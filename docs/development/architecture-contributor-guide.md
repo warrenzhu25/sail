@@ -7,40 +7,114 @@ rank: 1
 
 Welcome to the definitive architectural reference and contributor guide for **Sail**. 
 
-Sail is a high-performance, drop-in replacement for Apache Spark written entirely in Rust. It is built on top of **Apache DataFusion** and **Apache Arrow**, unifying batch processing, stream processing, and compute-intensive AI workloads without the overhead of the JVM.
-
-This document provides an exhaustive, production-grade deep dive into Sail's internal codebase topology, query compilation lifecycle, distributed DAG scheduling mechanics, and high-speed Arrow Flight shuffle architecture. It is designed to onboard core contributors to the system’s most complex subsystems.
+Whether you are a seasoned systems engineer or a newcomer to distributed data processing, this guide is designed to provide a self-contained, exhaustive deep dive into Sail's internal mechanics. It covers everything from fundamental concepts and codebase topology to query compilation lifecycles, distributed DAG scheduling, and high-speed Arrow Flight shuffle architecture.
 
 ---
 
-## 1. Architectural Foundations & Codebase Topology
+## 1. Introduction & Core Philosophy
 
-Sail operates under a strict separation of concerns between the **Control Plane** (cluster coordination, task scheduling, metadata management) and the **Data Plane** (query execution, columnar data transformations, shuffle exchanges).
+### 1.1 The Problem with Legacy Spark
+For over 15 years, Apache Spark has been the industry standard for distributed data processing. However, its foundation on the Java Virtual Machine (JVM) introduces severe performance and operational bottlenecks:
+*   **Garbage Collection (GC) Pauses**: Massive in-memory datasets cause unpredictable GC pauses, stalling execution pipelines.
+*   **Heavy Memory Footprint**: Object serialization and JVM heap management inflate memory usage, requiring massive, expensive cloud instances.
+*   **Slow Startup Times**: Bootstrapping a JVM cluster takes minutes, making it unsuitable for elastic, serverless, or interactive AI workloads.
+
+### 1.2 The Sail Solution
+Sail is a **100% Rust-native, drop-in replacement** for Apache Spark. It eliminates the JVM entirely while maintaining perfect behavioral parity with the Spark DataFrame and SQL APIs. 
+
+By leveraging **Apache DataFusion** (a state-of-the-art vectorized query engine) and **Apache Arrow** (the industry standard columnar memory format), Sail delivers up to **4x faster execution** and **94% lower infrastructure costs**.
 
 ```mermaid
 graph TD
-    subgraph Control Plane
-        Drv[Driver Actor / Scheduler] -- "Tonic gRPC (Internal Protocol)" --> Wrk[Worker Actor]
-        Wrk -- "Heartbeats & Status" --> Drv
+    subgraph PySpark Client (No changes needed)
+        PC[PySpark Code: df.filter(...).show()]
     end
 
-    subgraph Data Plane
-        DF1[DataFusion Engine - Upstream] -- "Arrow Flight (do_get)" --> DF2[DataFusion Engine - Downstream]
+    subgraph Sail Standalone Rust Engine (Zero JVM)
+        SC[Spark Connect gRPC Gateway] --> AST[AST Compiler / PlanResolver]
+        AST --> Opt[DataFusion Optimizer]
+        Opt --> JS[Distributed DAG Scheduler]
+        JS --> DF[DataFusion Physical Engine]
+        DF -- "Arrow Flight Shuffle" --> DF
     end
+
+    PC -- "sc://localhost:50051" --> SC
 ```
 
-### 1.1 Module Hierarchy
-The Sail monorepo is organized into specialized crates, each encapsulating a distinct layer of the execution stack:
+---
 
-*   **`sail-spark-connect`**: Implements the official Spark Connect gRPC protocol (`sc://...`). It accepts incoming client connections, decodes raw protobuf query plans, and manages streaming response channels.
-*   **`sail-session`**: Governs user sessions (`SparkSession`). It manages session-level configuration isolation, temporary views, UDF registries, and custom catalog mounts.
-*   **`sail-plan`**: The query compiler. It translates Spark Connect ASTs (`spec::Plan`) into DataFusion `LogicalPlan` structures, applies custom analyzer/optimizer rules, and generates physical `ExecutionPlan` graphs.
-*   **`sail-execution`**: The core distributed execution engine. It houses the `JobScheduler`, `DriverActor`, `WorkerActor`, `WorkerPool`, `StreamManager`, and Arrow Flight shuffle services.
-*   **`sail-common-datafusion`**: Extension traits and utilities wrapping DataFusion core data structures (e.g., memory pools, execution configurations, system tables).
-*   **`sail-catalog` / `sail-data-source`**: Custom lakehouse integration crates providing native support for Delta Lake, Apache Iceberg, Hive Metastore, AWS Glue, Unity Catalog, and Microsoft OneLake without relying on DataFusion's default memory catalogs.
+## 2. Codebase Topology & Component Deep Dive
 
-### 1.2 Execution Modes
-Sail supports three primary execution topologies configured via `AppConfig.mode`:
+The Sail monorepo is modularized into specialized crates. To understand Sail, you must understand the role and internal mechanics of each core component.
+
+```mermaid
+graph TD
+    subgraph Client Layer
+        Client[PySpark Client]
+    end
+
+    subgraph Frontend & Gateway
+        SC[sail-spark-connect]
+        Sess[sail-session]
+    end
+
+    subgraph Compiler Layer
+        Plan[sail-plan]
+        Cat[sail-catalog & Data Sources]
+    end
+
+    subgraph Distributed Execution Engine
+        Exec[sail-execution]
+        subgraph Exec[sail-execution]
+            JS[Job Scheduler]
+            Drv[Driver Actor]
+            Wrk[Worker Actor]
+            Shuff[Stream Manager & Flight]
+        end
+    end
+
+    Client -- "gRPC" --> SC
+    SC --> Sess
+    Sess --> Plan
+    Plan --> Cat
+    Plan --> Exec
+```
+
+### 2.1 `sail-spark-connect` (The gRPC Gateway)
+*   **Background**: In modern Spark architecture, the client (e.g., a Python script or Jupyter notebook) is decoupled from the execution engine via the **Spark Connect** gRPC protocol.
+*   **Role**: `sail-spark-connect` implements the official Spark Connect protobuf service definitions (`execute_plan`, `analyze_plan`, `config`, `interrupt`). It acts as the front door to the Sail server.
+*   **Internal Mechanics**: Built on top of Tokio and Tonic (Rust's premier gRPC framework), it accepts incoming client connections, extracts metadata (such as UUIDs, user tags, and session IDs), and routes incoming protobuf query ASTs to the underlying session manager. It wraps all execution results into asynchronous streaming responses (`ExecutePlanResponse`).
+
+### 2.2 `sail-session` (The Multitenant Isolation Layer)
+*   **Background**: Analytical engines must support multiple concurrent users and queries without cross-session interference.
+*   **Role**: `sail-session` manages the lifecycle of user sessions (`SparkSession`). It mirrors DataFusion's `SessionContext` but adds robust multitenant management.
+*   **Internal Mechanics**: 
+    *   **Session Manager**: Maintains a thread-safe, LRU-backed registry of active sessions. If a client does not send requests within `session_timeout_secs` (default 15 minutes), the manager reaps the session, releasing associated memory and temporary files.
+    *   **Extension Injection**: When a session is constructed via `ServerSessionFactory`, Sail injects custom extensions into the DataFusion `SessionConfig`, including `ActivityTracker` (for monitoring idle times), `PlanService` (for AST formatting), and `JobService` (attaching the execution runner).
+
+### 2.3 `sail-plan` (The Compiler & AST Translator)
+*   **Background**: PySpark clients transmit query plans as Spark Connect ASTs (`spec::Plan`). DataFusion, however, executes DataFusion `LogicalPlan` structures.
+*   **Role**: `sail-plan` is the compiler layer that translates Spark ASTs into optimized DataFusion logical and physical plans.
+*   **Internal Mechanics**: The core of this crate is the `PlanResolver` (`sail-plan/src/resolver/query/mod.rs`). It acts as a recursive descent compiler, walking the Spark AST nodes and performing complex semantic mappings:
+    *   **Scan Resolution**: Translates Spark table scans (`ReadType::NamedTable`) into DataFusion `TableScan` logical nodes, resolving schemas against Sail's custom catalogs.
+    *   **Relational Mapping**: Maps transformations (`Project`, `Filter`, `Join`, `Aggregate`) into DataFusion logical builders.
+    *   **Expression Parsing**: Converts Spark SQL expressions, literals, and mathematical operators into DataFusion `Expr` structs, maintaining a tracking state (`PlanResolverState`) to manage complex column aliasing and hidden metadata fields.
+
+### 2.4 `sail-execution` (The Distributed Engine)
+*   **Background**: Apache DataFusion is primarily a single-node execution engine. `sail-execution` wraps DataFusion with a distributed cluster control plane.
+*   **Role**: Houses the distributed DAG scheduler, actor systems, worker pools, and shuffle managers.
+*   **Internal Mechanics**: Operates with a strict separation between the Control Plane (Tonic gRPC / Actor messaging) and Data Plane (Arrow Flight streams).
+
+### 2.5 `sail-catalog` & `sail-data-source` (Enterprise Lakehouse Integration)
+*   **Background**: DataFusion's default catalog is an in-memory structure. Modern enterprise lakehouses require integration with external metadata providers.
+*   **Role**: Provides native support for Delta Lake, Apache Iceberg, Hive Metastore (HMS), AWS Glue, Unity Catalog, and Microsoft OneLake.
+*   **Internal Mechanics**: Implements DataFusion's `CatalogProvider` and `SchemaProvider` traits. When a query references a table `my_catalog.default.sales`, Sail intercepts the resolution, queries the external metadata service (e.g., parsing Delta log transaction files or Iceberg REST manifests), and returns a fully configured physical table scan provider.
+
+---
+
+## 3. Execution Modes Matrix
+
+Sail transitions seamlessly between local development and large-scale cluster execution via `AppConfig.mode`:
 
 ```rust
 // From sail-common/src/config/application.rs
@@ -51,91 +125,72 @@ pub enum ExecutionMode {
 }
 ```
 
-1.  **`Local` Mode**: Executes physical plans directly within the server process using DataFusion's multithreaded execution model. There is no actor-based RPC communication or network serialization overhead.
-2.  **`LocalCluster` Mode**: Emulates a distributed cluster within a single OS process. It spawns distinct driver and worker actor systems across different CPU threads that communicate over local RPC channels, validating distributed scheduling logic.
-3.  **`KubernetesCluster` Mode**: Production distributed deployment. The driver and workers run in separate Kubernetes pods. Sail dynamically provisions worker pods via the Kubernetes API and coordinates tasks over Tonic gRPC.
-
-### 1.3 Memory Management Architecture
-To prevent Out-Of-Memory (OOM) crashes during intensive distributed joins and aggregations, Sail tightly controls memory allocation via DataFusion's `MemoryPool` abstractions:
-
-```mermaid
-graph LR
-    subgraph Memory Pool Configurations
-        Unb[Unbounded Pool]
-        Grd[Greedy Pool - FIFO Allocation]
-        Fair[Fair Pool - Even Operator Split]
-    end
-```
-
-*   **`Unbounded`**: Allocates memory freely without limits (ideal for isolated or over-provisioned environments).
-*   **`Greedy`**: Allocates memory up to a maximum limit (`max_size`) on a first-come, first-served basis.
-*   **`Fair`**: Allocates memory up to a limit while ensuring that a single rogue operator does not starve concurrent execution nodes.
+| Execution Mode | Architecture & Topology | Primary Use Case | Communication Protocol |
+| :--- | :--- | :--- | :--- |
+| **`Local`** | Single process, multithreaded. Uses `LocalJobRunner`. | Ad-hoc analytics, laptop development, unit testing. | In-process memory sharing (Zero RPC). |
+| **`LocalCluster`** | Single process, multi-actor. Emulates driver and workers on local threads. | Debugging distributed scheduling, RPC logic, and shuffle graphs. | In-process local RPC channels. |
+| **`KubernetesCluster`** | Distributed pods. Driver and workers run in separate Kubernetes containers. | Production lakehouse processing, heavy ETL, massive AI workloads. | Control: Tonic gRPC. Data: Arrow Flight. |
 
 ---
 
-## 2. Query Compilation & AST Translation
+## 4. Comprehensive Query Lifecycle
 
-When a PySpark client triggers an action (e.g., `.show()`), it transmits an `ExecutePlanRequest` protobuf message. Sail compiles this request into an executable DataFusion physical plan through a multi-phase pipeline.
+To understand how all components unite, we trace the comprehensive lifecycle of a distributed PySpark DataFrame query.
 
 ```mermaid
 sequenceDiagram
     autonumber
+    actor Client as PySpark Client
     participant SC as SparkConnectServer
-    participant PR as PlanResolver
-    participant Opt as DataFusion Optimizer
-    participant QP as QueryPlanner
+    participant Sess as SessionManager
+    participant Plan as PlanResolver
+    participant Drv as Driver Actor (Scheduler)
+    participant Wrk as Worker Actor
+    participant Shuff as StreamManager & Flight
 
-    SC->>PR: resolve_and_execute_plan(spec::Plan)
-    Note over PR: Recursively walks Spark AST
-    PR->>PR: Map Scans, Projections, Joins -> LogicalPlan
-    PR->>PR: Resolve PyO3 UDFs & Expressions
-    PR->>Opt: Optimize LogicalPlan (Default + Sail Rules)
-    Opt->>QP: create_physical_plan()
-    QP-->>SC: Arc<dyn ExecutionPlan>
+    Note over Client,SC: Phase 1: Connection & Session Setup
+    Client->>SC: Connect (sc://localhost:50051)
+    Client->>SC: ExecutePlanRequest (SessionID, AST Protobuf)
+    SC->>Sess: get_or_create_session(SessionID)
+    Sess-->>SC: DataFusion SessionContext
+
+    Note over SC,Plan: Phase 2: AST Compilation & Optimization
+    SC->>Plan: resolve_and_execute_plan(AST)
+    Plan->>Plan: Walk AST -> Build DataFusion LogicalPlan
+    Plan->>Plan: Run Optimizer (Filter Pushdown, Join Reorder)
+    Plan->>Plan: QueryPlanner::create_physical_plan()
+    Plan-->>SC: Arc<dyn ExecutionPlan>
+
+    Note over SC,Drv: Phase 3: DAG Construction & Stage Splitting
+    SC->>Drv: execute_job(ExecutionPlan)
+    Drv->>Drv: JobGraph::try_new(ExecutionPlan)
+    Note over Drv: Splits physical plan into Stages at repartition boundaries
+
+    Note over Drv,Wrk: Phase 4: Task Scheduling & Upstream Execution
+    Drv->>Drv: refresh_job() -> Schedule Stage 1
+    Drv->>Wrk: execute_task(TaskDefinition: Stage 1)
+    Wrk->>Wrk: DataFusion execute_stream(Stage 1 Plan)
+    Wrk->>Shuff: Write output batches to StreamManager (Channels)
+    Wrk-->>Drv: Task Complete (Worker = W1)
+
+    Note over Drv,Wrk: Phase 5: Downstream Scheduling & Arrow Flight Shuffle
+    Drv->>Drv: refresh_job() -> Stage 1 Succeeded -> Schedule Stage 2
+    Drv->>Wrk: execute_task(TaskDefinition: Stage 2, InputLocator: W1)
+    Wrk->>Shuff: FlightClient::do_get(TaskStreamTicket)
+    Shuff-->>Wrk: Stream Arrow IPC Batches over gRPC
+    Note over Wrk: Injects batches directly into DataFusion probe pipeline
+    Wrk-->>Drv: Task Complete -> Return Final Results
+
+    Note over Drv,Client: Phase 6: Result Streaming
+    Drv-->>SC: ExecutorOutputStream
+    SC-->>Client: Stream ExecutePlanResponse (Arrow IPC Chunks)
 ```
-
-### 2.1 Request Interception (`SparkConnectServer`)
-In `server.rs`, incoming requests are routed based on their root plan type:
-
-*   **Commands** (`CommandPlan`): DDL statements, table creation, writing data, UDF registration. These execute eagerly and return empty success streams or scalar summaries.
-*   **Relations** (`RelationPlan`): Standard DataFrame transformations (`Filter`, `Join`, `Aggregate`). These execute lazily, building an execution pipeline that streams Arrow batches back to the client.
-
-### 2.2 AST Resolution (`PlanResolver`)
-The `PlanResolver` (`sail-plan/src/resolver/query/mod.rs`) recursively traverses Spark AST nodes (`spec::QueryNode`) and maps them into DataFusion `LogicalPlan` nodes.
-
-```rust
-// Conceptual architecture of PlanResolver
-impl PlanResolver<'_> {
-    pub async fn resolve_query_plan(&self, plan: spec::QueryPlan, state: &mut PlanResolverState) -> PlanResult<LogicalPlan> {
-        match plan.node {
-            QueryNode::Read { read_type, .. } => self.resolve_read(read_type, state).await,
-            QueryNode::Project { input, expressions } => self.resolve_project(input, expressions, state).await,
-            QueryNode::Filter { input, condition } => self.resolve_filter(input, condition, state).await,
-            QueryNode::Join(join) => self.resolve_join(join, state).await,
-            QueryNode::Aggregate(agg) => self.resolve_aggregate(agg, state).await,
-            // ... 30+ other node types
-        }
-    }
-}
-```
-
-#### State Tracking (`PlanResolverState`)
-Spark Connect ASTs rely heavily on complex column aliasing, subquery scoping, and implicit metadata fields. `PlanResolverState` maintains a registry mapping unresolved spec field names to fully qualified DataFusion `Column` structures.
-
-#### Python UDF Integration
-When resolving Python User-Defined Functions (UDFs) or Data Sources, Sail embeds Python runtimes (`PyO3`). Because both Sail and Python (via PyArrow/Pandas) operate on Apache Arrow memory buffers, data is shared between the Rust engine and Python workers using **zero-copy Arrow array pointers**, completely bypassing serialization bottlenecks.
-
-### 2.3 Logical Optimization & Physical Planning
-Once the DataFusion `LogicalPlan` is built:
-1.  **Analyzer Rules**: Evaluates type coercions, function signatures, and semantic validity.
-2.  **Optimizer Rules**: Pushes filters down into table scans, eliminates redundant projections, reorders joins based on table statistics, and coerces view types (`Utf8View`) to standard types at output boundaries.
-3.  **Physical Planning**: Invokes DataFusion's `QueryPlanner` (`session_state.create_physical_plan()`). This converts logical nodes into physical execution nodes (e.g., converting a logical join into a physical `HashJoinExec` or `SortMergeJoinExec`).
 
 ---
 
-## 3. Distributed Scheduler Engine (`JobScheduler`)
+## 5. Distributed Scheduler Engine (`JobScheduler`)
 
-In cluster mode (`LocalCluster` or `KubernetesCluster`), the physical `ExecutionPlan` cannot be executed directly by a single node. It must be managed by the `JobScheduler` (`sail-execution/src/driver/job_scheduler/core.rs`).
+In cluster mode, the physical `ExecutionPlan` is managed by the `JobScheduler` (`sail-execution/src/driver/job_scheduler/core.rs`).
 
 ```mermaid
 graph TD
@@ -148,7 +203,7 @@ graph TD
     end
 ```
 
-### 3.1 DAG Construction (`JobGraph`)
+### 5.1 DAG Construction (`JobGraph`)
 The `JobGraph` planner (`sail-execution/src/job_graph/planner.rs`) walks the physical execution plan tree. 
 
 Whenever it encounters a data repartitioning boundary—specifically `RepartitionExec` or `CoalescePartitionsExec`—it severs the plan tree and inserts a **Stage Boundary**.
@@ -168,7 +223,7 @@ fn build_job_graph(plan: Arc<dyn ExecutionPlan>, usage: PartitionUsage, graph: &
 
 The severed upstream tree becomes a distinct `Stage`. The repartitioning node in the downstream stage is replaced by a `StageInputExec`—a custom physical plan node representing the receiving end of a distributed shuffle.
 
-### 3.2 Task Region Topology
+### 5.2 Task Region Topology
 A `Stage` is subdivided into multiple `Task`s corresponding to its output partitions. The driver organizes these tasks into `TaskRegion`s (`TaskRegionTopology`).
 
 ```mermaid
@@ -191,7 +246,7 @@ The scheduler maintains explicit state tracking across four tiers:
 3.  **`TaskState`**: `Created`, `Running`, `Succeeded`, `Failed`, `Canceled`.
 4.  **`TaskAttemptDescriptor`**: Tracks individual execution attempts, failure messages, and stop timestamps.
 
-### 3.3 Driver Scheduling Loop (`refresh_job`)
+### 5.3 Driver Scheduling Loop (`refresh_job`)
 The driver actor periodically evaluates the job state machine via `JobScheduler::refresh_job`:
 
 ```rust
@@ -221,7 +276,7 @@ pub fn refresh_job(&mut self, job_id: JobId) -> Vec<JobAction> {
 }
 ```
 
-### 3.4 Task Assignment & Dispatch
+### 5.4 Task Assignment & Dispatch
 When `schedule_task_regions` identifies a ready task region (all upstream dependency regions are `Succeeded`), it generates a `TaskDefinition`.
 
 ```rust
@@ -234,13 +289,13 @@ pub struct TaskDefinition {
 
 The driver selects an available worker from the `WorkerPool` (matching slot availability) and transmits the `TaskDefinition` over Tonic gRPC (`DriverToWorker::execute_task`).
 
-### 3.5 Failure Recovery & Retries
+### 5.5 Failure Recovery & Retries
 If a worker pod crashes or a network timeout occurs, the worker actor reports a task failure. 
 The scheduler inspects the failure cause. If the number of attempts (`attempts.len()`) is less than `config.cluster.task_max_attempts`, the scheduler instantiates a new `TaskAttemptDescriptor`, selects a different worker node, and re-dispatches the task.
 
 ---
 
-## 4. Distributed Shuffle Architecture (Arrow Flight)
+## 6. Distributed Shuffle Architecture (Arrow Flight)
 
 Sail completely replaces DataFusion's single-node in-memory repartitioning queues with a high-speed, distributed shuffle architecture powered by **Apache Arrow Flight**.
 
@@ -269,7 +324,7 @@ sequenceDiagram
     Note over Wrk2: Injects directly into DataFusion probe pipeline
 ```
 
-### 4.1 Upstream Execution & Shuffle Write
+### 6.1 Upstream Execution & Shuffle Write
 When an upstream task executes on a worker node, its final physical plan node is wrapped by a shuffle writer (`TaskStreamSink`). 
 
 As DataFusion record batches flow through the pipeline, the shuffle writer partitions the data into distinct **Channels** (corresponding to downstream task partitions) using either hashing (`OutputDistribution::Hash`) or round-robin batches (`OutputDistribution::RoundRobin`).
@@ -291,7 +346,7 @@ pub enum LocalStreamState {
 ```
 Currently, Sail holds shuffle data in high-speed memory (`MemoryStream`), avoiding the heavy disk I/O bottlenecks that characterize traditional Spark shuffle managers.
 
-### 4.2 Task Locators & Coordination
+### 6.2 Task Locators & Coordination
 When the upstream task finishes, the worker notifies the driver. The driver records the exact `worker_id` and gRPC URI where the partition was executed.
 
 When scheduling downstream tasks, the `JobScheduler` constructs a `TaskInputLocator` for each required shuffle channel:
@@ -307,7 +362,7 @@ pub enum TaskInputLocator {
 }
 ```
 
-### 4.3 Arrow Flight Exchange Protocol
+### 6.3 Arrow Flight Exchange Protocol
 When the downstream worker receives its `TaskDefinition`, it inspects the `TaskInputLocator::Worker`. For each upstream worker ID, it instantiates a `TaskStreamFlightClient` (`sail-execution/src/stream_service/client.rs`).
 
 It initiates an Arrow Flight `do_get` request, passing an encoded `TaskStreamTicket`:
@@ -323,7 +378,7 @@ pub struct TaskStreamTicket {
 }
 ```
 
-### 4.4 Flight Server Materialization
+### 6.4 Flight Server Materialization
 The upstream worker's `TaskStreamFlightServer` (`sail-execution/src/stream_service/server.rs`) intercepts the `do_get` request:
 
 1.  Decodes the `TaskStreamTicket`.
@@ -336,7 +391,7 @@ The downstream worker receives these IPC batches and injects them instantly into
 
 ---
 
-## 5. Worker Node Lifecycle & Concurrency
+## 7. Worker Node Lifecycle & Concurrency
 
 In cluster mode, worker nodes operate as independent actor systems managed by a `WorkerManager` (`LocalWorkerManager` or `KubernetesWorkerManager`).
 
@@ -351,12 +406,12 @@ stateDiagram-v2
     Lost --> [*]
 ```
 
-### 5.1 Bootstrapping & Handshake
+### 7.1 Bootstrapping & Handshake
 1.  **Provisioning**: The driver actor requests worker slots from the `WorkerManager`. In Kubernetes mode, this spawns a new pod using the configured `worker_pod_template`.
 2.  **Handshake**: The worker process boots, binds its internal gRPC and Arrow Flight servers, and sends a `RegisterWorker` RPC to the driver's listening address.
 3.  **Pool Enrollment**: The driver enrolls the worker in its `WorkerPool`, tracking its available task slots (`config.cluster.worker_task_slots`).
 
-### 5.2 Heartbeat & Health Monitoring
+### 7.2 Heartbeat & Health Monitoring
 Workers maintain active health checks with the driver:
 *   **Worker to Driver**: Sends periodic heartbeats (`config.cluster.worker_heartbeat_interval_secs`).
 *   **Driver Monitoring**: If the driver fails to receive a heartbeat within `worker_heartbeat_timeout_secs`, it transitions the worker state to `Lost`.
@@ -364,7 +419,7 @@ Workers maintain active health checks with the driver:
 
 ---
 
-## 6. Contributor Reference & Navigation Guide
+## 8. Contributor Reference & Navigation Guide
 
 To assist contributors in navigating the monorepo, here is a mapping of core architectural subsystems to their exact source files:
 
