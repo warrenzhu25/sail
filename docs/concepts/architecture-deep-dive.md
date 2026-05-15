@@ -1,3 +1,8 @@
+---
+title: Architecture Deep Dive
+rank: 3
+---
+
 # Sail Architecture Deep Dive
 
 This document explains Sail's architecture through the code paths that matter
@@ -11,6 +16,26 @@ and command-line entry points. Internally those requests are normalized into
 Sail's shared plan model, resolved into DataFusion logical plans, planned into
 DataFusion physical plans plus Sail extension operators, and executed either in a
 single local process or across a driver and worker cluster.
+
+## Reading Guide
+
+This deep dive is organized by architectural layer. Use the table below to
+navigate to the section most relevant to your task:
+
+| If you want to... | Start with |
+|-------------------|------------|
+| Understand how requests enter Sail | [Request Entry Points](#request-entry-points) |
+| Debug session or runtime configuration | [Session And Runtime Setup](#session-and-runtime-setup) |
+| Understand plan representation | [Plan Model And SQL Conversion](#plan-model-and-sql-conversion) |
+| Debug query planning or resolution | [Logical And Physical Planning](#logical-and-physical-planning) |
+| Debug local or distributed execution | [Execution](#execution) |
+| Add or debug a catalog backend | [Catalogs](#catalogs) |
+| Add or debug a table format | [Data Sources And Table Formats](#data-sources-and-table-formats) |
+| Debug object storage access | [Object Storage](#object-storage) |
+| Add or debug functions | [Functions And Python Execution](#functions-and-python-execution) |
+
+For a higher-level overview of Sail's architecture without code details, see
+[Architecture Overview](./architecture/).
 
 ## Request Entry Points
 
@@ -220,12 +245,40 @@ execution, the file often uses eager silent mode: it drains the stream to make
 the command happen, then returns an empty or complete response depending on
 reattachable operation metadata.
 
+**Session extensions** are Sail-specific objects attached to DataFusion's
+`SessionContext` using DataFusion's extension mechanism. When code calls
+`ctx.extension::<SparkSession>()`, it retrieves the `SparkSession` object that
+was registered during session creation. Sail uses this pattern for several
+session-scoped dependencies: `SparkSession` holds Spark-specific metadata and
+executors, `JobService` provides the job runner for plan execution,
+`CatalogManager` handles catalog operations, and `TableFormatRegistry` provides
+table format implementations. This approach keeps Sail's extensions decoupled
+from DataFusion's core types while still making them accessible throughout the
+request path.
+
+**Resolution** in `resolve_and_execute_plan` refers to the process of converting
+Sail's intermediate `spec::Plan` representation into a DataFusion `LogicalPlan`
+and then into a physical `ExecutionPlan`. This involves resolving table names
+against catalogs, resolving column names against schemas, looking up functions
+in the function registry, applying type coercion, and running DataFusion's
+optimizer passes. The result is a fully resolved, optimized physical plan ready
+for execution.
+
 `ExecutePlanResponseStream` adapts Sail executor output into
 `ExecutePlanResponse`. Its `poll_next` implementation maps each internal batch
 variant to the correct Spark Connect response type: Arrow batches, SQL command
 results, streaming query results, checkpoint results, schema messages, and final
 completion messages. This is the final protocol boundary before data reaches a
 Spark Connect client.
+
+**Why wrap internal batches?** This wrapper exists because Sail's internal
+execution produces a stream of generic `ExecutorBatch` values, but Spark Connect
+clients expect `ExecutePlanResponse` messages with session IDs, operation IDs,
+and response IDs attached. The wrapper performs this protocol conversion at the
+edge of the system rather than threading Spark Connect concerns through the
+entire execution layer. This keeps the core execution engine protocol-agnostic:
+the same internal batch stream could be adapted for Flight SQL or other protocols
+with a different wrapper.
 
 The individual handler functions choose which Sail plan to build. For example,
 `handle_execute_relation` converts a Spark relation into a query plan,
@@ -319,6 +372,14 @@ Spark's schema protobuf shape. `handle_analyze_explain` delegates to
 explain mode. `handle_analyze_ddl_parse` parses Spark DDL data types and asks
 the plan resolver to map them to DataFusion types.
 
+**Why does `NamedPlan` separate the plan from field names?** During resolution,
+Sail often renames columns internally to avoid conflicts and enable correct
+reference tracking. For example, a column named `id` in user SQL might become
+`__sail_resolved_id_42` internally. The `NamedPlan.fields` vector preserves the
+original user-facing names so they can be restored when returning results to
+clients. This separation keeps the internal plan consistent for optimization
+while ensuring the output schema matches what users expect.
+
 The file also documents current compatibility gaps through explicit TODO
 handlers. Persist and unpersist currently behave as no-ops with warnings,
 whereas input-files, same-semantics, and semantic-hash analysis still return
@@ -369,6 +430,14 @@ Detailed logic:
 instances. It is generic over an opaque info type so server sessions and worker
 sessions can receive different creation inputs while sharing the same trait.
 
+**The opaque `I` type parameter** allows different factory implementations to
+receive different creation inputs without coupling the trait to specific data
+structures. For server sessions, `I` might include the session ID, user
+configuration, and Spark session metadata. For worker sessions, `I` might include
+the worker ID, driver connection info, and task-specific settings. This design
+keeps the factory trait reusable across different session creation contexts
+without requiring a common input structure.
+
 The trait takes `&mut self` because factories maintain state such as reusable
 runtime caches or worker-specific setup. It returns a DataFusion
 `SessionContext`, which becomes the container for Sail session extensions:
@@ -402,6 +471,24 @@ The worker session factory creates `SessionContext` instances for remote task
 execution. A worker context needs the runtime, object store access, physical
 planning support, table formats, and functions required to run assigned
 partitions, but it should not behave like a full client session.
+
+**Server sessions own:**
+
+- User-visible state (temporary views, session variables)
+- Spark session metadata (session ID, configuration)
+- Job history and executor tracking
+- Job submission through the job runner
+- Catalog manager with full CRUD operations
+- Plan resolution from `spec::Plan` to physical plans
+
+**Worker sessions own:**
+
+- Runtime environment for task execution
+- Object store access for reading/writing data
+- Physical planning support for deserializing plan fragments
+- Table format implementations for scan execution
+- Function registry for expression evaluation
+- No job submission capability (receives pre-planned tasks)
 
 The important distinction is ownership. Server sessions own user-facing
 session state and job submission. Worker sessions provide the execution
@@ -496,6 +583,14 @@ mutator callback so callers can make final adjustments before the
 runtime policy while still customizing the environment for a specific session
 kind.
 
+**The mutator callback pattern** (`FnOnce(RuntimeEnvBuilder) -> Result<RuntimeEnvBuilder>`)
+allows callers to inject session-specific customizations without modifying the
+factory. For example, a server session factory might add session-specific object
+store credentials, while a worker session factory might configure different
+memory limits. The factory handles the common setup (registry, caches, pools),
+and the mutator applies final adjustments. This pattern avoids proliferating
+factory variants for every combination of customizations.
+
 Memory behavior is selected from `AppConfig.runtime.memory_pool`. Sail can use
 DataFusion's unbounded pool, greedy bounded pool, or fair spill pool. Temporary
 file behavior is selected from configured paths and maximum size: a max size of
@@ -507,6 +602,23 @@ global across sessions, or session-scoped. Global caches are stored inside the
 factory and reused, while session caches are created fresh for each runtime
 environment. This matters for file-heavy workloads because listing, metadata,
 and statistics reuse can significantly change planning and scan cost.
+
+**Global vs session-scoped cache tradeoffs:**
+
+- **Global caches** reduce redundant I/O when multiple sessions access the same
+  files. They improve performance for shared datasets but require careful
+  invalidation when underlying data changes. Memory usage accumulates across all
+  sessions.
+- **Session-scoped caches** isolate sessions from each other. Cache entries are
+  always fresh within a session's lifetime, but repeated queries across sessions
+  re-fetch the same metadata. Memory is released when sessions end.
+- **Disabled caches** ensure every access fetches fresh data. This is correct
+  for rapidly changing data but incurs significant I/O overhead for large file
+  sets.
+
+The choice depends on workload characteristics: long-running sessions with
+stable data benefit from global caches, while short sessions with frequently
+updated data may prefer session-scoped or disabled caches.
 
 ### `crates/sail-session/src/session_manager/*`
 
@@ -822,6 +934,22 @@ Column names, function names, catalog references, and some type choices are
 represented in `spec` form and resolved later by `sail-plan`, where a
 `SessionContext` and catalog manager are available.
 
+**What "preserving unresolved intent" means in practice:**
+
+- A column reference like `t.id` becomes `spec::UnresolvedAttribute { name: ["t", "id"] }`
+  rather than a resolved column with known type and position
+- A function call like `COUNT(*)` becomes `spec::UnresolvedFunction { function_name: "count", ... }`
+  rather than a bound aggregate function
+- A table reference like `catalog.db.table` becomes `spec::ObjectName` rather
+  than a resolved table scan
+- Expressions keep their syntactic form (e.g., `BETWEEN` stays as a between
+  expression rather than being lowered to `AND` comparisons)
+
+This preservation is important because resolution requires context that the SQL
+analyzer does not have: the current default catalog, registered functions, table
+schemas, and Spark-specific configuration. By keeping these unresolved, the
+analyzer remains pure and testable, and resolution errors surface in one place.
+
 ### `crates/sail-sql-analyzer/src/expression.rs`
 
 Reference code excerpt:
@@ -923,6 +1051,53 @@ frontends and the resolver. Spark Connect conversion, SQL analysis, and internal
 commands should produce `spec` values. `sail-plan` consumes those values and is
 responsible for resolving them against the active session.
 
+**Why does Sail use the `spec` intermediate model?**
+
+The `spec` model exists for five key architectural reasons:
+
+1. **Protocol independence**: Both Spark Connect requests and SQL strings
+   convert to `spec::Plan`. This means the resolver only needs one implementation
+   path regardless of input protocol. Adding a new protocol (like Arrow Flight
+   SQL queries) only requires implementing the conversion to `spec`, not
+   duplicating resolver logic.
+
+2. **Deferred resolution**: The `spec` model captures user intent without
+   requiring a live session. Table names remain as `spec::ObjectName`, column
+   references remain as `spec::UnresolvedAttribute`, and function calls remain as
+   `spec::UnresolvedFunction`. This separation allows parsing and semantic
+   analysis to happen before catalog lookup, which simplifies error handling and
+   enables analysis caching.
+
+3. **Serialization and inspection**: `spec` types are designed to be
+   serializable and inspectable. This makes debugging easier because you can
+   print or log the `spec::Plan` before resolution. It also enables test fixtures
+   that operate on `spec` plans without needing a full session context.
+
+4. **Normalization**: Different SQL dialects and Spark Connect representations
+   can express the same operation differently. The `spec` model normalizes these
+   variations into a canonical form. For example, both `WHERE x > 5` and a
+   DataFrame filter call become the same `spec::QueryNode::Filter`. This reduces
+   the number of cases the resolver must handle.
+
+5. **Spark-specific extensibility**: The `spec` model can represent
+   Spark-specific constructs that DataFusion's native types do not support, such
+   as pandas UDFs, Spark streaming operations, or Spark-specific aggregate
+   semantics. These are represented in `spec` and converted to Sail extension
+   nodes during resolution.
+
+**What stays unresolved in `spec`?**
+
+- **Table names**: `spec::ObjectName` holds the multi-part name (catalog,
+  database, table) without catalog lookup
+- **Column references**: `spec::UnresolvedAttribute` holds the column name
+  without schema validation
+- **Function calls**: `spec::UnresolvedFunction` holds the function name without
+  registry lookup
+- **Data types**: Some types remain in Spark DDL form until resolution maps them
+  to Arrow types
+- **Subquery references**: Subqueries are represented structurally without
+  correlation analysis
+
 ## Logical And Physical Planning
 
 ### `crates/sail-plan/src/resolver/mod.rs`
@@ -956,6 +1131,21 @@ That split mirrors the fact that resolution is not a single pass over one kind
 of object. It must resolve table references, function calls, column references,
 types, hidden fields, generated fields, catalog commands, writes, and extension
 nodes.
+
+**`PlanResolverState` role:** The state object tracks context accumulated during
+resolution. Key responsibilities include:
+
+- **Field mapping**: Maps internal resolved field names to user-facing names,
+  enabling correct schema restoration
+- **Outer query schema**: Tracks schemas from outer queries for correlated
+  subquery resolution
+- **Aggregate state**: Tracks which expressions are inside aggregate contexts,
+  affecting column reference validation
+- **CTE definitions**: Stores Common Table Expression definitions for reference
+  during plan resolution
+- **Subquery references**: Tracks subquery correlation for proper scoping
+- **Hidden field tracking**: Records which fields are internal (hidden from
+  users) vs user-visible
 
 ### `crates/sail-plan/src/resolver/plan.rs`
 
@@ -1136,6 +1326,27 @@ steps need internal columns to express operations such as grouping, generators,
 or metadata tracking. `remove_hidden_fields` projects them away from the final
 user-visible plan unless a caller intentionally uses the hidden-field-aware path.
 
+**What are hidden fields and why are they needed?**
+
+Hidden fields are internal columns that Sail adds to plans during resolution but
+that should not appear in user-facing output. They serve three main purposes:
+
+1. **Outer join filtering**: When resolving outer joins, Sail may need to track
+   which side of the join produced a row. Hidden columns carry this information
+   through the plan without exposing it to users.
+
+2. **Generator output tracking**: Operations like `EXPLODE` or `LATERAL VIEW`
+   produce multiple output rows from single input rows. Hidden columns track
+   generator state and position information needed for correct semantics.
+
+3. **Metadata columns**: Some operations need row-level metadata (file paths,
+   row indices, partition values) for correct execution. These are added as
+   hidden columns during resolution and used by physical operators.
+
+The pattern is: add hidden columns during resolution when internal tracking is
+needed, propagate them through the plan, use them in physical execution, and
+strip them from the final output with `remove_hidden_fields`.
+
 ### `crates/sail-plan/src/resolver/expression/*`
 
 The expression resolver modules convert `spec::Expr` into DataFusion
@@ -1269,6 +1480,24 @@ lakehouse extension planners, the system table planner, and
 operators, while Sail handles logical extension nodes that DataFusion does not
 know about.
 
+**Extension planner chain order matters:**
+
+1. **Lakehouse planners** (`new_lakehouse_extension_planners()`) run first.
+   These handle Delta Lake and Iceberg-specific logical nodes like row-level
+   write operations. They must run first because lakehouse operations often need
+   format-specific planning that the generic planner cannot provide.
+
+2. **System table planner** (`SystemTablePhysicalPlanner`) runs next. It handles
+   system catalog tables that expose Sail runtime metadata. These are separate
+   from external data sources.
+
+3. **Generic extension planner** (`ExtensionPhysicalPlanner`) runs last as the
+   catch-all for Sail's other extension nodes (range, show-string, map-partitions,
+   catalog commands, etc.).
+
+Each planner returns `Some(plan)` if it handles the node, or `None` to pass to
+the next planner. If no planner handles a node, DataFusion raises an error.
+
 `ExtensionPhysicalPlanner::plan_extension` is the main mapping from Sail logical
 extension nodes to physical execution nodes. Examples include `RangeNode` to
 `RangeExec`, `ShowStringNode` to `ShowStringExec`, `MapPartitionsNode` to
@@ -1295,6 +1524,30 @@ file writes, file deletes, schema pivoting, barriers, merge planning, and
 streaming source/filter/limit/collector nodes. Each node carries the logical
 metadata needed by the physical planner to build the corresponding execution
 operator.
+
+**Why does Sail need its own extension nodes?**
+
+Sail cannot rely solely on DataFusion's built-in operators for several reasons:
+
+- **Spark-specific semantics**: Operations like `RANGE` with specific partition
+  counts, `monotonically_increasing_id()`, and `spark_partition_id()` have
+  Spark-defined behavior that differs from or doesn't exist in DataFusion.
+
+- **Format-aware writes**: File writes need to know about partitioning schemes,
+  bucketing, sort requirements, and format-specific commit semantics. A generic
+  "insert" operator cannot capture this.
+
+- **Python UDF execution**: `MapPartitionsNode` represents Python UDF execution
+  with Arrow batch semantics, which requires custom execution behavior.
+
+- **Streaming operations**: Spark Structured Streaming has specific source,
+  filter, and collector semantics that don't map to DataFusion's batch model.
+
+- **Catalog commands**: Operations like CREATE TABLE, ALTER TABLE, and DROP
+  TABLE need to execute Sail-specific catalog logic, not just return data.
+
+By defining these as extension nodes, Sail can participate in DataFusion's
+optimization framework while still controlling execution behavior.
 
 ### `crates/sail-physical-plan/src/lib.rs`
 
@@ -1465,11 +1718,34 @@ calls DataFusion's `execute_stream(plan, ctx.task_ctx())`. The result is a
 record batch stream produced in the same process using DataFusion's normal task
 context.
 
+**What does `trace_execution_plan` do?** This function wraps the physical plan
+tree with instrumentation nodes that collect execution metrics. Each operator in
+the plan gets wrapped with tracing that records job ID, stage (if applicable),
+attempt number, and operator ID. These metrics flow to Sail's telemetry system,
+enabling observability into execution time, row counts, and resource usage at
+the operator level. The instrumentation is lightweight and designed to have
+minimal overhead on execution.
+
 `ClusterJobRunner::execute` sends `DriverEvent::ExecuteJob` to the driver actor
 with the physical plan and DataFusion task context. It waits on a oneshot
 channel for the driver to return a stream. From the caller's perspective, local
 and cluster execution both return `SendableRecordBatchStream`; the difference is
 hidden behind the job runner.
+
+**How cluster execution hides distribution from callers:** The `JobRunner` trait
+provides a uniform interface: give it a physical plan, get back a record batch
+stream. Protocol handlers like `handle_execute_plan` don't need to know whether
+execution is local or distributed. The cluster job runner internally coordinates
+with the driver to:
+
+1. Decompose the plan into stages at shuffle boundaries
+2. Schedule tasks across workers
+3. Manage intermediate data exchange between stages
+4. Collect final results into a stream
+
+The caller just sees the final stream, as if the query ran locally. This
+abstraction allows Sail to switch between local and cluster mode based on
+configuration without changing request handling code.
 
 Both runners implement `stop`. Local stop flips an atomic flag and returns empty
 history. Cluster stop asks the driver actor to shut down and optionally return
@@ -1490,6 +1766,25 @@ availability, output streams, and shutdown state. Handling these through actor
 messages avoids scattered locking and makes state transitions easier to reason
 about.
 
+**Why use the actor model for driver and workers?**
+
+1. **No scattered locking**: All state mutations happen in response to messages.
+   The actor processes one message at a time, eliminating races without requiring
+   fine-grained locks throughout the codebase.
+
+2. **Clear message protocol**: The set of events an actor handles (e.g.,
+   `ExecuteJob`, `TaskComplete`, `WorkerRegistered`, `Shutdown`) forms an
+   explicit protocol. This makes the system's behavior easier to understand and
+   test.
+
+3. **Spawned tasks with isolation**: Long-running operations (like waiting for
+   workers or streaming results) can spawn background tasks that communicate
+   back via messages. The actor remains responsive to other events.
+
+4. **Graceful shutdown**: The actor can process a shutdown message, clean up
+   in-flight work, report final state, and exit cleanly. This is harder to
+   coordinate with scattered async code and shared state.
+
 ### `crates/sail-execution/src/driver/job_scheduler/*`
 
 The job scheduler converts a physical plan into an executable job structure. It
@@ -1500,6 +1795,23 @@ running, complete, failed, or waiting on dependencies.
 This module is responsible for deciding when work is ready. It does not run
 tasks itself; instead, it determines the next schedulable units and cooperates
 with the task assigner and worker pool.
+
+**Job graph vs job scheduler: the distinction**
+
+- **Job graph** (`job_graph/*`) is a **data structure**. It represents the static
+  decomposition of a physical plan into stages and their dependencies. Think of
+  it as the "what": which stages exist, which depend on which, and what each
+  stage's input/output requirements are.
+
+- **Job scheduler** (`job_scheduler/*`) is a **state machine**. It tracks the
+  dynamic execution progress through the job graph. Think of it as the "when":
+  which stages are ready to run, which are blocked on dependencies, which have
+  completed or failed.
+
+The job graph is built once from the physical plan. The scheduler continuously
+updates state as tasks complete, dependencies resolve, and workers report
+status. This separation allows the same job graph structure to support
+different scheduling policies.
 
 ### `crates/sail-execution/src/driver/task_assigner/*`
 
@@ -1787,6 +2099,34 @@ Together with the caching provider, this is part of Sail's decorator pattern for
 catalogs: session code can compose runtime handling and caching around the
 actual backend implementation.
 
+**The catalog decorator pattern explained:**
+
+Sail uses the decorator pattern to layer cross-cutting concerns onto catalog
+providers without modifying the providers themselves:
+
+```
+┌─────────────────────────────────────┐
+│  RuntimeAwareCatalogProvider        │  ← Handles async runtime context
+│  ┌───────────────────────────────┐  │
+│  │  CachingCatalogProvider       │  │  ← Caches metadata to reduce I/O
+│  │  ┌─────────────────────────┐  │  │
+│  │  │  GlueCatalogProvider    │  │  │  ← Actual backend implementation
+│  │  └─────────────────────────┘  │  │
+│  └───────────────────────────────┘  │
+└─────────────────────────────────────┘
+```
+
+**Why decorators instead of built-in features?**
+
+- **Separation of concerns**: The Glue provider focuses only on Glue API
+  translation. It doesn't need to know about caching TTLs or Tokio runtimes.
+- **Composability**: Not all providers need all decorators. A memory catalog
+  doesn't need caching. A synchronous provider doesn't need runtime wrapping.
+- **Testability**: Each layer can be tested independently. You can test caching
+  behavior with a mock provider, or test runtime handling without a real catalog.
+- **Configuration flexibility**: Session setup can choose which decorators to
+  apply based on configuration, without changing provider implementations.
+
 ### `crates/sail-catalog-memory/src/lib.rs`
 
 The memory catalog is an in-process catalog implementation. It is primarily
@@ -1937,6 +2277,26 @@ Table properties, operation options, table location, and time travel settings
 are represented as separate layers. This lets format implementations preserve
 option precedence instead of flattening everything too early.
 
+**`OptionLayer` precedence design:**
+
+Options come from multiple sources with different priorities. `OptionLayer`
+preserves this structure:
+
+1. **Table properties** (lowest priority): Stored in catalog metadata, apply to
+   all operations on the table
+2. **Operation options**: Specified in the query (e.g., `OPTIONS (key = value)`),
+   override table properties for this operation
+3. **Table location**: The base path for the table, which may come from catalog
+   or be specified directly
+4. **Time travel**: Version or timestamp constraints that affect which snapshot
+   to read
+
+**Why preserve structure instead of flattening early?** Different format
+implementations may need to know where an option came from. For example, a
+format might treat a table-level compression setting differently from a
+query-level override. By keeping layers separate, format code can make these
+distinctions when needed.
+
 Row-level operations use additional shared metadata. `RowLevelWriteInfo`
 describes DELETE, UPDATE, and MERGE execution, including the target table,
 condition, expanded input plans, touched-file plans, deletion-vector plans,
@@ -1982,6 +2342,31 @@ This layer is important for file formats such as Parquet, CSV, JSON, Avro, text,
 and binary. Lakehouse formats often have their own metadata logs or manifests,
 but plain file formats need listing logic to determine which files belong to a
 scan.
+
+**Why lakehouse formats (Delta, Iceberg) differ from file formats (Parquet, CSV):**
+
+Lakehouse formats are not just "Parquet with extra features." They have
+fundamentally different requirements:
+
+- **Metadata logs**: Lakehouse formats maintain transaction logs or metadata
+  files that track which data files are part of the table. Reading requires
+  parsing these logs, not listing directories.
+
+- **ACID semantics**: Writes must be atomic and isolated. This requires
+  coordinating file creation with log commits, handling concurrent writers, and
+  supporting rollback on failure.
+
+- **Schema evolution**: Lakehouse formats track schema changes over time and can
+  read old data with new schemas (or vice versa). File formats have no built-in
+  schema versioning.
+
+- **Row-level operations**: DELETE, UPDATE, and MERGE require tracking which
+  rows changed, potentially using deletion vectors or copy-on-write rewrites.
+  File formats only support append or full-file replacement.
+
+This is why Delta and Iceberg have dedicated crates (`sail-delta-lake`,
+`sail-iceberg`) with datasource, operations, and kernel modules, rather than
+being simple format plugins.
 
 ### `crates/sail-data-source/src/options/*`
 
@@ -2111,6 +2496,24 @@ A single session can discover stores lazily as plans reference new paths, while
 the registry still caches stores so repeated access to the same authority does
 not rebuild clients unnecessarily.
 
+**How dynamic registration works:**
+
+1. **URL parsing**: When a plan references a path like `s3://bucket-name/path/file.parquet`,
+   the registry extracts the scheme (`s3`) and authority (`bucket-name`).
+
+2. **Cache lookup**: The registry checks if a store for this scheme+authority
+   combination already exists. If so, it returns the cached store.
+
+3. **Lazy creation**: If no store exists, the registry creates one using
+   configuration (credentials, endpoints, retry policies) and caches it for
+   future use.
+
+4. **Why this matters for multi-cloud/multi-bucket**: A single query might read
+   from `s3://analytics-bucket/...` and write to `gs://archive-bucket/...`. The
+   registry handles both transparently, creating appropriate clients for each
+   cloud provider. Without dynamic registration, users would need to
+   pre-configure every bucket they might access.
+
 ## Functions And Python Execution
 
 ### `crates/sail-function/src/lib.rs`
@@ -2125,6 +2528,23 @@ unresolved function names from SQL or Spark Connect into the registered
 DataFusion function objects. When adding Spark-compatible function behavior, add
 or update the function implementation here and ensure the resolver can find it
 under the expected name.
+
+**Function registration flow:**
+
+- **Built-in functions**: Defined in `sail-function` crate, registered during
+  session setup. The session factory calls registration helpers that add scalar,
+  aggregate, and window functions to DataFusion's function registry. These are
+  available immediately when the session starts.
+
+- **Python UDFs**: Registered dynamically via Spark Connect or DataFrame API.
+  When a Python UDF is registered, it's stored in `CatalogManager`. During
+  resolution, `spec::UnresolvedFunction` nodes referencing UDFs are converted to
+  `MapPartitionsNode` logical nodes, which become `MapPartitionsExec` physical
+  operators that invoke Python.
+
+- **SQL-defined functions**: Functions created via `CREATE FUNCTION` are stored
+  in the catalog and resolved like table references. They may wrap expressions
+  or reference external implementations.
 
 ### `crates/sail-python-udf/src/lib.rs`
 
@@ -2179,6 +2599,19 @@ plan through `sail-plan`, producing a DataFusion physical plan through the
 session planner and optimizers. The session's `JobService` chooses the local or
 cluster job runner. The job runner returns a stream of Arrow record batches, and
 `ExecutePlanResponseStream` converts those batches into Spark Connect responses.
+
+**Detailed 8-step query flow:**
+
+| Step | Component | Action |
+|------|-----------|--------|
+| 1. **gRPC reception** | `plan_executor.rs` | Receive Spark Connect `ExecutePlanRequest` |
+| 2. **Protocol conversion** | Spark Connect converters | Convert protobuf `Relation` → `spec::Plan` |
+| 3. **Resolution** | `PlanResolver` | Resolve tables, columns, functions → DataFusion `LogicalPlan` |
+| 4. **Optimization** | DataFusion optimizer | Apply logical optimization rules |
+| 5. **Physical planning** | `ExtensionQueryPlanner` | Convert logical plan → `ExecutionPlan` with Sail extensions |
+| 6. **Schema renaming** | `NamedPlan` | Restore user-facing field names from internal names |
+| 7. **Execution** | `JobRunner` | Execute locally or send to driver for cluster execution |
+| 8. **Response streaming** | `ExecutePlanResponseStream` | Convert Arrow batches → Spark Connect responses |
 
 A SQL query follows the same downstream path after parsing and analysis. The SQL
 text is tokenized and parsed by `sail-sql-parser`, converted into `spec::Plan`
@@ -2248,30 +2681,41 @@ need to know whether a plan is running locally or in a cluster.
 
 ## Debugging Guide By Symptom
 
-If SQL text fails to parse, start with `sail-sql-analyzer/src/parser.rs` and the
-parser modules under `sail-sql-parser`. If SQL parses but produces the wrong
-semantic plan, inspect `sail-sql-analyzer/src/statement.rs`,
-`query.rs`, and `expression.rs`.
+| Symptom | Where to look |
+|---------|---------------|
+| SQL fails to parse | `sail-sql-analyzer/src/parser.rs`, `sail-sql-parser` modules |
+| SQL parses but wrong semantic plan | `sail-sql-analyzer/src/statement.rs`, `query.rs`, `expression.rs` |
+| Spark Connect converts incorrectly | Protobuf converters in `sail-spark-connect`, compare `spec::Plan` |
+| Table/column not found | `CatalogManager` resolution, catalog provider, `PlanResolverState` |
+| Table found but scans wrong data | Table format datasource module, object store registry |
+| Logical plan valid but physical fails | `sail-session/src/planner.rs` extension planner cases |
+| Physical plan valid but local exec fails | `sail-physical-plan` operator, `LocalJobRunner` |
+| Fails only in cluster mode | Driver actor, job scheduler, task assigner, worker actor, streams |
+| Wrong schema returned to client | `NamedPlan` field names, hidden field removal, `plan_analyzer.rs` |
 
-If Spark Connect input converts incorrectly, inspect the protobuf conversion
-code in the Spark Connect crate and compare the resulting `spec::Plan` with the
-SQL analyzer output for an equivalent query.
+**Additional debugging tips:**
 
-If a table or column cannot be resolved, inspect `CatalogManager` name
-resolution, the relevant catalog provider, and `PlanResolverState`. If a table
-is found but scans incorrectly, inspect the table format's datasource module and
-the object store registry.
+- **Enable EXPLAIN output**: Use `EXPLAIN` or `EXPLAIN ANALYZE` to see the
+  logical and physical plans. This shows where the plan diverges from
+  expectations.
 
-If a logical plan is valid but physical planning fails, inspect
-`sail-session/src/planner.rs` for missing extension planner support. If the
-physical plan is valid but execution fails locally, inspect the matching
-`sail-physical-plan` operator and `LocalJobRunner`. If it fails only in cluster
-mode, inspect the driver actor, job scheduler, task assigner, worker actor, and
-stream modules.
+- **Check resolver state**: If column resolution fails, the issue is often in
+  `PlanResolverState`. Check that field names are registered correctly and that
+  plan IDs match when using Spark Connect plan references.
 
-If schemas returned to Spark clients look wrong, inspect `NamedPlan` field names,
-hidden field removal in the query resolver, and schema conversion in
-`plan_analyzer.rs`.
+- **Inspect `spec::Plan`**: Since `spec` types are serializable, you can log
+  or print the intermediate plan before resolution. This helps isolate whether
+  the issue is in protocol conversion or resolution.
+
+- **Compare SQL vs Spark Connect**: If an operation works via SQL but not Spark
+  Connect (or vice versa), compare the `spec::Plan` produced by each path. They
+  should be equivalent.
+
+- **Cluster-specific debugging checklist**:
+  - Is the physical plan serializable? (All operators must support serde)
+  - Are workers receiving tasks? (Check driver actor logs)
+  - Are streams connecting between workers? (Check worker actor logs)
+  - Is the job graph correct? (Inspect stage dependencies and shuffle boundaries)
 
 ## Further Reading
 
