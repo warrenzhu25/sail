@@ -12,6 +12,14 @@ pub struct StreamManagerOptions {
     pub shuffle_dir: PathBuf,
 }
 
+#[allow(dead_code)]
+impl StreamManagerOptions {
+    pub fn with_shuffle_dir(mut self, shuffle_dir: PathBuf) -> Self {
+        self.shuffle_dir = shuffle_dir;
+        self
+    }
+}
+
 impl Default for StreamManagerOptions {
     fn default() -> Self {
         Self {

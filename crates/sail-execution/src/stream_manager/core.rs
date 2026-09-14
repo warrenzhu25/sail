@@ -121,6 +121,22 @@ impl StreamManager {
                 ))),
             },
             Entry::Vacant(entry) => {
+                let file_path = self
+                    .options
+                    .shuffle_dir
+                    .join(format!("{}", key.job_id))
+                    .join(format!("{}", key.stage))
+                    .join(format!(
+                        "shuffle_{}_{}_{}.data",
+                        key.partition, key.attempt, key.channel
+                    ));
+                if file_path.exists() {
+                    let mut stream =
+                        Box::new(crate::stream_manager::local::DiskStream::new(file_path));
+                    let source = stream.subscribe()?;
+                    entry.insert(LocalStreamState::Created { stream });
+                    return Ok(source);
+                }
                 let (tx, rx) = mpsc::channel(self.options.task_stream_buffer);
                 entry.insert(LocalStreamState::Pending { senders: vec![tx] });
                 ctx.send_with_delay(

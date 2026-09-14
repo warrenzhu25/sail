@@ -36,6 +36,12 @@ pub struct StageTopology {
 }
 
 impl JobTopology {
+    pub fn update_region_tasks(&mut self, region_idx: usize, tasks: Vec<TaskTopology>) {
+        if let Some(region) = self.regions.get_mut(region_idx) {
+            region.tasks = tasks;
+        }
+    }
+
     /// Groups pipelined stages into components and builds the topology of task regions and stages.
     pub fn try_new(graph: &JobGraph) -> ExecutionResult<Self> {
         let mut stages = (0..graph.stages().len())
@@ -96,8 +102,7 @@ impl JobTopology {
             let mut all_forward = true;
             for &u in &component {
                 for input in &graph.stages()[u].inputs {
-                    if component.contains(&input.stage) && !matches!(input.mode, InputMode::Forward)
-                    {
+                    if !matches!(input.mode, InputMode::Forward) {
                         all_forward = false;
                         break;
                     }

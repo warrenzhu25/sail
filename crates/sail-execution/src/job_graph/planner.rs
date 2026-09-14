@@ -25,14 +25,22 @@ use crate::job_graph::{
 use crate::plan::{ShuffleConsumption, StageInputExec};
 
 impl JobGraph {
+    #[allow(dead_code)]
     pub fn try_new(plan: Arc<dyn ExecutionPlan>) -> ExecutionResult<Self> {
+        Self::try_new_with_mode(plan, OutputMode::Pipelined)
+    }
+
+    pub fn try_new_with_mode(
+        plan: Arc<dyn ExecutionPlan>,
+        shuffle_mode: OutputMode,
+    ) -> ExecutionResult<Self> {
         let plan = ensure_single_input_partition_for_global_limit(plan)?;
         let plan = ensure_partitioned_hash_join_if_build_side_emits_unmatched_rows(plan)?;
         let mut graph = Self {
             stages: vec![],
             schema: plan.schema(),
         };
-        let last = build_job_graph(plan, PartitionUsage::Once, &mut graph)?;
+        let last = build_job_graph(plan, PartitionUsage::Once, &mut graph, shuffle_mode)?;
         let (last, inputs) = rewrite_inputs(last)?;
         graph.stages.push(Stage {
             inputs,
@@ -171,6 +179,7 @@ fn build_job_graph(
     plan: Arc<dyn ExecutionPlan>,
     usage: PartitionUsage,
     graph: &mut JobGraph,
+    shuffle_mode: OutputMode,
 ) -> ExecutionResult<Arc<dyn ExecutionPlan>> {
     // Recursively build the job graph for the children first
     // and propagate partition usage information.
@@ -179,14 +188,14 @@ fn build_job_graph(
         match join.mode {
             PartitionMode::Partitioned => {
                 vec![
-                    build_job_graph(left.clone(), usage, graph)?,
-                    build_job_graph(right.clone(), usage, graph)?,
+                    build_job_graph(left.clone(), usage, graph, shuffle_mode)?,
+                    build_job_graph(right.clone(), usage, graph, shuffle_mode)?,
                 ]
             }
             PartitionMode::CollectLeft => {
                 vec![
-                    build_job_graph(left.clone(), PartitionUsage::Shared, graph)?,
-                    build_job_graph(right.clone(), usage, graph)?,
+                    build_job_graph(left.clone(), PartitionUsage::Shared, graph, shuffle_mode)?,
+                    build_job_graph(right.clone(), usage, graph, shuffle_mode)?,
                 ]
             }
             PartitionMode::Auto => {
@@ -201,8 +210,8 @@ fn build_job_graph(
     {
         let (left, right) = plan.children().two()?;
         vec![
-            build_job_graph(left.clone(), PartitionUsage::Shared, graph)?,
-            build_job_graph(right.clone(), usage, graph)?,
+            build_job_graph(left.clone(), PartitionUsage::Shared, graph, shuffle_mode)?,
+            build_job_graph(right.clone(), usage, graph, shuffle_mode)?,
         ]
     } else if plan.as_any().is::<RepartitionExec>()
         || plan.as_any().is::<CoalescePartitionsExec>()
@@ -211,11 +220,11 @@ fn build_job_graph(
         let child = plan.children().one()?;
         // At the stage boundary, we only expect to use the child partition once
         // since the shuffle writer can materialize the data for multiple consumption.
-        vec![build_job_graph(child.clone(), PartitionUsage::Once, graph)?]
+        vec![build_job_graph(child.clone(), PartitionUsage::Once, graph, shuffle_mode)?]
     } else {
         plan.children()
             .into_iter()
-            .map(|x| build_job_graph(x.clone(), usage, graph))
+            .map(|x| build_job_graph(x.clone(), usage, graph, shuffle_mode))
             .collect::<ExecutionResult<Vec<_>>>()?
     };
     let plan = with_new_children_if_necessary(plan, children)?;
@@ -244,17 +253,17 @@ fn build_job_graph(
                         .clone()
                         .with_partitioning(Partitioning::RoundRobinBatch(n)),
                 );
-                create_shuffle(child, graph, properties, consumption)?
+                create_shuffle(child, graph, properties, consumption, shuffle_mode)?
             }
             Partitioning::RoundRobinBatch(_) | Partitioning::Hash(_, _) => {
-                create_shuffle(child, graph, properties, consumption)?
+                create_shuffle(child, graph, properties, consumption, shuffle_mode)?
             }
         }
     } else if let Some(coalesce) = plan.as_any().downcast_ref::<CoalescePartitionsExec>() {
         let properties = coalesce.properties().clone();
         let child = plan.children().one()?;
         let fetch = coalesce.fetch();
-        let shuffled = create_shuffle(child, graph, properties, consumption)?;
+        let shuffled = create_shuffle(child, graph, properties, consumption, shuffle_mode)?;
         if let Some(f) = fetch {
             Arc::new(GlobalLimitExec::new(shuffled, 0, Some(f))) as Arc<dyn ExecutionPlan>
         } else {
@@ -263,7 +272,7 @@ fn build_job_graph(
     } else if plan.as_any().is::<SortPreservingMergeExec>() {
         let child = plan.children().one()?;
         plan.clone()
-            .with_new_children(vec![create_merge_input(child, graph)?])?
+            .with_new_children(vec![create_merge_input(child, graph, shuffle_mode)?])?
     } else if plan.as_any().is::<SystemTableExec>() || plan.as_any().is::<CatalogCommandExec>() {
         plan.children().zero()?;
         create_driver_stage(&plan, graph)?
@@ -276,6 +285,7 @@ fn build_job_graph(
 fn create_merge_input(
     plan: &Arc<dyn ExecutionPlan>,
     graph: &mut JobGraph,
+    shuffle_mode: OutputMode,
 ) -> ExecutionResult<Arc<dyn ExecutionPlan>> {
     let properties = plan.properties().clone();
     let (plan, inputs) = rewrite_inputs(plan.clone())?;
@@ -283,17 +293,14 @@ fn create_merge_input(
         inputs,
         plan,
         group: String::new(),
-        mode: OutputMode::Pipelined,
+        mode: shuffle_mode,
         distribution: OutputDistribution::RoundRobin { channels: 1 },
         placement: TaskPlacement::Worker,
     };
     let s = graph.stages.len();
     graph.stages.push(stage);
     Ok(Arc::new(StageInputExec::new(
-        StageInput {
-            stage: s,
-            mode: InputMode::Merge,
-        },
+        StageInput::new(s, InputMode::Merge),
         properties,
     )))
 }
@@ -305,6 +312,7 @@ fn create_shuffle(
     // which are different from the properties of the input plan.
     properties: Arc<PlanProperties>,
     consumption: ShuffleConsumption,
+    shuffle_mode: OutputMode,
 ) -> ExecutionResult<Arc<dyn ExecutionPlan>> {
     let distribution = match properties.partitioning.clone() {
         Partitioning::RoundRobinBatch(channels) | Partitioning::UnknownPartitioning(channels) => {
@@ -317,7 +325,7 @@ fn create_shuffle(
         inputs,
         plan,
         group: String::new(),
-        mode: OutputMode::Pipelined,
+        mode: shuffle_mode,
         distribution,
         placement: TaskPlacement::Worker,
     };
@@ -328,7 +336,7 @@ fn create_shuffle(
         ShuffleConsumption::Multiple => InputMode::Broadcast,
     };
     Ok(Arc::new(StageInputExec::new(
-        StageInput { stage: s, mode },
+        StageInput::new(s, mode),
         properties,
     )))
 }
@@ -366,10 +374,7 @@ fn create_driver_stage(
     let s = graph.stages.len();
     graph.stages.push(stage);
     Ok(Arc::new(StageInputExec::new(
-        StageInput {
-            stage: s,
-            mode: InputMode::Forward,
-        },
+        StageInput::new(s, InputMode::Forward),
         plan.properties().clone(),
     )))
 }

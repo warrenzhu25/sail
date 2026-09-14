@@ -27,6 +27,10 @@ impl JobGraph {
         &self.stages
     }
 
+    pub fn stages_mut(&mut self) -> &mut [Stage] {
+        &mut self.stages
+    }
+
     pub fn schema(&self) -> &SchemaRef {
         &self.schema
     }
@@ -112,10 +116,23 @@ impl fmt::Display for TaskPlacement {
     }
 }
 
+use std::ops::Range;
+
 #[derive(Debug, Clone)]
 pub struct StageInput {
     pub stage: usize,
     pub mode: InputMode,
+    pub partition_ranges: Option<Vec<Range<usize>>>,
+}
+
+impl StageInput {
+    pub fn new(stage: usize, mode: InputMode) -> Self {
+        Self {
+            stage,
+            mode,
+            partition_ranges: None,
+        }
+    }
 }
 
 impl fmt::Display for StageInput {
@@ -156,10 +173,10 @@ impl fmt::Display for InputMode {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputMode {
     Pipelined,
-    #[expect(unused)]
+    #[allow(dead_code)]
     Blocking,
 }
 

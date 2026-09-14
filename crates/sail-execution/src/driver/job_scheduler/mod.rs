@@ -1,3 +1,4 @@
+pub mod adaptive;
 mod core;
 mod observer;
 mod options;
