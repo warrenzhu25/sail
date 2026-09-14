@@ -19,12 +19,11 @@ pub enum TaskWriteLocation {
     },
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LocalStreamStorage {
     Memory {
         replicas: usize,
     },
-    #[expect(unused)]
     Disk,
 }
 

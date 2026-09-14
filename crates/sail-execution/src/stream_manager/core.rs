@@ -35,7 +35,7 @@ impl StreamManager {
     ) -> ExecutionResult<Box<dyn TaskStreamSink>> {
         let create = |senders: Vec<_>| -> ExecutionResult<_> {
             let mut stream =
-                Self::create_local_stream_with_senders(storage, senders, &self.options)?;
+                Self::create_local_stream_with_senders(&key, storage, senders, &self.options)?;
             let sink = stream.publish()?;
             Ok((stream, sink))
         };
@@ -152,8 +152,20 @@ impl StreamManager {
         if let Some(stage) = stage {
             self.local_streams
                 .retain(|key, _| key.job_id != job_id || key.stage != stage);
+            let stage_dir = self
+                .options
+                .shuffle_dir
+                .join(format!("{job_id}"))
+                .join(format!("{stage}"));
+            if stage_dir.exists() {
+                let _ = std::fs::remove_dir_all(stage_dir);
+            }
         } else {
             self.local_streams.retain(|key, _| key.job_id != job_id);
+            let job_dir = self.options.shuffle_dir.join(format!("{job_id}"));
+            if job_dir.exists() {
+                let _ = std::fs::remove_dir_all(job_dir);
+            }
         }
     }
 
@@ -197,6 +209,7 @@ impl StreamManager {
     }
 
     fn create_local_stream_with_senders(
+        key: &TaskStreamKey,
         storage: LocalStreamStorage,
         senders: Vec<mpsc::Sender<TaskStreamResult<RecordBatch>>>,
         options: &StreamManagerOptions,
@@ -207,9 +220,20 @@ impl StreamManager {
                 replicas,
                 senders,
             ))),
-            LocalStreamStorage::Disk => Err(ExecutionError::InternalError(
-                "not implemented: local disk storage".to_string(),
-            )),
+            LocalStreamStorage::Disk => {
+                let file_path = options
+                    .shuffle_dir
+                    .join(format!("{}", key.job_id))
+                    .join(format!("{}", key.stage))
+                    .join(format!(
+                        "shuffle_{}_{}_{}.data",
+                        key.partition, key.attempt, key.channel
+                    ));
+                Ok(Box::new(crate::stream_manager::local::DiskStream::new(
+                    file_path,
+                )))
+            }
         }
     }
 }
+

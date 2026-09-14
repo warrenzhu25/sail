@@ -171,3 +171,109 @@ impl TaskStreamSink for MemoryStreamReplicaSender {
         Ok(())
     }
 }
+
+/// A disk-backed stream that persists record batches to a data file and reads them back.
+pub(crate) struct DiskStream {
+    file_path: std::path::PathBuf,
+    is_written: bool,
+}
+
+impl DiskStream {
+    pub fn new(file_path: std::path::PathBuf) -> Self {
+        Self {
+            file_path,
+            is_written: false,
+        }
+    }
+}
+
+impl LocalStream for DiskStream {
+    fn publish(&mut self) -> ExecutionResult<Box<dyn TaskStreamSink>> {
+        if self.is_written {
+            return Err(ExecutionError::InternalError(
+                "disk stream can only be written once".to_string(),
+            ));
+        }
+        self.is_written = true;
+        if let Some(parent) = self.file_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = std::fs::File::create(&self.file_path)?;
+        Ok(Box::new(DiskStreamWriter {
+            writer: Some(file),
+            stream_writer: None,
+        }))
+    }
+
+    fn subscribe(&mut self) -> ExecutionResult<TaskStreamSource> {
+        let file = std::fs::File::open(&self.file_path)?;
+        let reader = match datafusion::arrow::ipc::reader::StreamReader::try_new(file, None) {
+            Ok(r) => r,
+            Err(e) => {
+                return Err(ExecutionError::InternalError(format!(
+                    "failed to open arrow ipc stream reader: {e}"
+                )));
+            }
+        };
+
+        let batches: Vec<TaskStreamResult<RecordBatch>> = reader
+            .map(|r| r.map_err(|e| crate::stream::error::TaskStreamError::Unknown(e.to_string())))
+            .collect();
+
+        Ok(Box::pin(futures::stream::iter(batches)))
+    }
+}
+
+struct DiskStreamWriter {
+    writer: Option<std::fs::File>,
+    stream_writer: Option<datafusion::arrow::ipc::writer::StreamWriter<std::fs::File>>,
+}
+
+#[tonic::async_trait]
+impl TaskStreamSink for DiskStreamWriter {
+    async fn write(&mut self, batch: TaskStreamResult<RecordBatch>) -> TaskStreamSinkState {
+        let batch = match batch {
+            Ok(b) => b,
+            Err(e) => {
+                return TaskStreamSinkState::Error(datafusion::error::DataFusionError::Execution(
+                    e.to_string(),
+                ));
+            }
+        };
+
+        if self.stream_writer.is_none() {
+            if let Some(file) = self.writer.take() {
+                match datafusion::arrow::ipc::writer::StreamWriter::try_new(file, &batch.schema()) {
+                    Ok(sw) => self.stream_writer = Some(sw),
+                    Err(e) => {
+                        return TaskStreamSinkState::Error(
+                            datafusion::error::DataFusionError::Execution(e.to_string()),
+                        );
+                    }
+                }
+            } else {
+                return TaskStreamSinkState::Closed;
+            }
+        }
+
+        if let Some(ref mut sw) = self.stream_writer {
+            if let Err(e) = sw.write(&batch) {
+                return TaskStreamSinkState::Error(datafusion::error::DataFusionError::Execution(
+                    e.to_string(),
+                ));
+            }
+            TaskStreamSinkState::Ok
+        } else {
+            TaskStreamSinkState::Closed
+        }
+    }
+
+    async fn close(mut self: Box<Self>) -> Result<()> {
+        if let Some(mut sw) = self.stream_writer.take() {
+            sw.finish()
+                .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+        }
+        Ok(())
+    }
+}
+
