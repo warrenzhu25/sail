@@ -41,7 +41,7 @@ pub struct TaskSetEntry {
 #[derive(Debug, Clone)]
 pub enum TaskOutputKind {
     Local,
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     Remote,
 }
 

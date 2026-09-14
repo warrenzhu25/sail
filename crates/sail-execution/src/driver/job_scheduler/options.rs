@@ -26,7 +26,7 @@ impl Default for JobSchedulerOptions {
             task_launch_timeout: Duration::from_secs(60),
             task_max_attempts: 3,
             shuffle_mode: OutputMode::Pipelined,
-            shuffle_dir: PathBuf::from(std::env::temp_dir()).join("sail").join("shuffle"),
+            shuffle_dir: std::env::temp_dir().join("sail").join("shuffle"),
             adaptive_enabled: true,
             target_partition_size: 64 * 1024 * 1024,
             min_partition_size: 1024 * 1024,
@@ -36,7 +36,7 @@ impl Default for JobSchedulerOptions {
     }
 }
 
-#[allow(dead_code)]
+#[expect(dead_code)]
 impl JobSchedulerOptions {
     pub fn with_shuffle_mode(mut self, shuffle_mode: OutputMode) -> Self {
         self.shuffle_mode = shuffle_mode;
@@ -58,6 +58,11 @@ impl JobSchedulerOptions {
         self
     }
 
+    pub fn with_min_partition_size(mut self, min_partition_size: u64) -> Self {
+        self.min_partition_size = min_partition_size;
+        self
+    }
+
     pub fn with_skew_factor(mut self, skew_factor: f64) -> Self {
         self.skew_factor = skew_factor;
         self
@@ -75,7 +80,7 @@ impl From<&DriverOptions> for JobSchedulerOptions {
             task_launch_timeout: options.task_launch_timeout,
             task_max_attempts: options.task_max_attempts,
             shuffle_mode: OutputMode::Pipelined,
-            shuffle_dir: PathBuf::from(std::env::temp_dir()).join("sail").join("shuffle"),
+            shuffle_dir: std::env::temp_dir().join("sail").join("shuffle"),
             adaptive_enabled: true,
             target_partition_size: 64 * 1024 * 1024,
             min_partition_size: 1024 * 1024,

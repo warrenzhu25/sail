@@ -17,12 +17,11 @@ use sail_server::actor::ActorContext;
 
 use crate::driver::job_scheduler::adaptive::StageShuffleStats;
 use crate::driver::job_scheduler::state::{
-    JobDescriptor, JobState, StageState, TaskAttemptDescriptor, TaskDescriptor, TaskRegionState,
-    TaskState,
+    JobDescriptor, JobState, StageState, TaskAttemptDescriptor, TaskDescriptor,
+    TaskRegionDescriptor, TaskRegionState, TaskState,
 };
-use crate::driver::job_scheduler::topology::{TaskRegionTopology, TaskTopology};
+use crate::driver::job_scheduler::topology::{JobTopology, TaskRegionTopology};
 use crate::driver::job_scheduler::{JobAction, JobScheduler, JobSchedulerOptions};
-use crate::plan::StageInputExec;
 use crate::driver::output::build_job_output;
 use crate::driver::DriverActor;
 use crate::error::{ExecutionError, ExecutionResult};
@@ -30,6 +29,7 @@ use crate::id::{JobId, TaskKey, TaskKeyDisplay, TaskStreamKey};
 use crate::job_graph::{
     InputMode, JobGraph, OutputDistribution, OutputMode, Stage, StageInput, TaskPlacement,
 };
+use crate::plan::StageInputExec;
 use crate::task::definition::{
     TaskDefinition, TaskInput, TaskInputKey, TaskInputLocator, TaskOutput, TaskOutputDistribution,
     TaskOutputLocator,
@@ -250,16 +250,12 @@ impl JobScheduler {
                 continue;
             }
             let all_consumers_succeeded = stage.consumers.iter().all(|&c| {
-                let partitions = job.graph.stages()[c]
-                    .plan
-                    .output_partitioning()
-                    .partition_count();
-                (0..partitions).all(|p| {
-                    job.stages[c].tasks[p]
-                        .attempts
-                        .last()
-                        .is_some_and(|a| matches!(a.state, TaskState::Succeeded))
-                })
+                !job.stages[c].tasks.is_empty()
+                    && job.stages[c].tasks.iter().all(|t| {
+                        t.attempts
+                            .last()
+                            .is_some_and(|a| matches!(a.state, TaskState::Succeeded))
+                    })
             });
 
             if all_consumers_succeeded && !stage.consumers.is_empty() {
@@ -281,6 +277,10 @@ impl JobScheduler {
         job: &mut JobDescriptor,
     ) -> Vec<JobAction> {
         let mut actions = vec![];
+
+        if options.adaptive_enabled {
+            Self::optimize_stages_adaptively(options, job_id, job);
+        }
 
         for r in 0..job.topology.regions.len() {
             if matches!(job.regions[r].state, TaskRegionState::Succeeded) {
@@ -307,10 +307,6 @@ impl JobScheduler {
                 continue;
             }
 
-            if options.adaptive_enabled {
-                Self::optimize_region_adaptively(options, job_id, job, r);
-            }
-
             for t in &job.topology.regions[r].tasks {
                 job.stages[t.stage].tasks[t.partition]
                     .attempts
@@ -332,34 +328,55 @@ impl JobScheduler {
         actions
     }
 
-    fn optimize_region_adaptively(
+    fn optimize_stages_adaptively(
         options: &JobSchedulerOptions,
         job_id: JobId,
         job: &mut JobDescriptor,
-        region_idx: usize,
     ) {
-        let stages_in_region: Vec<usize> = job.topology.regions[region_idx]
-            .tasks
-            .iter()
-            .map(|t| t.stage)
-            .collect::<IndexSet<_>>()
-            .into_iter()
-            .collect();
+        let mut topology_changed = false;
 
-        for s in &stages_in_region {
-            let s = *s;
+        for s in 0..job.graph.stages().len() {
             let inputs = job.graph.stages()[s].inputs.clone();
-            for (input_idx, input) in inputs.iter().enumerate() {
-                if !matches!(input.mode, InputMode::Shuffle) {
-                    continue;
-                }
+            let shuffle_inputs: Vec<(usize, crate::job_graph::StageInput)> = inputs
+                .iter()
+                .cloned()
+                .enumerate()
+                .filter(|(_, input)| matches!(input.mode, InputMode::Shuffle))
+                .collect();
+
+            if shuffle_inputs.is_empty() {
+                continue;
+            }
+
+            if shuffle_inputs
+                .iter()
+                .any(|(_, input)| input.partition_ranges.is_some())
+            {
+                continue;
+            }
+
+            let all_upstream_ready = shuffle_inputs.iter().all(|(_, input)| {
                 let u = input.stage;
-                if !matches!(job.graph.stages()[u].mode, OutputMode::Blocking) {
-                    continue;
-                }
-                if input.partition_ranges.is_some() {
-                    continue;
-                }
+                matches!(job.graph.stages()[u].mode, OutputMode::Blocking)
+                    && job.stages[u].tasks.iter().all(|t| {
+                        t.attempts
+                            .last()
+                            .is_some_and(|a| matches!(a.state, TaskState::Succeeded))
+                    })
+            });
+
+            if !all_upstream_ready {
+                continue;
+            }
+
+            let upstream_channels = {
+                let first_u = shuffle_inputs[0].1.stage;
+                job.graph.stages()[first_u].distribution.channels()
+            };
+
+            let mut combined_channel_bytes = vec![0u64; upstream_channels];
+            for (_, input) in &shuffle_inputs {
+                let u = input.stage;
                 let upstream_partitions = job.stages[u].tasks.len();
                 let upstream_channels = job.graph.stages()[u].distribution.channels();
                 let upstream_attempts: Vec<usize> = (0..upstream_partitions)
@@ -375,21 +392,44 @@ impl JobScheduler {
                     &upstream_attempts,
                 );
 
-                let mut ranges = stats.coalesce(options.target_partition_size);
-                if ranges.is_empty() {
-                    ranges = (0..upstream_channels).map(|c| c..c + 1).collect();
+                let skewed =
+                    stats.detect_skew_partitions(options.skew_factor, options.min_skew_threshold);
+                if !skewed.is_empty() {
+                    debug!("job {job_id} stage {s} upstream stage {u} detected skewed channels: {skewed:?}");
                 }
-                let new_partition_count = ranges.len();
 
+                if stats.should_broadcast_join(10 * 1024 * 1024) {
+                    debug!("job {job_id} stage {s} upstream stage {u} candidate for broadcast join (total: {} bytes)", stats.total_bytes);
+                }
+
+                for (c, &b) in stats.channel_bytes.iter().enumerate() {
+                    if c < combined_channel_bytes.len() {
+                        combined_channel_bytes[c] += b;
+                    }
+                }
+            }
+
+            let mut ranges = crate::driver::job_scheduler::adaptive::coalesce_shuffle_partitions(
+                &combined_channel_bytes,
+                options.target_partition_size,
+            );
+            if ranges.is_empty() {
+                ranges = (0..upstream_channels).map(|c| c..c + 1).collect();
+            }
+            let new_partition_count = ranges.len();
+
+            if new_partition_count < upstream_channels {
                 debug!(
-                    "job {job_id} stage {s} input {input_idx}: adaptively coalesced {upstream_channels} channels into {new_partition_count} partitions (ranges: {ranges:?})"
+                    "job {job_id} stage {s}: adaptively coalesced {upstream_channels} channels into {new_partition_count} partitions (ranges: {ranges:?})"
                 );
 
-                job.graph.stages_mut()[s].inputs[input_idx].partition_ranges = Some(ranges);
+                for (input_idx, _) in &shuffle_inputs {
+                    job.graph.stages_mut()[s].inputs[*input_idx].partition_ranges =
+                        Some(ranges.clone());
+                }
 
                 if let Ok(new_plan) = update_stage_plan_partitioning(
                     job.graph.stages()[s].plan.clone(),
-                    input_idx,
                     new_partition_count,
                 ) {
                     job.graph.stages_mut()[s].plan = new_plan;
@@ -398,20 +438,23 @@ impl JobScheduler {
                 job.stages[s].tasks = (0..new_partition_count)
                     .map(|_| TaskDescriptor { attempts: vec![] })
                     .collect();
+
+                topology_changed = true;
             }
         }
 
-        let mut new_region_tasks = Vec::new();
-        for s in &stages_in_region {
-            let p_count = job.stages[*s].tasks.len();
-            for p in 0..p_count {
-                new_region_tasks.push(TaskTopology {
-                    stage: *s,
-                    partition: p,
-                });
+        if topology_changed {
+            if let Ok(new_topology) = JobTopology::try_new(&job.graph) {
+                job.topology = new_topology;
+                job.regions.resize(
+                    job.topology.regions.len(),
+                    TaskRegionDescriptor {
+                        state: TaskRegionState::Running,
+                    },
+                );
+                Self::update_task_regions(job, options);
             }
         }
-        job.topology.update_region_tasks(region_idx, new_region_tasks);
     }
 
     fn build_task_region(
@@ -870,7 +913,6 @@ struct StageGroup {
 
 fn update_stage_plan_partitioning(
     plan: Arc<dyn ExecutionPlan>,
-    target_input: usize,
     new_partition_count: usize,
 ) -> ExecutionResult<Arc<dyn ExecutionPlan>> {
     use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
@@ -878,19 +920,47 @@ fn update_stage_plan_partitioning(
 
     let result = plan.transform_up(|node| {
         if let Some(placeholder) = node.as_any().downcast_ref::<StageInputExec<usize>>() {
-            if *placeholder.input() == target_input {
-                let old_props = placeholder.properties();
-                let new_partitioning =
-                    datafusion::physical_plan::Partitioning::UnknownPartitioning(new_partition_count);
-                let new_props = Arc::new(PlanProperties::new(
-                    old_props.equivalence_properties().clone(),
-                    new_partitioning,
-                    old_props.emission_type,
-                    old_props.boundedness,
-                ));
-                let new_node = StageInputExec::new(target_input, new_props);
-                return Ok(Transformed::yes(Arc::new(new_node) as Arc<dyn ExecutionPlan>));
-            }
+            let old_props = placeholder.properties();
+            let new_partitioning =
+                datafusion::physical_plan::Partitioning::UnknownPartitioning(new_partition_count);
+            let new_props = Arc::new(PlanProperties::new(
+                old_props.equivalence_properties().clone(),
+                new_partitioning,
+                old_props.emission_type,
+                old_props.boundedness,
+            ));
+            let new_node = StageInputExec::new(*placeholder.input(), new_props);
+            return Ok(Transformed::yes(
+                Arc::new(new_node) as Arc<dyn ExecutionPlan>
+            ));
+        }
+        if let Some(repartition) =
+            node.as_any()
+                .downcast_ref::<datafusion::physical_plan::repartition::RepartitionExec>()
+        {
+            let new_partitioning = match repartition.partitioning() {
+                datafusion::physical_plan::Partitioning::RoundRobinBatch(_) => {
+                    datafusion::physical_plan::Partitioning::RoundRobinBatch(new_partition_count)
+                }
+                datafusion::physical_plan::Partitioning::Hash(exprs, _) => {
+                    datafusion::physical_plan::Partitioning::Hash(
+                        exprs.clone(),
+                        new_partition_count,
+                    )
+                }
+                datafusion::physical_plan::Partitioning::UnknownPartitioning(_) => {
+                    datafusion::physical_plan::Partitioning::UnknownPartitioning(
+                        new_partition_count,
+                    )
+                }
+            };
+            let new_repartition = datafusion::physical_plan::repartition::RepartitionExec::try_new(
+                repartition.input().clone(),
+                new_partitioning,
+            )?;
+            return Ok(Transformed::yes(
+                Arc::new(new_repartition) as Arc<dyn ExecutionPlan>
+            ));
         }
         Ok(Transformed::no(node))
     });
@@ -910,18 +980,25 @@ mod tests {
 
     #[test]
     fn test_adaptive_disk_shuffle_coalescing_workflow() -> Result<(), Box<dyn std::error::Error>> {
-        let temp_dir = std::env::temp_dir().join(format!("sail_test_aqe_{}", rand::random::<u64>()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("sail_test_aqe_{}", rand::random::<u64>()));
         let job_id = JobId::from(42);
         let stage_dir = temp_dir.join(format!("{job_id}")).join("0");
         std::fs::create_dir_all(&stage_dir)?;
 
         // Map partition 0, attempt 0: channels 0..4 (each 100 bytes)
         for c in 0..4 {
-            std::fs::write(stage_dir.join(format!("shuffle_0_0_{c}.index")), "100\n10\n")?;
+            std::fs::write(
+                stage_dir.join(format!("shuffle_0_0_{c}.index")),
+                "100\n10\n",
+            )?;
         }
         // Map partition 1, attempt 0: channels 0..4 (each 100 bytes)
         for c in 0..4 {
-            std::fs::write(stage_dir.join(format!("shuffle_1_0_{c}.index")), "100\n10\n")?;
+            std::fs::write(
+                stage_dir.join(format!("shuffle_1_0_{c}.index")),
+                "100\n10\n",
+            )?;
         }
 
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
@@ -934,10 +1011,17 @@ mod tests {
         let graph = JobGraph::try_new_with_mode(repartition, OutputMode::Blocking)?;
         assert_eq!(graph.stages().len(), 2);
         assert_eq!(graph.stages()[0].mode.to_string(), "Blocking");
-        assert_eq!(graph.stages()[1].plan.output_partitioning().partition_count(), 4);
+        assert_eq!(
+            graph.stages()[1]
+                .plan
+                .output_partitioning()
+                .partition_count(),
+            4
+        );
 
         let mut job = JobDescriptor::try_new(graph, JobState::Draining)?;
-        assert_eq!(job.topology.regions.len(), 2);
+        // 1 partition for Stage 0 + 4 partitions for Stage 1 = 5 regions
+        assert_eq!(job.topology.regions.len(), 5);
 
         // Mark upstream tasks (Stage 0) as succeeded
         let stage0_partitions = job.stages[0].tasks.len();
@@ -962,11 +1046,17 @@ mod tests {
         assert!(matches!(job.regions[0].state, TaskRegionState::Succeeded));
 
         let actions = JobScheduler::schedule_task_regions(&options, job_id, &mut job);
-        assert_eq!(actions.len(), 1);
+        assert_eq!(actions.len(), 2);
+        assert_eq!(job.topology.regions.len(), 3); // 1 for Stage 0 + 2 for Stage 1
 
-        // Stage 1 was coalesced from 4 partitions to 2 partitions!
         assert_eq!(job.stages[1].tasks.len(), 2);
-        assert_eq!(job.graph.stages()[1].plan.output_partitioning().partition_count(), 2);
+        assert_eq!(
+            job.graph.stages()[1]
+                .plan
+                .output_partitioning()
+                .partition_count(),
+            2
+        );
         assert_eq!(
             job.graph.stages()[1].inputs[0].partition_ranges,
             Some(vec![0..2, 2..4])
@@ -978,7 +1068,8 @@ mod tests {
 
     #[test]
     fn test_adaptive_disabled_preserves_partitions() -> Result<(), Box<dyn std::error::Error>> {
-        let temp_dir = std::env::temp_dir().join(format!("sail_test_aqe_off_{}", rand::random::<u64>()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("sail_test_aqe_off_{}", rand::random::<u64>()));
         let job_id = JobId::from(43);
         let stage_dir = temp_dir.join(format!("{job_id}")).join("0");
         std::fs::create_dir_all(&stage_dir)?;
@@ -996,6 +1087,7 @@ mod tests {
 
         let graph = JobGraph::try_new_with_mode(repartition, OutputMode::Blocking)?;
         let mut job = JobDescriptor::try_new(graph, JobState::Draining)?;
+        assert_eq!(job.topology.regions.len(), 5);
 
         for p in 0..job.stages[0].tasks.len() {
             job.stages[0].tasks[p].attempts.push(TaskAttemptDescriptor {
@@ -1015,11 +1107,17 @@ mod tests {
 
         JobScheduler::update_task_regions(&mut job, &options);
         let actions = JobScheduler::schedule_task_regions(&options, job_id, &mut job);
-        assert_eq!(actions.len(), 1);
+        // Stage 1 remains 4 partitions, each scheduled in its own region!
+        assert_eq!(actions.len(), 4);
 
-        // Stage 1 remains 4 partitions!
         assert_eq!(job.stages[1].tasks.len(), 4);
-        assert_eq!(job.graph.stages()[1].plan.output_partitioning().partition_count(), 4);
+        assert_eq!(
+            job.graph.stages()[1]
+                .plan
+                .output_partitioning()
+                .partition_count(),
+            4
+        );
         assert_eq!(job.graph.stages()[1].inputs[0].partition_ranges, None);
 
         let _ = std::fs::remove_dir_all(temp_dir);
@@ -1085,7 +1183,7 @@ mod tests {
             TaskInputLocator::Worker { stage, keys } => {
                 assert_eq!(stage, 0);
                 assert_eq!(keys.len(), 2); // 2 coalesced partitions
-                // Partition 0 reads channels 0 and 1
+                                           // Partition 0 reads channels 0 and 1
                 assert_eq!(keys[0].len(), 2);
                 assert_eq!(keys[0][0].1.channel, 0);
                 assert_eq!(keys[0][1].1.channel, 1);
@@ -1094,7 +1192,7 @@ mod tests {
                 assert_eq!(keys[1][0].1.channel, 2);
                 assert_eq!(keys[1][1].1.channel, 3);
             }
-            _ => panic!("expected Worker locator"),
+            _ => return Err("expected Worker locator".into()),
         }
 
         Ok(())
@@ -1102,7 +1200,8 @@ mod tests {
 
     #[test]
     fn test_disk_shuffle_stage_and_job_cleanup() -> Result<(), Box<dyn std::error::Error>> {
-        let temp_dir = std::env::temp_dir().join(format!("sail_test_clean_{}", rand::random::<u64>()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("sail_test_clean_{}", rand::random::<u64>()));
         let job_id = JobId::from(99);
         let stage0_dir = temp_dir.join(format!("{job_id}")).join("0");
         let stage1_dir = temp_dir.join(format!("{job_id}")).join("1");
@@ -1115,8 +1214,8 @@ mod tests {
         assert!(stage0_dir.exists());
         assert!(stage1_dir.exists());
 
-        let options =
-            crate::stream_manager::StreamManagerOptions::default().with_shuffle_dir(temp_dir.clone());
+        let options = crate::stream_manager::StreamManagerOptions::default()
+            .with_shuffle_dir(temp_dir.clone());
         let mut sm = crate::stream_manager::StreamManager::new(options);
 
         // Remove only stage 0
@@ -1127,6 +1226,190 @@ mod tests {
         // Remove entire job
         sm.remove_local_streams(job_id, None);
         assert!(!temp_dir.join(format!("{job_id}")).exists());
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_adaptive_multi_input_coalescing() -> Result<(), Box<dyn std::error::Error>> {
+        use datafusion::common::{JoinType, NullEquality};
+        use datafusion::physical_expr::expressions::Column;
+        use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("sail_test_aqe_multi_{}", rand::random::<u64>()));
+        let job_id = JobId::from(77);
+
+        // Stage 0 dir (left upstream)
+        let stage0_dir = temp_dir.join(format!("{job_id}")).join("0");
+        std::fs::create_dir_all(&stage0_dir)?;
+        for c in 0..4 {
+            std::fs::write(stage0_dir.join(format!("shuffle_0_0_{c}.index")), "50\n5\n")?;
+        }
+
+        // Stage 1 dir (right upstream)
+        let stage1_dir = temp_dir.join(format!("{job_id}")).join("1");
+        std::fs::create_dir_all(&stage1_dir)?;
+        for c in 0..4 {
+            std::fs::write(stage1_dir.join(format!("shuffle_0_0_{c}.index")), "50\n5\n")?;
+        }
+
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+        let empty1 = Arc::new(EmptyExec::new(schema.clone()));
+        let empty2 = Arc::new(EmptyExec::new(schema.clone()));
+        let rep1 = Arc::new(RepartitionExec::try_new(
+            empty1,
+            Partitioning::RoundRobinBatch(4),
+        )?);
+        let rep2 = Arc::new(RepartitionExec::try_new(
+            empty2,
+            Partitioning::RoundRobinBatch(4),
+        )?);
+
+        let join = Arc::new(HashJoinExec::try_new(
+            rep1,
+            rep2,
+            vec![(Arc::new(Column::new("x", 0)), Arc::new(Column::new("x", 0)))],
+            None,
+            &JoinType::Inner,
+            None,
+            PartitionMode::Partitioned,
+            NullEquality::NullEqualsNothing,
+            false,
+        )?);
+
+        let graph = JobGraph::try_new_with_mode(join, OutputMode::Blocking)?;
+        assert_eq!(graph.stages().len(), 3); // Stage 0 (left), Stage 1 (right), Stage 2 (join)
+        assert_eq!(graph.stages()[2].inputs.len(), 2);
+
+        let mut job = JobDescriptor::try_new(graph, JobState::Draining)?;
+
+        // Succeed Stage 0 (left)
+        for t in &mut job.stages[0].tasks {
+            t.attempts.push(TaskAttemptDescriptor {
+                state: TaskState::Succeeded,
+                messages: vec![],
+                cause: None,
+                job_output_fetched: false,
+                created_at: Utc::now(),
+                stopped_at: None,
+            });
+        }
+        // Succeed Stage 1 (right)
+        for t in &mut job.stages[1].tasks {
+            t.attempts.push(TaskAttemptDescriptor {
+                state: TaskState::Succeeded,
+                messages: vec![],
+                cause: None,
+                job_output_fetched: false,
+                created_at: Utc::now(),
+                stopped_at: None,
+            });
+        }
+
+        let options = JobSchedulerOptions::default()
+            .with_shuffle_mode(OutputMode::Blocking)
+            .with_shuffle_dir(temp_dir.clone())
+            .with_adaptive_enabled(true)
+            .with_target_partition_size(250); // Combined channel sizes: 50+50=100. Target 250 -> [0..2, 2..4]
+
+        JobScheduler::update_task_regions(&mut job, &options);
+
+        // Schedule task regions
+        let actions = JobScheduler::schedule_task_regions(&options, job_id, &mut job);
+        assert_eq!(actions.len(), 2); // 2 coalesced partitions for Stage 2
+
+        // Stage 2 tasks coalesced from 4 down to 2
+        assert_eq!(job.stages[2].tasks.len(), 2);
+        // Both left and right inputs must have identical coalesced partition ranges
+        assert_eq!(
+            job.graph.stages()[2].inputs[0].partition_ranges,
+            Some(vec![0..2, 2..4])
+        );
+        assert_eq!(
+            job.graph.stages()[2].inputs[1].partition_ranges,
+            Some(vec![0..2, 2..4])
+        );
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_task_failure_isolation_in_coalesced_stage() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sail_test_isolation_{}", rand::random::<u64>()));
+        let job_id = JobId::from(88);
+        let stage_dir = temp_dir.join(format!("{job_id}")).join("0");
+        std::fs::create_dir_all(&stage_dir)?;
+
+        for c in 0..4 {
+            std::fs::write(
+                stage_dir.join(format!("shuffle_0_0_{c}.index")),
+                "100\n10\n",
+            )?;
+        }
+
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+        let empty = Arc::new(EmptyExec::new(schema));
+        let repartition = Arc::new(RepartitionExec::try_new(
+            empty,
+            Partitioning::RoundRobinBatch(4),
+        )?);
+
+        let graph = JobGraph::try_new_with_mode(repartition, OutputMode::Blocking)?;
+        let mut job = JobDescriptor::try_new(graph, JobState::Draining)?;
+
+        // Succeed upstream stage 0
+        for t in &mut job.stages[0].tasks {
+            t.attempts.push(TaskAttemptDescriptor {
+                state: TaskState::Succeeded,
+                messages: vec![],
+                cause: None,
+                job_output_fetched: false,
+                created_at: Utc::now(),
+                stopped_at: None,
+            });
+        }
+
+        let options = JobSchedulerOptions::default()
+            .with_shuffle_mode(OutputMode::Blocking)
+            .with_shuffle_dir(temp_dir.clone())
+            .with_adaptive_enabled(true)
+            .with_target_partition_size(250);
+
+        JobScheduler::update_task_regions(&mut job, &options);
+        let actions = JobScheduler::schedule_task_regions(&options, job_id, &mut job);
+        assert_eq!(actions.len(), 2); // 2 partitions scheduled
+        assert!(matches!(
+            job.stages[1].tasks[0].attempts[0].state,
+            TaskState::Created
+        ));
+        assert!(matches!(
+            job.stages[1].tasks[1].attempts[0].state,
+            TaskState::Created
+        ));
+
+        // Start both tasks running
+        job.stages[1].tasks[0].attempts[0].state = TaskState::Running;
+        job.stages[1].tasks[1].attempts[0].state = TaskState::Running;
+
+        // Fail partition 0
+        job.stages[1].tasks[0].attempts[0].state = TaskState::Failed;
+
+        // Cascade cancel task attempts
+        let cancel_actions = JobScheduler::cascade_cancel_task_attempts(job_id, &mut job);
+
+        // Region for partition 0 had only task (1, 0). Partition 1 must remain Running!
+        assert!(matches!(
+            job.stages[1].tasks[1].attempts[0].state,
+            TaskState::Running
+        ));
+        assert!(!cancel_actions.iter().any(|action| matches!(
+            action,
+            JobAction::CancelTask { key } if key.stage == 1 && key.partition == 1
+        )));
 
         let _ = std::fs::remove_dir_all(temp_dir);
         Ok(())

@@ -171,7 +171,7 @@ impl StageState {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TaskRegionDescriptor {
     pub state: TaskRegionState,
 }

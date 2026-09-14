@@ -245,11 +245,10 @@ impl StreamManager {
                         "shuffle_{}_{}_{}.data",
                         key.partition, key.attempt, key.channel
                     ));
-                Ok(Box::new(crate::stream_manager::local::DiskStream::new(
-                    file_path,
-                )))
+                Ok(Box::new(
+                    crate::stream_manager::local::DiskStream::new_with_senders(file_path, senders),
+                ))
             }
         }
     }
 }
-

@@ -481,9 +481,7 @@ impl TryFrom<gen::TaskOutputLocator> for TaskOutputLocator {
             })) => Ok(TaskOutputLocator::Local {
                 replicas: replicas as usize,
             }),
-            Some(gen::task_output_locator::Kind::LocalDisk(_)) => {
-                Ok(TaskOutputLocator::LocalDisk)
-            }
+            Some(gen::task_output_locator::Kind::LocalDisk(_)) => Ok(TaskOutputLocator::LocalDisk),
             Some(gen::task_output_locator::Kind::Remote(gen::TaskOutputRemoteLocator { uri })) => {
                 Ok(TaskOutputLocator::Remote { uri })
             }

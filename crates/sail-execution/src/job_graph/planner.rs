@@ -25,7 +25,7 @@ use crate::job_graph::{
 use crate::plan::{ShuffleConsumption, StageInputExec};
 
 impl JobGraph {
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub fn try_new(plan: Arc<dyn ExecutionPlan>) -> ExecutionResult<Self> {
         Self::try_new_with_mode(plan, OutputMode::Pipelined)
     }
@@ -220,7 +220,12 @@ fn build_job_graph(
         let child = plan.children().one()?;
         // At the stage boundary, we only expect to use the child partition once
         // since the shuffle writer can materialize the data for multiple consumption.
-        vec![build_job_graph(child.clone(), PartitionUsage::Once, graph, shuffle_mode)?]
+        vec![build_job_graph(
+            child.clone(),
+            PartitionUsage::Once,
+            graph,
+            shuffle_mode,
+        )?]
     } else {
         plan.children()
             .into_iter()

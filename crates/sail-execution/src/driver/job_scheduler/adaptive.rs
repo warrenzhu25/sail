@@ -34,9 +34,12 @@ impl StageShuffleStats {
         attempts: &[usize],
     ) -> Self {
         let mut stats = Self::new(channels);
-        let stage_dir = shuffle_dir.join(format!("{job_id}")).join(format!("{stage}"));
+        let stage_dir = shuffle_dir
+            .join(format!("{job_id}"))
+            .join(format!("{stage}"));
 
-        for (p, &attempt) in attempts.iter().enumerate().take(partitions) {
+        for p in 0..partitions {
+            let attempt = attempts.get(p).copied().unwrap_or(0);
             for (c, (channel_byte_acc, channel_record_acc)) in stats
                 .channel_bytes
                 .iter_mut()
@@ -44,17 +47,22 @@ impl StageShuffleStats {
                 .enumerate()
             {
                 let index_file = stage_dir.join(format!("shuffle_{p}_{attempt}_{c}.index"));
-                if let Ok(content) = std::fs::read_to_string(&index_file) {
-                    let mut lines = content.lines();
-                    if let (Some(bytes_str), Some(records_str)) = (lines.next(), lines.next()) {
-                        if let (Ok(bytes), Ok(records)) =
-                            (bytes_str.parse::<u64>(), records_str.parse::<usize>())
-                        {
-                            *channel_byte_acc += bytes;
-                            *channel_record_acc += records;
-                            stats.total_bytes += bytes;
-                            stats.total_records += records;
+                match std::fs::read_to_string(&index_file) {
+                    Ok(content) => {
+                        let mut lines = content.lines();
+                        if let (Some(bytes_str), Some(records_str)) = (lines.next(), lines.next()) {
+                            if let (Ok(bytes), Ok(records)) =
+                                (bytes_str.parse::<u64>(), records_str.parse::<usize>())
+                            {
+                                *channel_byte_acc += bytes;
+                                *channel_record_acc += records;
+                                stats.total_bytes += bytes;
+                                stats.total_records += records;
+                            }
                         }
+                    }
+                    Err(e) => {
+                        debug!("could not read shuffle index file {index_file:?}: {e}");
                     }
                 }
             }
@@ -64,6 +72,7 @@ impl StageShuffleStats {
 
     /// Dynamically coalesce adjacent shuffle channels into partition ranges
     /// such that each range's combined size is roughly `target_partition_size` bytes.
+    #[cfg(test)]
     pub fn coalesce(&self, target_partition_size: u64) -> Vec<Range<usize>> {
         coalesce_shuffle_partitions(&self.channel_bytes, target_partition_size)
     }
@@ -72,7 +81,6 @@ impl StageShuffleStats {
     ///
     /// A partition is skewed if its size exceeds `median * skew_factor` and exceeds
     /// `min_skew_threshold` in bytes.
-    #[allow(dead_code)]
     pub fn detect_skew_partitions(&self, skew_factor: f64, min_skew_threshold: u64) -> Vec<usize> {
         if self.channel_bytes.is_empty() {
             return vec![];
@@ -105,7 +113,6 @@ impl StageShuffleStats {
     }
 
     /// Determines if downstream join should be optimized to broadcast join.
-    #[allow(dead_code)]
     pub fn should_broadcast_join(&self, auto_broadcast_threshold: u64) -> bool {
         self.total_bytes > 0 && self.total_bytes <= auto_broadcast_threshold
     }
@@ -132,9 +139,7 @@ pub fn coalesce_shuffle_partitions(
 
     for (i, &size) in channel_bytes.iter().enumerate() {
         if current_size > 0 && current_size + size > target_partition_size {
-            debug!(
-                "coalesced partition range {start}..{i} with size {current_size} bytes"
-            );
+            debug!("coalesced partition range {start}..{i} with size {current_size} bytes");
             ranges.push(start..i);
             start = i;
             current_size = size;
@@ -155,7 +160,8 @@ pub fn coalesce_shuffle_partitions(
 }
 
 /// Splits map partitions into sub-ranges for reading a skewed channel across multiple tasks.
-#[allow(dead_code)]
+#[cfg(test)]
+#[expect(clippy::single_range_in_vec_init)]
 pub fn split_skew_partition(num_map_partitions: usize, num_splits: usize) -> Vec<Range<usize>> {
     if num_map_partitions == 0 || num_splits <= 1 {
         return vec![0..num_map_partitions];
@@ -181,7 +187,10 @@ mod tests {
 
     #[test]
     fn test_coalesce_empty() {
-        assert_eq!(coalesce_shuffle_partitions(&[], 100), Vec::<Range<usize>>::new());
+        assert_eq!(
+            coalesce_shuffle_partitions(&[], 100),
+            Vec::<Range<usize>>::new()
+        );
     }
 
     #[test]
@@ -197,10 +206,7 @@ mod tests {
     fn test_coalesce_all_small_partitions() {
         // 5 small channels coalesced into a single partition
         let sizes = vec![10, 10, 10, 10, 10];
-        assert_eq!(
-            coalesce_shuffle_partitions(&sizes, 100),
-            vec![0..5]
-        );
+        assert_eq!(coalesce_shuffle_partitions(&sizes, 100), vec![0..5]);
     }
 
     #[test]
@@ -232,7 +238,8 @@ mod tests {
 
     #[test]
     fn test_from_disk_stats() -> Result<(), Box<dyn std::error::Error>> {
-        let temp_dir = std::env::temp_dir().join(format!("sail_test_adaptive_{}", rand::random::<u64>()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("sail_test_adaptive_{}", rand::random::<u64>()));
         let job_dir = temp_dir.join("1").join("0");
         std::fs::create_dir_all(&job_dir)?;
 
@@ -243,14 +250,7 @@ mod tests {
         std::fs::write(job_dir.join("shuffle_1_0_0.index"), "300\n30\n")?;
         std::fs::write(job_dir.join("shuffle_1_0_1.index"), "400\n40\n")?;
 
-        let stats = StageShuffleStats::from_disk(
-            &temp_dir,
-            JobId::from(1),
-            0,
-            2,
-            2,
-            &[0, 0],
-        );
+        let stats = StageShuffleStats::from_disk(&temp_dir, JobId::from(1), 0, 2, 2, &[0, 0]);
 
         assert_eq!(stats.channel_bytes, vec![400, 600]);
         assert_eq!(stats.channel_records, vec![40, 60]);

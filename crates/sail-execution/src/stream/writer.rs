@@ -21,9 +21,7 @@ pub enum TaskWriteLocation {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LocalStreamStorage {
-    Memory {
-        replicas: usize,
-    },
+    Memory { replicas: usize },
     Disk,
 }
 

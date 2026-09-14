@@ -12,7 +12,7 @@ pub struct StreamManagerOptions {
     pub shuffle_dir: PathBuf,
 }
 
-#[allow(dead_code)]
+#[cfg_attr(not(test), expect(dead_code))]
 impl StreamManagerOptions {
     pub fn with_shuffle_dir(mut self, shuffle_dir: PathBuf) -> Self {
         self.shuffle_dir = shuffle_dir;
@@ -25,7 +25,7 @@ impl Default for StreamManagerOptions {
         Self {
             task_stream_buffer: 16,
             task_stream_creation_timeout: Duration::from_secs(60),
-            shuffle_dir: PathBuf::from(std::env::temp_dir()).join("sail").join("shuffle"),
+            shuffle_dir: std::env::temp_dir().join("sail").join("shuffle"),
         }
     }
 }
@@ -35,7 +35,7 @@ impl From<&DriverOptions> for StreamManagerOptions {
         Self {
             task_stream_buffer: options.task_stream_buffer,
             task_stream_creation_timeout: options.task_stream_creation_timeout,
-            shuffle_dir: PathBuf::from(std::env::temp_dir()).join("sail").join("shuffle"),
+            shuffle_dir: std::env::temp_dir().join("sail").join("shuffle"),
         }
     }
 }
@@ -45,7 +45,7 @@ impl From<&WorkerOptions> for StreamManagerOptions {
         Self {
             task_stream_buffer: options.task_stream_buffer,
             task_stream_creation_timeout: options.task_stream_creation_timeout,
-            shuffle_dir: PathBuf::from(std::env::temp_dir()).join("sail").join("shuffle"),
+            shuffle_dir: std::env::temp_dir().join("sail").join("shuffle"),
         }
     }
 }
