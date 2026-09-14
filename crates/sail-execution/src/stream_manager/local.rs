@@ -172,7 +172,7 @@ impl TaskStreamSink for MemoryStreamReplicaSender {
     }
 }
 
-/// A disk-backed stream that persists record batches to a data file and reads them back.
+/// A disk-backed stream that persists record batches to a data file and an index file.
 pub(crate) struct DiskStream {
     file_path: std::path::PathBuf,
     is_written: bool,
@@ -184,6 +184,20 @@ impl DiskStream {
             file_path,
             is_written: false,
         }
+    }
+
+    pub fn index_path(&self) -> std::path::PathBuf {
+        self.file_path.with_extension("index")
+    }
+
+    /// Read the partition shuffle statistics (total_bytes, total_records) from the index file.
+    #[allow(dead_code)]
+    pub fn read_stats(&self) -> Option<(u64, usize)> {
+        let content = std::fs::read_to_string(self.index_path()).ok()?;
+        let mut lines = content.lines();
+        let bytes = lines.next()?.parse::<u64>().ok()?;
+        let records = lines.next()?.parse::<usize>().ok()?;
+        Some((bytes, records))
     }
 }
 
@@ -199,14 +213,23 @@ impl LocalStream for DiskStream {
             std::fs::create_dir_all(parent)?;
         }
         let file = std::fs::File::create(&self.file_path)?;
+        let index_path = self.index_path();
         Ok(Box::new(DiskStreamWriter {
             writer: Some(file),
             stream_writer: None,
+            index_path,
+            total_records: 0,
         }))
     }
 
     fn subscribe(&mut self) -> ExecutionResult<TaskStreamSource> {
+        if !self.file_path.exists() {
+            return Ok(Box::pin(futures::stream::empty()));
+        }
         let file = std::fs::File::open(&self.file_path)?;
+        if file.metadata()?.len() == 0 {
+            return Ok(Box::pin(futures::stream::empty()));
+        }
         let reader = match datafusion::arrow::ipc::reader::StreamReader::try_new(file, None) {
             Ok(r) => r,
             Err(e) => {
@@ -227,6 +250,8 @@ impl LocalStream for DiskStream {
 struct DiskStreamWriter {
     writer: Option<std::fs::File>,
     stream_writer: Option<datafusion::arrow::ipc::writer::StreamWriter<std::fs::File>>,
+    index_path: std::path::PathBuf,
+    total_records: usize,
 }
 
 #[tonic::async_trait]
@@ -240,6 +265,8 @@ impl TaskStreamSink for DiskStreamWriter {
                 ));
             }
         };
+
+        self.total_records += batch.num_rows();
 
         if self.stream_writer.is_none() {
             if let Some(file) = self.writer.take() {
@@ -269,11 +296,75 @@ impl TaskStreamSink for DiskStreamWriter {
     }
 
     async fn close(mut self: Box<Self>) -> Result<()> {
+        let mut total_bytes = 0u64;
         if let Some(mut sw) = self.stream_writer.take() {
             sw.finish()
                 .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+            let file = sw.into_inner()
+                .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+            if let Ok(metadata) = file.metadata() {
+                total_bytes = metadata.len();
+            }
         }
+        // Write simple index metadata (total bytes, total records)
+        let index_content = format!("{}\n{}\n", total_bytes, self.total_records);
+        let _ = std::fs::write(&self.index_path, index_content);
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use datafusion::arrow::array::Int32Array;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use futures::StreamExt;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn test_disk_stream_round_trip() -> Result<()> {
+        let temp_dir = std::env::temp_dir().join(format!("sail_test_{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&temp_dir)?;
+        let file_path = temp_dir.join("test_stream.data");
+        let mut disk_stream = DiskStream::new(file_path.clone());
+
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5]))],
+        )?;
+
+        let mut sink = disk_stream.publish().unwrap();
+        let state = sink.write(Ok(batch.clone())).await;
+        assert!(matches!(state, TaskStreamSinkState::Ok));
+        sink.close().await?;
+
+        assert!(file_path.exists());
+        let index_path = disk_stream.index_path();
+        assert!(index_path.exists());
+
+        // Check index file content (bytes, rows)
+        let index_str = std::fs::read_to_string(&index_path)?;
+        assert!(index_str.contains("\n5\n"));
+        let stats = disk_stream.read_stats();
+        assert!(stats.is_some());
+        let (bytes, records) = stats.unwrap();
+        assert!(bytes > 0);
+        assert_eq!(records, 5);
+
+        // Subscribe and read back
+        let mut source = disk_stream.subscribe().unwrap();
+        let read_batch = source.next().await.unwrap().unwrap();
+        assert_eq!(read_batch, batch);
+        assert!(source.next().await.is_none());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        Ok(())
+    }
+}
+
+
 

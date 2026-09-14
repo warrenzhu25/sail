@@ -70,6 +70,7 @@ pub enum TaskOutputDistribution {
 #[derive(Debug, Clone)]
 pub enum TaskOutputLocator {
     Local { replicas: usize },
+    LocalDisk,
     Remote { uri: String },
 }
 
@@ -459,6 +460,9 @@ impl From<TaskOutputLocator> for gen::TaskOutputLocator {
                     replicas: replicas as u64,
                 })
             }
+            TaskOutputLocator::LocalDisk => {
+                gen::task_output_locator::Kind::LocalDisk(gen::TaskOutputLocalDiskLocator {})
+            }
             TaskOutputLocator::Remote { uri } => {
                 gen::task_output_locator::Kind::Remote(gen::TaskOutputRemoteLocator { uri })
             }
@@ -477,6 +481,9 @@ impl TryFrom<gen::TaskOutputLocator> for TaskOutputLocator {
             })) => Ok(TaskOutputLocator::Local {
                 replicas: replicas as usize,
             }),
+            Some(gen::task_output_locator::Kind::LocalDisk(_)) => {
+                Ok(TaskOutputLocator::LocalDisk)
+            }
             Some(gen::task_output_locator::Kind::Remote(gen::TaskOutputRemoteLocator { uri })) => {
                 Ok(TaskOutputLocator::Remote { uri })
             }
@@ -560,6 +567,18 @@ impl TaskOutput {
                     storage: LocalStreamStorage::Memory {
                         replicas: *replicas,
                     },
+                    key: TaskStreamKey {
+                        job_id: key.job_id,
+                        stage: key.stage,
+                        partition: key.partition,
+                        attempt: key.attempt,
+                        channel,
+                    },
+                })
+                .collect(),
+            TaskOutputLocator::LocalDisk => (0..channels)
+                .map(|channel| TaskWriteLocation::Local {
+                    storage: LocalStreamStorage::Disk,
                     key: TaskStreamKey {
                         job_id: key.job_id,
                         stage: key.stage,

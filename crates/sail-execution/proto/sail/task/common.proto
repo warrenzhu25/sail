@@ -92,6 +92,7 @@ message TaskOutputLocator {
   oneof Kind {
     TaskOutputLocalLocator local = 1;
     TaskOutputRemoteLocator remote = 2;
+    TaskOutputLocalDiskLocator local_disk = 3;
   }
 }
 
@@ -101,5 +102,8 @@ message TaskOutputLocalLocator {
 
 message TaskOutputRemoteLocator {
   string uri = 1;
+}
+
+message TaskOutputLocalDiskLocator {
 }
 
