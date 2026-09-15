@@ -7,24 +7,25 @@ rank: 4
 
 ## 1. Executive Summary
 
-In distributed data processing, shuffle is the most resource-intensive and failure-prone boundary. Until this implementation, LakeSail's execution engine (`sail-execution`) relied exclusively on in-memory streaming pipelines (`LocalStreamStorage::Memory`) using Tokio `mpsc` channels and Arrow Flight.
+`sail-execution` normally moves shuffle data between task stages purely in memory (`OutputMode::Pipelined`, Tokio `mpsc` channels), which streams data directly from a running upstream task to a running downstream task. This project adds an alternate, disk-backed shuffle path (`OutputMode::Blocking`, `LocalStreamStorage::Disk`) plus a runtime-statistics layer that can adapt downstream partitioning to the volume of data actually produced, instead of the volume planned at compile time.
 
-This project delivers a complete, production-grade **Disk-Based Adaptive Shuffle Subsystem** that bridges persistent I/O with **Adaptive Query Execution (AQE)**. Key achievements:
+Key pieces, as implemented today:
 
-1. **Persistent On-Disk Shuffle (`DiskStream`)**: Memory-bounded execution with binary Arrow IPC batch streaming, channel offset framing, and zero-loss crash resilience.
-2. **$O(1)$ Runtime Channel Statistics**: Direct extraction of partition byte distributions from `.index` metadata without scanning bulky `.data` payloads.
-3. **Dynamic AQE Partition Coalescing**: Post-shuffle runtime optimization that dynamically merges adjacent small shuffle channels into balanced target-sized partitions, eliminating scheduling overhead.
-4. **Data Skew Detection & Split Sub-Ranges**: Identifying data skew outliers using median-based heuristics and calculating multi-reader map slices.
-5. **Decoupled Stage Execution (`OutputMode::Blocking`)**: Stage lifecycle decoupling where upstream workers write shuffle outputs to disk and immediately terminate, freeing worker threads and memory before downstream stages are scheduled.
-6. **Robust Test Suite & Zero Regressions**: 16 unit and end-to-end integration tests covering serialization, stream recovery, adaptive plan rewriting, and topology task management.
+1. **Persistent on-disk shuffle (`DiskStream`)** — one Arrow IPC file per shuffle channel, with a small text index file and atomic rename for crash-safe writes.
+2. **Cheap runtime channel statistics** — `StageShuffleStats::from_disk` derives each channel's byte/record size by reading its two-line `.index` file, without opening the (potentially large) `.data` file.
+3. **Dynamic partition coalescing** — `coalesce_shuffle_partitions` merges adjacent small channels into `~target_partition_size` groups, and the scheduler rewrites the downstream stage's plan and task count accordingly.
+4. **Skew and broadcast-join *detection*** — `detect_skew_partitions` and `should_broadcast_join` compute real signals from the stats, but today only feed a debug log line; no plan mitigation is wired to them yet (see §7 for exact status).
+5. **Stage lifecycle decoupling (`OutputMode::Blocking`)** — when active, upstream tasks finish writing to disk and exit before the downstream stage is even scheduled, rather than the two overlapping in time.
+6. **Test coverage** — 18 unit/integration tests across `adaptive.rs`, `driver/job_scheduler/core.rs`, and `stream_manager/local.rs` (listed in §6).
+
+This document was last checked against the code at commit `7a112171` (`fix(execution): fix adaptive disk shuffle correctness, topology, streaming, and tests`), which substantially reworked the on-disk layout and reader path from the original `238c95dc`/`24b5897a`/`529baf4b` commits below — several details from the original design/implementation commits (a combined multi-channel data file with a binary offset index, a `TaskInputLocator::LocalDisk` variant) were superseded by the simpler per-channel-file layout described here. **Read [`adaptive-disk-shuffle-design.md`](./adaptive-disk-shuffle-design.md) first** — in particular its "Implementation Status" section, which explains that `OutputMode::Blocking` is fully implemented and tested but not yet the mode a running driver actually selects.
 
 ---
 
 ## 2. Delivery Timeline & Commit History
 
-Every stage of this implementation was built with atomic, self-contained commits pushed to the remote fork (`fork/deepdive`):
-
 ```
+* 7a112171 - fix(execution): fix adaptive disk shuffle correctness, topology, streaming, and tests
 * 4acea9f7 - docs(concepts): add implementation summary for disk-based adaptive shuffle
 * 30e0cbb2 - feat(execution): implement disk-based adaptive shuffle coalescing and tests
 * 9e0bdb7d - docs: add AGENT.md guidelines for AI agents
@@ -33,355 +34,161 @@ Every stage of this implementation was built with atomic, self-contained commits
 * 238c95dc - docs: add design doc for adaptive disk-based shuffle
 ```
 
-### Commit Details
+### Commit details
 
-#### Commit 1: `24b5897a` — `feat(execution): implement DiskStream for local disk-based shuffle`
-- **Scope**: `crates/sail-execution/src/stream_manager/`
-- **Additions**:
-  - Implemented `DiskStream` with `.data` and `.index` file layouts.
-  - Implemented channel-specific seek offset writing and reading using `tokio::fs` and Arrow IPC streams.
-  - Added `LocalStreamStorage::Disk` variant and `StreamManagerOptions` configuration.
+#### `24b5897a` — implement `DiskStream` for local disk-based shuffle
+- Scope: `crates/sail-execution/src/stream_manager/`
+- Introduced `DiskStream` and `LocalStreamStorage::Disk`.
 
-#### Commit 2: `529baf4b` — `feat(execution): add LocalDisk locator and index statistics to DiskStream`
-- **Scope**: `crates/sail-execution/src/stream_manager/` & `task/`
-- **Additions**:
-  - Added `TaskInputLocator::LocalDisk` and `TaskStreamLocation::LocalDisk`.
-  - Implemented `read_index_stats` and `read_channel_stats` to query channel byte sizes directly from binary `.index` files.
-  - Implemented recursive directory cleanup for stages and jobs during task teardown and scheduler stop events.
+#### `529baf4b` — add `LocalDisk` locator and index statistics to `DiskStream`
+- Scope: `stream_manager/`, `task/`
+- Added an initial index/statistics mechanism. (Superseded by `7a112171`'s simpler per-channel text index — see §1.)
 
-#### Commit 3: `9e0bdb7d` — `docs: add AGENT.md guidelines for AI agents`
-- **Scope**: Repository root `AGENT.md`
-- **Additions**:
-  - Operational guidelines, git hygiene, commit atomicity rules, and testing standards for AI agents.
+#### `9e0bdb7d` — add `AGENT.md` guidelines for AI agents
+- Repository-root operational guidelines; unrelated to the shuffle mechanism itself.
 
-#### Commit 4: `30e0cbb2` — `feat(execution): implement disk-based adaptive shuffle coalescing and tests`
-- **Scope**: `crates/sail-execution/src/driver/job_scheduler/` & `job_graph/`
-- **Additions**:
-  - Implemented `adaptive.rs` (`StageShuffleStats`, `coalesce`, `detect_skew_partitions`, `split_skew_partition`, `should_broadcast_join`).
-  - Implemented adaptive region optimization in `JobScheduler::schedule_task_regions`.
-  - Implemented DataFusion execution plan repartitioning rewriter (`update_stage_plan_partitioning`).
-  - Added `JobTopology::update_region_tasks` to dynamically resize scheduled tasks.
-  - Added multi-channel routing in `get_task_input`.
-  - Added fallback disk recovery in `StreamManager::fetch_local_stream`.
-  - Comprehensive unit and integration test suite.
+#### `30e0cbb2` — implement disk-based adaptive shuffle coalescing and tests
+- Scope: `driver/job_scheduler/`
+- Added `adaptive.rs` (`StageShuffleStats`, `coalesce_shuffle_partitions`, `detect_skew_partitions`, `should_broadcast_join`, `split_skew_partition`) and wired coalescing into `JobScheduler::schedule_task_regions`.
 
-#### Commit 5: `4acea9f7` — `docs(concepts): add implementation summary for disk-based adaptive shuffle`
-- **Scope**: `docs/concepts/architecture/`
-- **Additions**:
-  - Added high-level architecture overview and test mapping.
+#### `4acea9f7` — add implementation summary docs
+- The original version of this document and the design doc.
+
+#### `7a112171` — fix adaptive disk shuffle correctness, topology, streaming, and tests
+- Reworked the on-disk layout to one `.data`/`.index` pair **per channel** (rather than a combined multi-channel file with a binary offset index).
+- Simplified the index file to plain two-line text (`bytes\n`, `records\n`).
+- Adjusted topology rebuilding and the shuffle-read merge path.
+- This is the version described throughout the rest of this document and the design doc.
 
 ---
 
-## 3. Architecture & Data Flow Breakdown
+## 3. Architecture & Data Flow
 
 ```mermaid
 flowchart TD
-    subgraph Stage0 [Stage 0: Map Tasks (4 Partitions)]
-        T0[Task 0] -->|Framed IPC Batches| DS0["DiskStream: shuffle_0_0 (.data + .index)"]
-        T1[Task 1] -->|Framed IPC Batches| DS1["DiskStream: shuffle_0_1 (.data + .index)"]
-        T2[Task 2] -->|Framed IPC Batches| DS2["DiskStream: shuffle_0_2 (.data + .index)"]
-        T3[Task 3] -->|Framed IPC Batches| DS3["DiskStream: shuffle_0_3 (.data + .index)"]
+    subgraph Stage0 [Stage 0: Map Tasks, 4 partitions x 4 channels each]
+        T0[Task partition 0] -->|"4 per-channel DiskStreams"| DS0["shuffle_0_0_0 .. shuffle_0_0_3<br/>(.data + .index each)"]
+        T1[Task partition 1] -->|"4 per-channel DiskStreams"| DS1["shuffle_1_0_0 .. shuffle_1_0_3"]
+        T2[Task partition 2] -->|"4 per-channel DiskStreams"| DS2["shuffle_2_0_0 .. shuffle_2_0_3"]
+        T3[Task partition 3] -->|"4 per-channel DiskStreams"| DS3["shuffle_3_0_0 .. shuffle_3_0_3"]
     end
 
-    subgraph Driver [Driver: JobScheduler Coordination]
-        DS0 -.->|Read 8-byte Index Offsets| SSS["StageShuffleStats::from_disk(stage=0)"]
-        DS1 -.->|Read 8-byte Index Offsets| SSS
-        DS2 -.->|Read 8-byte Index Offsets| SSS
-        DS3 -.->|Read 8-byte Index Offsets| SSS
-        SSS --> Alg["coalesce(target_size=400B)"]
-        Alg --> Ranges["partition_ranges: [0..2, 2..4]"]
-        Ranges --> Rewriter["update_stage_plan_partitioning(count=2)"]
-        Rewriter --> Topo["JobTopology::update_region_tasks(count=2)"]
+    subgraph Driver [Driver: JobScheduler]
+        DS0 -.->|"read .index text (bytes, records)"| SSS["StageShuffleStats::from_disk(stage=0)"]
+        DS1 -.-> SSS
+        DS2 -.-> SSS
+        DS3 -.-> SSS
+        SSS --> Alg["coalesce_shuffle_partitions(target_size)"]
+        Alg --> Ranges["partition_ranges: [0..2, 2..4]<br/>(4 channels coalesced into 2 ranges)"]
+        Ranges --> Rewriter["update_stage_plan_partitioning(new_count)"]
+        Rewriter --> Topo["JobTopology::try_new() — full rebuild"]
     end
 
-    subgraph Stage1 [Stage 1: Adaptive Coalesced Reduce Tasks (2 Partitions)]
-        Topo --> RT0["Reduce Task 0 (Partition 0)"]
-        Topo --> RT1["Reduce Task 1 (Partition 1)"]
-        RT0 -->|Reads Channels [0..2) via Seek| SR0["ShuffleReadExec: Reads DS0, DS1, DS2, DS3"]
-        RT1 -->|Reads Channels [2..4) via Seek| SR1["ShuffleReadExec: Reads DS0, DS1, DS2, DS3"]
+    subgraph Stage1 [Stage 1: Coalesced Reduce Tasks]
+        Topo --> RT0["Reduce Task 0 (channels 0..2)"]
+        Topo --> RT1["Reduce Task 1 (channels 2..4)"]
+        RT0 -->|"opens shuffle_{0..3}_0_{channel} directly"| DS0
+        RT0 --> DS1
+        RT0 --> DS2
+        RT0 --> DS3
+        RT0 -->|"select_all: concurrent merge"| Merge0[MergedRecordBatchStream]
     end
 ```
 
+Note the important correction from the original version of this document: coalescing groups **channels**, and a reduce task assigned a range of channels reads that range **from every upstream map partition** — it does not reduce the number of files opened, it reduces the number of downstream tasks. See design doc §5.4 for the exact merge mechanism (`futures::stream::select_all`, concurrent and unordered).
+
 ---
 
-## 4. Detailed Component Implementation
+## 4. Key Components
 
-### 4.1 `adaptive.rs` — The AQE Brain
-File: [`crates/sail-execution/src/driver/job_scheduler/adaptive.rs`](file:///usr/local/google/home/warrenzhu/sail/crates/sail-execution/src/driver/job_scheduler/adaptive.rs)
+### 4.1 `adaptive.rs` — stats, coalescing, detection
 
-#### 1. `StageShuffleStats`
-Encapsulates runtime statistics for an entire completed shuffle stage:
-```rust
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StageShuffleStats {
-    pub stage: usize,
-    pub num_channels: usize,
-    pub channel_bytes: Vec<u64>,
-    pub total_bytes: u64,
-}
+File: `crates/sail-execution/src/driver/job_scheduler/adaptive.rs`
+
+- **`StageShuffleStats::from_disk(shuffle_dir, job_id, stage, partitions, channels, attempts)`**: for every `(map partition, channel)` pair, reads `shuffle_{p}_{attempt}_{c}.index` as UTF-8 text, parses two lines (`bytes`, `records`), and accumulates per-channel and stage-wide totals. Missing/unreadable index files are skipped with a `debug!` log, not an error — a partially-written stage simply reports smaller totals rather than failing.
+- **`coalesce_shuffle_partitions(channel_bytes, target)`**: single linear pass; greedily grows a range until the next channel would push it over `target`, then starts a new range. Never splits an individual oversized channel — see design doc §6.1 for the exact algorithm and its guarantees.
+- **`detect_skew_partitions(skew_factor, min_skew_threshold)`**: flags channel `c` when `size[c] >= min_skew_threshold` **and** `size[c] > median(nonzero sizes) * skew_factor`. Computed on real data, but its result is currently only logged by the caller (§7).
+- **`should_broadcast_join(threshold)`**: `total_bytes > 0 && total_bytes <= threshold`. Also detection-only; the caller passes a hardcoded `10 * 1024 * 1024` rather than a configurable value.
+- **`split_skew_partition(num_map_partitions, num_splits)`**: divides the map-partition axis into `num_splits` contiguous chunks so a skewed channel's reads could, in principle, be spread across several reduce tasks. This function is compiled only under `#[cfg(test)]` — no production code calls it today.
+
+### 4.2 `driver/job_scheduler/core.rs` — wiring into the scheduler
+
+- **`optimize_stages_adaptively`**, called from `schedule_task_regions` when `adaptive_enabled`: for each stage with shuffle inputs whose upstream is fully succeeded and in `OutputMode::Blocking`, it gathers `StageShuffleStats`, runs skew/broadcast detection (log-only), coalesces channels, and — if that reduces the partition count — updates `StageInput.partition_ranges`, rewrites the stage's plan via `update_stage_plan_partitioning`, and replaces the stage's task list. If any stage changed, `JobTopology::try_new` rebuilds topology from scratch afterward (there is no targeted "resize this region" call).
+- **`get_task_input`**, `InputMode::Shuffle` branch: when `partition_ranges` is set, task `p`'s input keys are every `(channel in ranges[p], every upstream map partition)` pair; otherwise it defaults to one key per `(channel, partition)` with no coalescing.
+
+### 4.3 `stream_manager/` — persistence and lookup
+
+- `stream_manager/local.rs`: `DiskStream` (one channel's file), `DiskStreamWriter` (buffers via `arrow_ipc::writer::StreamWriter`, writes the text index, atomically renames on `close()`).
+- `stream_manager/core.rs`: `StreamManager::fetch_local_stream` checks whether the channel's `.data` file already exists on disk (the common case once upstream has fully finished) and reads directly if so, otherwise falls back to the same pending-subscriber/probe mechanism used for in-memory streams. `create_remote_stream`/`fetch_remote_stream` on `StreamManager` are unimplemented stubs; actual cross-node reads go through the separate `stream_service` Arrow Flight server (`stream_service/server.rs`), keyed by a protobuf `TaskStreamTicket{job_id, stage, partition, attempt, channel}` — one ticket per channel, not a byte-range request.
+
+---
+
+## 5. End-to-End Walkthrough
+
+Query: `SELECT department, count(*) FROM employees GROUP BY department;`, with 4 map partitions, 4 shuffle channels, `target_partition_size = 400` bytes, and each map task emitting 50 bytes/channel (200 bytes/channel summed across all 4 map tasks).
+
 ```
-- **`from_disk(stage_dir, stage, num_channels)`**:
-  - Scans `stage_dir` for all index files matching `{stage}_{map_part}_{attempt}.index`.
-  - For each index file, reads the `(num_channels + 1) * 8` bytes.
-  - Computes channel byte length as `offset[c + 1] - offset[c]`.
-  - Sums each channel's bytes across all map tasks into `channel_bytes[c]`.
-  - Calculates `total_bytes = sum(channel_bytes)`.
-
-#### 2. `coalesce(channel_bytes, target_partition_size)`
-Merges adjacent small channels into target-sized chunks:
-- Iterates linearly through channels $0 .. C-1$.
-- If adding channel $c$ to the current group exceeds `target_partition_size` and the group is non-empty, the current group is finalized and a new range starts at $c$.
-- Guarantees $O(C)$ execution time and single-pass grouping.
-
-#### 3. `detect_skew_partitions(skew_factor, min_skew_threshold)`
-- Extracts non-zero channel sizes and sorts them to find the median:
-  $$\text{median} = \text{sorted}[N / 2]$$
-- Flags any channel $c$ where:
-  $$\text{size}[c] \ge \text{min\_skew\_threshold} \quad \land \quad \text{size}[c] > \text{median} \times \text{skew\_factor}$$
-
-#### 4. `split_skew_partition(num_map_partitions, num_splits)`
-- Calculates sub-ranges $[m_{start}, m_{end})$ of upstream map tasks using ceiling division:
-  $$\text{chunk\_size} = \left\lceil \frac{\text{num\_map\_partitions}}{\text{splits}} \right\rceil$$
-- Returns a list of `Range<usize>` covering all map partitions.
-
----
-
-### 4.2 `core.rs` & `topology.rs` — Driver Optimization & Scheduling
-Files:
-- [`crates/sail-execution/src/driver/job_scheduler/core.rs`](file:///usr/local/google/home/warrenzhu/sail/crates/sail-execution/src/driver/job_scheduler/core.rs)
-- [`crates/sail-execution/src/driver/job_scheduler/topology.rs`](file:///usr/local/google/home/warrenzhu/sail/crates/sail-execution/src/driver/job_scheduler/topology.rs)
-
-#### 1. `optimize_region_adaptively`
-Executes inside `JobScheduler::schedule_task_regions` before tasks in a `TaskRegion` are scheduled:
-1. Verifies `self.options.adaptive_enabled` is `true`.
-2. Inspects input dependencies: checks if upstream stage inputs are in `InputMode::Shuffle`.
-3. Reads shuffle stats from `shuffle_dir` using `StageShuffleStats::from_disk`.
-4. Computes coalesced ranges:
-   ```rust
-   let ranges = stats.coalesce(self.options.target_partition_size);
-   ```
-5. If coalescing reduces partition count (`ranges.len() < num_channels`):
-   - Updates `StageInput.partition_ranges = Some(ranges.clone())`.
-   - Traverses the stage's physical plan via `update_stage_plan_partitioning` to resize `Partitioning::RoundRobinBatch` and `Partitioning::Hash` to `ranges.len()`.
-   - Truncates or expands `stage.tasks` to match the new partition count.
-   - Calls `topology.update_region_tasks(region_id, ranges.len())` to synchronize the region's task queue.
-
-#### 2. `get_task_input` Routing for Coalesced Tasks
-When generating task inputs for a reduce task in partition $p$:
-- If `partition_ranges` is `Some(ranges)`:
-  - Range for task $p$ is $R_p = \text{ranges}[p]$.
-  - The locator receives **all channels** $c \in R_p$:
-    ```rust
-    let mut channel_keys = Vec::new();
-    for channel in range.clone() {
-        channel_keys.push((task_key, TaskStreamKey { channel, ... }));
-    }
-    ```
-- This allows a single downstream reduce task to consume data from multiple upstream channels seamlessly.
-
----
-
-### 4.3 `stream_manager/` — Persistent Storage & Recovery
-Files:
-- [`crates/sail-execution/src/stream_manager/local.rs`](file:///usr/local/google/home/warrenzhu/sail/crates/sail-execution/src/stream_manager/local.rs)
-- [`crates/sail-execution/src/stream_manager/core.rs`](file:///usr/local/google/home/warrenzhu/sail/crates/sail-execution/src/stream_manager/core.rs)
-
-#### 1. Serialization Protocol
-- Files are named: `{shuffle_dir}/{job_id}/{stage_id}/{partition}_{attempt}.data`.
-- Channel boundaries are recorded in: `{shuffle_dir}/{job_id}/{stage_id}/{partition}_{attempt}.index`.
-- Each record batch is serialized using `arrow_ipc::writer::StreamWriter` with an 8-byte length prefix.
-
-#### 2. On-Demand Stream Recovery
-In `StreamManager::fetch_local_stream`:
-```rust
-match streams.entry(key) {
-    Entry::Occupied(e) => e.get().clone(),
-    Entry::Vacant(v) => {
-        // Check if on-disk shuffle file exists
-        if let Some(shuffle_dir) = &self.options.shuffle_dir {
-            let data_path = shuffle_dir.join(...);
-            let index_path = shuffle_dir.join(...);
-            if data_path.exists() && index_path.exists() {
-                let disk_stream = DiskStream::new(...);
-                return v.insert(disk_stream).subscribe(channel);
-            }
-        }
-        // Fallback to waiting for in-memory stream
-        ...
-    }
-}
+T0  JobScheduler  schedule_task_regions(): Stage 0 (map, OutputMode::Blocking) region scheduled.
+T1  Worker Tasks  Tasks 0..3 each write 4 per-channel DiskStreams:
+                  shuffle_{p}_0_{c}.data.tmp + .index.tmp for c in 0..4, p in 0..4
+                  on close(): index content is "50\n<rows>\n"; files renamed to final names.
+T2  Worker Tasks  All Stage 0 tasks reach TaskState::Succeeded.
+T3  JobScheduler  optimize_stages_adaptively(): all_upstream_ready == true for Stage 1's shuffle input.
+T4  JobScheduler  StageShuffleStats::from_disk() sums each channel across all 4 map partitions:
+                  channel 0..3 each = 200 bytes; total = 800 bytes.
+T5  JobScheduler  coalesce_shuffle_partitions([200,200,200,200], target=400):
+                  channel 0 (200) + channel 1 (200) = 400 -> range 0..2
+                  channel 2 (200) + channel 3 (200) = 400 -> range 2..4
+                  2 ranges, down from 4 channels.
+T6  JobScheduler  StageInput.partition_ranges = Some([0..2, 2..4]) on Stage 1's shuffle input.
+                  update_stage_plan_partitioning(plan, 2): RepartitionExec/StageInputExec -> 2 partitions.
+                  Stage 1 tasks reset to 2 fresh task descriptors.
+                  JobTopology::try_new(): topology rebuilt; Stage 1's region now has 2 tasks.
+T7  JobScheduler  Reduce tasks 0 and 1 scheduled.
+                  get_task_input(task 0) -> keys for (channel 0, p 0..4) + (channel 1, p 0..4) = 8 keys.
+                  get_task_input(task 1) -> keys for (channel 2, p 0..4) + (channel 3, p 0..4) = 8 keys.
+T8  Worker Tasks  ShuffleReadExec opens all 8 sources per task and merges them via
+                  futures::stream::select_all (concurrent, no ordering guarantee).
+T9  JobScheduler  Once Stage 1's consumers succeed, CleanUpJob{stage: Some(0)} removes Stage 0's directory;
+                  job completion removes the whole job directory.
 ```
 
 ---
 
-## 5. End-to-End Walkthrough: A 2-Stage Query Lifecycle
+## 6. Test Coverage
 
-Consider the query:
-```sql
-SELECT department, count(*) FROM employees GROUP BY department;
-```
-Configured with:
-- Initial partition count: 4
-- `target_partition_size`: 400 bytes
-- Data distribution: 4 map tasks emitting small partitions (50 bytes per channel, total 200 bytes per channel across all map tasks).
+18 tests directly exercise this subsystem (function names are exact, from the current source — this list intentionally excludes unrelated tests that happen to live in the same crate):
 
-### Step-by-Step Execution Trace
+**`driver/job_scheduler/adaptive.rs`**
+- `test_coalesce_empty`, `test_coalesce_target_zero`, `test_coalesce_all_small_partitions`, `test_coalesce_balanced_partitions`, `test_coalesce_skewed_partition` — `coalesce_shuffle_partitions` edge cases and grouping behavior.
+- `test_from_disk_stats` — `StageShuffleStats::from_disk` correctly sums bytes/records across map partitions from real text index files written to a temp dir.
+- `test_detect_skew_partitions` — median/threshold skew flagging.
+- `test_split_skew_partition` — map-partition range splitting (exercises the test-only helper described in §4.1/§1).
+- `test_should_broadcast_join` — byte-threshold check.
 
-```
-Time  Component           Action / State Transition
----------------------------------------------------------------------------------------------------------
-T0    JobScheduler        accept_job(): Creates JobGraph with OutputMode::Blocking.
-                          JobTopology identifies Stage 0 as Blocking shuffle, Stage 1 as Reduce.
-T1    JobScheduler        schedule_task_regions(): Region 0 (Stage 0, Tasks 0..4) is scheduled.
-T2    Worker Tasks        Tasks 0..3 write to DiskStream.
-                          Task 0 writes: shuffle_0_0_0.data (200B) + shuffle_0_0_0.index (40B)
-                          Task 1 writes: shuffle_0_1_0.data (200B) + shuffle_0_1_0.index (40B)
-                          Task 2 writes: shuffle_0_2_0.data (200B) + shuffle_0_2_0.index (40B)
-                          Task 3 writes: shuffle_0_3_0.data (200B) + shuffle_0_3_0.index (40B)
-T3    Worker Tasks        All Stage 0 tasks transition to TaskState::Succeeded and exit.
-T4    JobScheduler        schedule_task_regions(): Region 1 (Stage 1) is ready.
-                          Calls optimize_region_adaptively().
-T5    JobScheduler        StageShuffleStats::from_disk():
-                          Channel 0 sum = 200B
-                          Channel 1 sum = 200B
-                          Channel 2 sum = 200B
-                          Channel 3 sum = 200B
-                          Total Stage Bytes = 800B
-T6    JobScheduler        stats.coalesce(target=400B):
-                          Channel 0 (200B) + Channel 1 (200B) = 400B -> Range 0..2 (Partition 0)
-                          Channel 2 (200B) + Channel 3 (200B) = 400B -> Range 2..4 (Partition 1)
-                          Resulting partition count: 2 (coalesced from 4).
-T7    JobScheduler        update_stage_plan_partitioning():
-                          Downstream RepartitionExec rewritten from 4 to 2 partitions.
-                          Stage 1 tasks resized from 4 to 2.
-                          JobTopology::update_region_tasks() resizes Region 1 to 2 tasks.
-T8    JobScheduler        Tasks 0 and 1 of Stage 1 scheduled.
-                          get_task_input(Task 0) -> reads channels 0 and 1 across all 4 map files.
-                          get_task_input(Task 1) -> reads channels 2 and 3 across all 4 map files.
-T9    Worker Tasks        Stage 1 tasks execute and stream final output.
-T10   JobScheduler        clean_up_stage(0): Recursively removes Stage 0 shuffle directory.
-                          stop_job(): Removes entire job directory.
-```
+**`driver/job_scheduler/core.rs`**
+- `test_adaptive_disk_shuffle_coalescing_workflow` — end-to-end: builds a 2-stage plan with `OutputMode::Blocking`, writes real index files simulating 4 small map outputs, and verifies the scheduler coalesces Stage 1 from 4 to 2 partitions.
+- `test_adaptive_disabled_preserves_partitions` — same setup with `adaptive_enabled = false`; confirms partitioning is left untouched.
+- `test_get_task_input_with_coalesced_ranges` — with `partition_ranges = Some([0..2, 2..4])` set directly, confirms `get_task_input` for partition 0 returns exactly the channel-0 and channel-1 keys.
+- `test_disk_shuffle_stage_and_job_cleanup` — confirms `clean_up_stage`/job cleanup actually removes the shuffle directories from disk.
+- `test_adaptive_multi_input_coalescing` — a stage with two shuffle inputs (e.g. both sides of a join) gets consistent coalesced ranges.
+- `test_task_failure_isolation_in_coalesced_stage` — a failed task within a coalesced region doesn't corrupt sibling tasks' state.
+
+**`stream_manager/local.rs`**
+- `test_disk_stream_round_trip` — write then read back a batch through `DiskStream`, checking both the data and the parsed index stats.
+- `test_disk_stream_multi_batch_and_empty_batch` — multiple batches including a zero-row batch are all preserved and read back in order for a single channel.
+- `test_disk_stream_with_pending_senders` — a subscriber registered before the writer closes gets the batch pushed to it live, *and* a later subscriber can still read the same data back from disk.
+- `test_disk_stream_empty_file` — a channel with no batches at all still produces a valid (empty) `.data`/`.index` pair and an empty read stream.
 
 ---
 
-## 6. Comprehensive Test Suite & Verification Matrix
+## 7. What's Real vs. What's Only Detected
 
-All 16 unit and integration tests in `crates/sail-execution` pass cleanly:
-
-```
-running 16 tests
-test driver::job_scheduler::adaptive::tests::test_coalesce_empty ... ok
-test driver::job_scheduler::adaptive::tests::test_coalesce_all_small_partitions ... ok
-test driver::job_scheduler::adaptive::tests::test_coalesce_balanced_partitions ... ok
-test driver::job_scheduler::adaptive::tests::test_coalesce_skewed_partition ... ok
-test codec::tests::test_round_trip_spark_variant_explode_helper_udf ... ok
-test driver::job_scheduler::adaptive::tests::test_coalesce_target_zero ... ok
-test driver::job_scheduler::adaptive::tests::test_detect_skew_partitions ... ok
-test driver::job_scheduler::adaptive::tests::test_should_broadcast_join ... ok
-test driver::job_scheduler::adaptive::tests::test_split_skew_partition ... ok
-test worker_manager::kubernetes::tests::test_label_merging_from_template ... ok
-test driver::job_scheduler::core::tests::test_get_task_input_with_coalesced_ranges ... ok
-test driver::job_scheduler::core::tests::test_disk_shuffle_stage_and_job_cleanup ... ok
-test driver::job_scheduler::adaptive::tests::test_from_disk_stats ... ok
-test driver::job_scheduler::core::tests::test_adaptive_disabled_preserves_partitions ... ok
-test stream_manager::local::tests::test_disk_stream_round_trip ... ok
-test driver::job_scheduler::core::tests::test_adaptive_disk_shuffle_coalescing_workflow ... ok
-
-test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
-```
-
-### Detailed Breakdown of Key Test Cases
-
-#### 1. `test_from_disk_stats`
-- **Location**: `adaptive.rs`
-- **Setup**: Creates a temporary directory with 2 mock map task index files (`0_0_0.index` and `0_1_0.index`) for 4 shuffle channels.
-- **Verification**: `StageShuffleStats::from_disk` correctly sums channel sizes across both tasks:
-  - Channel 0: $100 + 50 = 150$ bytes
-  - Channel 1: $200 + 150 = 350$ bytes
-  - Channel 2: $300 + 250 = 550$ bytes
-  - Channel 3: $400 + 350 = 750$ bytes
-  - Total: $1800$ bytes.
-
-#### 2. `test_coalesce_all_small_partitions`
-- **Location**: `adaptive.rs`
-- **Setup**: 8 channels of 100 bytes each (total 800 bytes) with target size 400 bytes.
-- **Verification**: Asserts exact ranges `vec![0..4, 4..8]`.
-
-#### 3. `test_coalesce_balanced_partitions`
-- **Location**: `adaptive.rs`
-- **Setup**: 4 channels of 400 bytes each (matching target size 400 bytes).
-- **Verification**: Preserves 1:1 mapping: `vec![0..1, 1..2, 2..3, 3..4]`.
-
-#### 4. `test_coalesce_skewed_partition`
-- **Location**: `adaptive.rs`
-- **Setup**: Channels `[100, 100, 5000, 100, 100]` with target size 400 bytes.
-- **Verification**: Produces `vec![0..2, 2..3, 3..5]`. Skewed channel 2 is isolated in its own partition while adjacent small channels are grouped.
-
-#### 5. `test_detect_skew_partitions` & `test_split_skew_partition`
-- **Location**: `adaptive.rs`
-- **Setup**: Calculates median across partition sizes and checks threshold conditions.
-- **Verification**: Detects skewed partition index 2 and verifies sub-ranges for 3 splits of 10 map partitions produce `vec![0..4, 4..8, 8..10]`.
-
-#### 6. `test_adaptive_disk_shuffle_coalescing_workflow`
-- **Location**: `core.rs`
-- **Setup**:
-  - Builds an end-to-end 2-stage query plan (`EmptyExec` $\to$ `RepartitionExec(4)`).
-  - Uses `OutputMode::Blocking`.
-  - Writes actual binary `.index` files to disk simulating 4 upstream tasks emitting small outputs (50 bytes/channel).
-  - Configures `target_partition_size = 400`.
-- **Verification**:
-  - Scheduler invokes `optimize_region_adaptively`.
-  - Upstream stats are evaluated to 200 bytes per channel.
-  - Stage 1 plan partitioning is rewritten from 4 partitions to 2 partitions.
-  - Region 1 task count is resized from 4 to 2.
-  - `JobState::Succeeded` reached.
-
-#### 7. `test_get_task_input_with_coalesced_ranges`
-- **Location**: `core.rs`
-- **Setup**: Sets `partition_ranges = Some(vec![0..2, 2..4])` on downstream stage input.
-- **Verification**: Calls `get_task_input` for partition 0. Verifies that the returned `TaskInputLocator::Worker` has 2 channel keys, corresponding to channel 0 and channel 1.
-
-#### 8. `test_adaptive_disabled_preserves_partitions`
-- **Location**: `core.rs`
-- **Setup**: Same plan as workflow test, but with `adaptive_enabled = false`.
-- **Verification**: Confirms downstream stage partitioning remains 4 partitions without coalescing.
-
-#### 9. `test_disk_shuffle_stage_and_job_cleanup`
-- **Location**: `core.rs`
-- **Setup**: Simulates stage execution creating shuffle directories. Calls `clean_up_stage` and `stop_job`.
-- **Verification**: Confirms the directories are deleted from the filesystem.
-
-#### 10. `test_disk_stream_round_trip`
-- **Location**: `stream_manager/local.rs`
-- **Setup**: Writes Arrow `RecordBatch` streams into `DiskStream` across multiple channels.
-- **Verification**: Reads specific channels back and verifies schema, record count, and column values match.
-
----
-
-## 7. Configuration Guide
-
-```rust
-let options = JobSchedulerOptions::default()
-    .with_shuffle_mode(OutputMode::Blocking)
-    .with_shuffle_dir(PathBuf::from("/var/data/sail/shuffle"))
-    .with_adaptive_enabled(true)
-    .with_target_partition_size(64 * 1024 * 1024) // 64 MB
-    .with_skew_factor(5.0)
-    .with_min_skew_threshold(128 * 1024 * 1024);   // 128 MB
-
-let stream_options = StreamManagerOptions::default()
-    .with_shuffle_dir(PathBuf::from("/var/data/sail/shuffle"));
-```
-
----
-
-## 8. Summary of Architectural Impact
-
-| Dimension | Before (In-Memory Streaming) | After (Disk-Based Adaptive Shuffle) |
+| Capability | Computed from real data? | Acts on the plan/schedule? |
 | :--- | :--- | :--- |
-| **Max Shuffle Volume** | Bounded by aggregate cluster RAM. Prone to OOMs. | Bounded by disk capacity (TB/PB scale). Constant RAM footprint. |
-| **Stage Coupling** | Upstream tasks must block until downstream consumers finish. | Upstream tasks exit immediately upon disk write, releasing compute slots. |
-| **Partition Sizing** | Static partition count chosen at compile-time. | Dynamic runtime coalescing to target partition size based on exact bytes. |
-| **Data Skew** | Skewed partitions overload single downstream workers. | Skew detection identifies outliers; split ranges allow multi-worker reads. |
-| **Stream Recovery** | Lost streams require restarting upstream task chains. | Streams on disk can be re-opened on demand without upstream reruns. |
+| Partition coalescing | Yes | **Yes** — rewrites plan partitioning and task count |
+| Data-skew detection | Yes | No — `debug!` log only; `split_skew_partition` is test-only |
+| Broadcast-join candidate detection | Yes | No — `debug!` log only; threshold is a hardcoded literal, not configurable |
+| `OutputMode::Blocking` in a running driver | N/A | No — `JobSchedulerOptions::from(&DriverOptions)` always produces `Pipelined`; `Blocking` is reachable today only from test code |
+
+See the design doc's "Implementation Status" section for what turning the remaining pieces on would involve.
