@@ -184,6 +184,26 @@ pub fn coalesce_shuffle_partitions(
     ranges
 }
 
+/// Returns the target partition size for coalescing shuffle partitions,
+/// taking the desired minimum parallelism into account (similar to Spark AQE
+/// with `spark.sql.adaptive.coalescePartitions.parallelismFirst`).
+///
+/// The target size is reduced so that roughly `min_parallelism` partitions are
+/// produced, but it never goes below `min_partition_size` (to avoid tiny tasks)
+/// or above `target_partition_size`.
+pub fn effective_target_partition_size(
+    total_bytes: u64,
+    target_partition_size: u64,
+    min_partition_size: u64,
+    min_parallelism: usize,
+) -> u64 {
+    if min_parallelism <= 1 || target_partition_size == 0 {
+        return target_partition_size;
+    }
+    let per_slot = total_bytes / min_parallelism as u64;
+    target_partition_size.min(per_slot.max(min_partition_size))
+}
+
 /// Splits map partitions into sub-ranges for reading a skewed channel across multiple tasks.
 #[cfg(test)]
 #[expect(clippy::single_range_in_vec_init)]
@@ -209,6 +229,31 @@ pub fn split_skew_partition(num_map_partitions: usize, num_splits: usize) -> Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_effective_target_partition_size() {
+        const MIB: u64 = 1024 * 1024;
+        // No parallelism floor.
+        assert_eq!(
+            effective_target_partition_size(1000 * MIB, 64 * MIB, MIB, 1),
+            64 * MIB
+        );
+        // Large data: the configured target size wins.
+        assert_eq!(
+            effective_target_partition_size(10_000 * MIB, 64 * MIB, MIB, 64),
+            64 * MIB
+        );
+        // Medium data: reduce the target size to keep 64 partitions.
+        assert_eq!(
+            effective_target_partition_size(640 * MIB, 64 * MIB, MIB, 64),
+            10 * MIB
+        );
+        // Small data: never go below the minimum partition size.
+        assert_eq!(
+            effective_target_partition_size(8 * MIB, 64 * MIB, MIB, 64),
+            MIB
+        );
+    }
 
     #[test]
     fn test_coalesce_empty() {

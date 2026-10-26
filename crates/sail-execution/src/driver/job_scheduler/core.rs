@@ -15,7 +15,7 @@ use sail_common_datafusion::error::CommonErrorCause;
 use sail_python_udf::error::PyErrExtractor;
 use sail_server::actor::ActorContext;
 
-use crate::driver::job_scheduler::adaptive::StageShuffleStats;
+use crate::driver::job_scheduler::adaptive::{effective_target_partition_size, StageShuffleStats};
 use crate::driver::job_scheduler::state::{
     JobDescriptor, JobState, StageState, TaskAttemptDescriptor, TaskDescriptor,
     TaskRegionDescriptor, TaskRegionState, TaskState,
@@ -613,9 +613,15 @@ impl JobScheduler {
             }
         }
 
+        let target_partition_size = effective_target_partition_size(
+            combined_channel_bytes.iter().sum(),
+            options.target_partition_size,
+            options.min_partition_size,
+            options.min_parallelism,
+        );
         let ranges = crate::driver::job_scheduler::adaptive::coalesce_shuffle_partitions(
             &combined_channel_bytes,
-            options.target_partition_size,
+            target_partition_size,
         );
         let n = ranges.len();
         if n == 0 || n >= channels {

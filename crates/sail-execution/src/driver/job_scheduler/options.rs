@@ -16,6 +16,11 @@ pub struct JobSchedulerOptions {
     pub adaptive_enabled: bool,
     pub target_partition_size: u64,
     pub min_partition_size: u64,
+    /// The minimum number of partitions to keep when coalescing shuffle partitions,
+    /// unless the partitions would become smaller than `min_partition_size`.
+    /// This is usually the total number of task slots in the cluster, so that
+    /// coalescing does not reduce the parallelism of CPU-heavy stages.
+    pub min_parallelism: usize,
     pub skew_factor: f64,
     pub min_skew_threshold: u64,
 }
@@ -30,6 +35,7 @@ impl Default for JobSchedulerOptions {
             adaptive_enabled: true,
             target_partition_size: 64 * 1024 * 1024,
             min_partition_size: 1024 * 1024,
+            min_parallelism: 1,
             skew_factor: 5.0,
             min_skew_threshold: 128 * 1024 * 1024,
         }
@@ -68,6 +74,11 @@ impl JobSchedulerOptions {
         self
     }
 
+    pub fn with_min_parallelism(mut self, min_parallelism: usize) -> Self {
+        self.min_parallelism = min_parallelism;
+        self
+    }
+
     pub fn with_skew_factor(mut self, skew_factor: f64) -> Self {
         self.skew_factor = skew_factor;
         self
@@ -89,10 +100,13 @@ impl From<&DriverOptions> for JobSchedulerOptions {
             } else {
                 OutputMode::Pipelined
             },
-            shuffle_dir: std::env::temp_dir().join("sail").join("shuffle"),
+            shuffle_dir: options.shuffle_dir.join("driver"),
             adaptive_enabled: options.adaptive_shuffle_enabled,
             target_partition_size: options.adaptive_shuffle_target_partition_bytes,
             min_partition_size: 1024 * 1024,
+            min_parallelism: (options.worker_max_count.max(options.worker_initial_count)
+                * options.worker_task_slots)
+                .max(1),
             skew_factor: 5.0,
             min_skew_threshold: 128 * 1024 * 1024,
         }

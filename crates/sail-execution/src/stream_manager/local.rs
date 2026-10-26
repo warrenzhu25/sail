@@ -1,6 +1,9 @@
 use std::collections::VecDeque;
+use std::fs::File;
+use std::io::{BufReader, BufWriter};
 
 use datafusion::arrow::array::RecordBatch;
+use datafusion::arrow::ipc::writer::StreamWriter;
 use datafusion::common::Result;
 use log::debug;
 use tokio::sync::mpsc;
@@ -223,9 +226,9 @@ impl LocalStream for DiskStream {
         }
         let tmp_file_path = self.file_path.with_extension("data.tmp");
         let tmp_index_path = self.index_path().with_extension("index.tmp");
-        let file = std::fs::File::create(&tmp_file_path)?;
+        // The data file is created lazily when the first batch is written,
+        // so that empty shuffle channels do not create data files.
         Ok(Box::new(DiskStreamWriter {
-            writer: Some(file),
             stream_writer: None,
             final_file_path: self.file_path.clone(),
             tmp_file_path,
@@ -253,6 +256,7 @@ impl LocalStream for DiskStream {
         if file.metadata()?.len() == 0 {
             return Ok(Box::pin(futures::stream::empty()));
         }
+        let file = BufReader::with_capacity(DISK_STREAM_BUFFER_SIZE, file);
         let reader = match datafusion::arrow::ipc::reader::StreamReader::try_new(file, None) {
             Ok(r) => r,
             Err(e) => {
@@ -279,9 +283,13 @@ impl LocalStream for DiskStream {
     }
 }
 
+/// The buffer size for reading and writing disk stream files.
+/// Hash-partitioned shuffle output often consists of many small batches,
+/// so buffering avoids issuing many small read/write system calls.
+const DISK_STREAM_BUFFER_SIZE: usize = 256 * 1024;
+
 struct DiskStreamWriter {
-    writer: Option<std::fs::File>,
-    stream_writer: Option<datafusion::arrow::ipc::writer::StreamWriter<std::fs::File>>,
+    stream_writer: Option<StreamWriter<BufWriter<File>>>,
     final_file_path: std::path::PathBuf,
     tmp_file_path: std::path::PathBuf,
     final_index_path: std::path::PathBuf,
@@ -305,17 +313,17 @@ impl TaskStreamSink for DiskStreamWriter {
         self.total_records += batch.num_rows();
 
         if self.stream_writer.is_none() {
-            if let Some(file) = self.writer.take() {
-                match datafusion::arrow::ipc::writer::StreamWriter::try_new(file, &batch.schema()) {
-                    Ok(sw) => self.stream_writer = Some(sw),
-                    Err(e) => {
-                        return TaskStreamSinkState::Error(
-                            datafusion::error::DataFusionError::Execution(e.to_string()),
-                        );
-                    }
+            let writer = File::create(&self.tmp_file_path)
+                .map(|f| BufWriter::with_capacity(DISK_STREAM_BUFFER_SIZE, f))
+                .map_err(|e| e.to_string())
+                .and_then(|f| StreamWriter::try_new(f, &batch.schema()).map_err(|e| e.to_string()));
+            match writer {
+                Ok(sw) => self.stream_writer = Some(sw),
+                Err(e) => {
+                    return TaskStreamSinkState::Error(
+                        datafusion::error::DataFusionError::Execution(e),
+                    );
                 }
-            } else {
-                return TaskStreamSinkState::Closed;
             }
         }
 
@@ -325,16 +333,21 @@ impl TaskStreamSink for DiskStreamWriter {
                     e.to_string(),
                 ));
             }
-
-            // Forward batch to any waiting receivers
-            for sender in &self.senders {
-                let _ = sender.try_send(Ok(batch.clone()));
-            }
-
-            TaskStreamSinkState::Ok
-        } else {
-            TaskStreamSinkState::Closed
         }
+
+        // Forward the batch to any waiting receivers. The batch must not be dropped
+        // when the channel is full, so we wait for capacity. Receivers that have gone
+        // away are removed since they no longer need the data.
+        let mut i = 0;
+        while i < self.senders.len() {
+            if self.senders[i].send(Ok(batch.clone())).await.is_err() {
+                self.senders.swap_remove(i);
+            } else {
+                i += 1;
+            }
+        }
+
+        TaskStreamSinkState::Ok
     }
 
     async fn close(mut self: Box<Self>) -> Result<()> {
@@ -344,25 +357,21 @@ impl TaskStreamSink for DiskStreamWriter {
                 .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
             let file = sw
                 .into_inner()
+                .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?
+                .into_inner()
                 .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
-            if let Ok(metadata) = file.metadata() {
-                total_bytes = metadata.len();
-            }
-        } else if let Some(file) = self.writer.take() {
+            total_bytes = file.metadata()?.len();
             drop(file);
+            // Atomically move the data file to its final destination.
+            std::fs::rename(&self.tmp_file_path, &self.final_file_path)?;
         }
 
-        // Write simple index metadata (total bytes, total records) to tmp index file
+        // Write simple index metadata (total bytes, total records) and move it
+        // to its final destination. The index file is always written, even for
+        // empty streams, so that its presence indicates a completed stream.
         let index_content = format!("{}\n{}\n", total_bytes, self.total_records);
-        let _ = std::fs::write(&self.tmp_index_path, index_content);
-
-        // Atomically rename temporary files to final destination
-        if self.tmp_file_path.exists() {
-            let _ = std::fs::rename(&self.tmp_file_path, &self.final_file_path);
-        }
-        if self.tmp_index_path.exists() {
-            let _ = std::fs::rename(&self.tmp_index_path, &self.final_index_path);
-        }
+        std::fs::write(&self.tmp_index_path, index_content)?;
+        std::fs::rename(&self.tmp_index_path, &self.final_index_path)?;
 
         // Drop senders to close channels for any pending receivers
         self.senders.clear();
