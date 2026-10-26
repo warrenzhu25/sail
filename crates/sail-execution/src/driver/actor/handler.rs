@@ -135,30 +135,7 @@ impl DriverActor {
             .get_worker_last_heartbeat(worker_id)
             .is_some_and(|x| x <= instant)
         {
-            self.worker_pool.stop_worker(
-                ctx,
-                worker_id,
-                Some("worker heartbeat timeout".to_string()),
-            );
-
-            let message = "task failed for lost worker".to_string();
-            let keys = self.task_assigner.find_worker_tasks(worker_id);
-            self.task_assigner.deactivate_worker(worker_id);
-            for key in keys.iter() {
-                self.job_scheduler.update_task(
-                    key,
-                    TaskState::Failed,
-                    Some(message.clone()),
-                    Some(CommonErrorCause::Execution(message.clone())),
-                );
-            }
-
-            let job_ids = keys.iter().map(|k| k.job_id).collect::<HashSet<_>>();
-            for job_id in job_ids {
-                self.refresh_job(ctx, job_id);
-                self.run_tasks(ctx);
-                self.scale_up_workers(ctx);
-            }
+            self.mark_worker_lost(ctx, worker_id, "worker heartbeat timeout");
         }
         ActorAction::Continue
     }
@@ -225,11 +202,25 @@ impl DriverActor {
                 self.scale_up_workers(ctx);
             }
             TaskStatus::Failed => {
+                let fetch_failure = match &cause {
+                    Some(CommonErrorCause::ShuffleFetch(e)) => Some(e.clone()),
+                    _ => None,
+                };
+                let rpc_failure = message
+                    .as_deref()
+                    .is_some_and(|m| m.starts_with("failed to run task via the worker client:"));
                 // Some canceled tasks may report failed status due to closed streams,
                 // but it is fine to handle them as failed tasks again.
                 self.job_scheduler
                     .update_task(&key, TaskState::Failed, message, cause);
-                self.task_assigner.unassign_task(&key);
+                let assignment = self.task_assigner.unassign_task(&key);
+                if rpc_failure {
+                    if let Some(TaskAssignment::Worker { worker_id, .. }) = assignment {
+                        self.mark_worker_lost(ctx, worker_id, "failed to launch task on worker");
+                    }
+                } else if let Some(e) = fetch_failure {
+                    self.handle_shuffle_fetch_failure(ctx, &e);
+                }
                 self.refresh_job(ctx, key.job_id);
                 self.run_tasks(ctx);
                 self.scale_up_workers(ctx);
@@ -409,6 +400,66 @@ impl DriverActor {
         }
         self.history = history;
         ActorAction::Stop
+    }
+
+    fn mark_worker_lost(
+        &mut self,
+        ctx: &mut ActorContext<Self>,
+        worker_id: WorkerId,
+        reason: &str,
+    ) {
+        if !self.task_assigner.is_worker_active(worker_id) {
+            return;
+        }
+        self.worker_pool
+            .stop_worker(ctx, worker_id, Some(reason.to_string()));
+
+        let keys = self.task_assigner.find_worker_tasks(worker_id);
+        let stream_keys = self.task_assigner.find_worker_local_streams(worker_id);
+        self.task_assigner.deactivate_worker(worker_id);
+
+        let message = format!("task failed for lost worker {worker_id}: {reason}");
+        for key in &keys {
+            self.job_scheduler
+                .invalidate_task_output(key, message.clone());
+        }
+        let stream_message = format!("shuffle output lost on worker {worker_id} ({reason})");
+        for key in &stream_keys {
+            self.job_scheduler
+                .invalidate_task_output(key, stream_message.clone());
+        }
+
+        let job_ids = keys
+            .iter()
+            .chain(stream_keys.iter())
+            .map(|k| k.job_id)
+            .collect::<HashSet<_>>();
+        for job_id in job_ids {
+            self.refresh_job(ctx, job_id);
+            self.run_tasks(ctx);
+            self.scale_up_workers(ctx);
+        }
+    }
+
+    fn handle_shuffle_fetch_failure(
+        &mut self,
+        ctx: &mut ActorContext<Self>,
+        error: &sail_common_datafusion::error::ShuffleFetchError,
+    ) {
+        let producer = TaskKey {
+            job_id: error.job_id.into(),
+            stage: error.stage as usize,
+            partition: error.partition as usize,
+            attempt: error.attempt as usize,
+        };
+        if error.unreachable {
+            if let Some(w) = error.worker_id {
+                self.mark_worker_lost(ctx, w.into(), "unreachable during shuffle fetch");
+                return;
+            }
+        }
+        self.job_scheduler
+            .invalidate_task_output(&producer, error.to_string());
     }
 
     fn refresh_job(&mut self, ctx: &mut ActorContext<Self>, job_id: JobId) {

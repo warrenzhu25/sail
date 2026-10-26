@@ -207,6 +207,13 @@ impl TaskAssigner {
         self.driver.untrack_remote_streams(job_id, stage)
     }
 
+    pub fn is_worker_active(&self, worker_id: WorkerId) -> bool {
+        matches!(
+            self.workers.get(&worker_id),
+            Some(WorkerResource::Active { .. })
+        )
+    }
+
     pub fn is_worker_idle(&self, worker_id: WorkerId) -> bool {
         let Some(worker) = self.workers.get(&worker_id) else {
             warn!("worker {worker_id} not found");
@@ -218,6 +225,17 @@ impl TaskAssigner {
                 local_streams: streams,
             } => slots.iter().all(|s| s.is_vacant()) && streams.is_empty(),
             WorkerResource::Inactive => false,
+        }
+    }
+
+    pub fn find_worker_local_streams(&self, worker_id: WorkerId) -> Vec<TaskKey> {
+        let Some(worker) = self.workers.get(&worker_id) else {
+            warn!("worker {worker_id} not found");
+            return vec![];
+        };
+        match worker {
+            WorkerResource::Active { local_streams, .. } => local_streams.iter().cloned().collect(),
+            WorkerResource::Inactive => vec![],
         }
     }
 

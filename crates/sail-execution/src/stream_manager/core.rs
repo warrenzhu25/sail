@@ -221,7 +221,10 @@ impl StreamManager {
     }
 
     pub async fn stop(&mut self) {
-        // TODO: remove all remote streams
+        self.local_streams.clear();
+        if self.options.shuffle_dir.exists() {
+            let _ = std::fs::remove_dir_all(&self.options.shuffle_dir);
+        }
     }
 
     fn create_local_stream_with_senders(

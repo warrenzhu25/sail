@@ -92,6 +92,46 @@ impl JobScheduler {
         }
     }
 
+    /// Invalidates a task attempt whose local shuffle output has been lost
+    /// (for example because the worker holding the output died or a downstream
+    /// task failed to fetch from it), so that the task can be re-scheduled.
+    ///
+    /// Returns `true` if the stage was still active and the attempt was invalidated.
+    pub fn invalidate_task_output(&mut self, key: &TaskKey, message: String) -> bool {
+        let Some(job) = self.jobs.get_mut(&key.job_id) else {
+            return false;
+        };
+        if !matches!(job.state, JobState::Running { .. }) {
+            return false;
+        }
+        let Some(stage) = job.stages.get_mut(key.stage) else {
+            return false;
+        };
+        // Once all consumers of the stage have succeeded, its output is no longer needed.
+        if matches!(stage.state, StageState::Inactive) {
+            return false;
+        }
+        let Some(attempt) = stage
+            .tasks
+            .get_mut(key.partition)
+            .and_then(|task| task.attempts.get_mut(key.attempt))
+        else {
+            return false;
+        };
+        attempt.recoverable_failure = true;
+        if matches!(attempt.state, TaskState::Failed | TaskState::Canceled) {
+            return true;
+        }
+        attempt.state = TaskState::Failed;
+        attempt.recoverable_failure = true;
+        if attempt.stopped_at.is_none() {
+            attempt.stopped_at = Some(Utc::now());
+        }
+        attempt.messages.push(message.clone());
+        attempt.cause = Some(CommonErrorCause::Execution(message));
+        true
+    }
+
     pub fn get_task_state(&self, key: &TaskKey) -> Option<TaskState> {
         let attempt = self
             .jobs
@@ -176,8 +216,12 @@ impl JobScheduler {
             let failed = region.tasks.iter().any(|t| {
                 let attempts = &job.stages[t.stage].tasks[t.partition].attempts;
                 if let Some(attempt) = attempts.last() {
+                    let non_recoverable_attempts = attempts
+                        .iter()
+                        .filter(|a| !a.is_recoverable_failure())
+                        .count();
                     if matches!(attempt.state, TaskState::Failed | TaskState::Canceled)
-                        && attempts.len() >= options.task_max_attempts
+                        && non_recoverable_attempts >= options.task_max_attempts
                     {
                         return true;
                     }
@@ -293,6 +337,26 @@ impl JobScheduler {
                 .all(|d| matches!(job.regions[*d].state, TaskRegionState::Succeeded))
             {
                 // The region has dependencies that are not yet succeeded.
+                // Cancel any active task attempts in this region whose upstream inputs are no
+                // longer available (e.g. an upstream map task is being recomputed after a worker loss).
+                for t in &job.topology.regions[r].tasks {
+                    let task = &mut job.stages[t.stage].tasks[t.partition];
+                    for (a, attempt) in task.attempts.iter_mut().enumerate() {
+                        if !attempt.state.is_terminal() {
+                            attempt.state = TaskState::Canceled;
+                            attempt.recoverable_failure = true;
+                            attempt.stopped_at = Some(Utc::now());
+                            actions.push(JobAction::CancelTask {
+                                key: TaskKey {
+                                    job_id,
+                                    stage: t.stage,
+                                    partition: t.partition,
+                                    attempt: a,
+                                },
+                            });
+                        }
+                    }
+                }
                 continue;
             }
 
@@ -315,6 +379,7 @@ impl JobScheduler {
                         messages: vec![],
                         cause: None,
                         job_output_fetched: false,
+                        recoverable_failure: false,
                         created_at: Utc::now(),
                         stopped_at: None,
                     });
@@ -1099,6 +1164,7 @@ mod tests {
                 messages: vec![],
                 cause: None,
                 job_output_fetched: false,
+                recoverable_failure: false,
                 created_at: Utc::now(),
                 stopped_at: None,
             });
@@ -1163,6 +1229,7 @@ mod tests {
                 messages: vec![],
                 cause: None,
                 job_output_fetched: false,
+                recoverable_failure: false,
                 created_at: Utc::now(),
                 stopped_at: None,
             });
@@ -1219,6 +1286,7 @@ mod tests {
             messages: vec![],
             cause: None,
             job_output_fetched: false,
+            recoverable_failure: false,
             created_at: Utc::now(),
             stopped_at: None,
         });
@@ -1360,6 +1428,7 @@ mod tests {
                 messages: vec![],
                 cause: None,
                 job_output_fetched: false,
+                recoverable_failure: false,
                 created_at: Utc::now(),
                 stopped_at: None,
             });
@@ -1371,6 +1440,7 @@ mod tests {
                 messages: vec![],
                 cause: None,
                 job_output_fetched: false,
+                recoverable_failure: false,
                 created_at: Utc::now(),
                 stopped_at: None,
             });
@@ -1436,6 +1506,7 @@ mod tests {
                 messages: vec![],
                 cause: None,
                 job_output_fetched: false,
+                recoverable_failure: false,
                 created_at: Utc::now(),
                 stopped_at: None,
             });
@@ -1490,6 +1561,7 @@ mod tests {
                 messages: vec![],
                 cause: None,
                 job_output_fetched: false,
+                recoverable_failure: false,
                 created_at: Utc::now(),
                 stopped_at: None,
             });
@@ -1683,6 +1755,124 @@ mod tests {
         }
         let input = find_input(&merge_plan).ok_or("stage input not found")?;
         assert_eq!(input.output_partitioning().partition_count(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_shuffle_fetch_failure_recomputes_upstream_partition(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use sail_common_datafusion::error::ShuffleFetchError;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+        let repartition = Arc::new(RepartitionExec::try_new(
+            Arc::new(EmptyExec::new(schema)),
+            Partitioning::RoundRobinBatch(2),
+        )?);
+        let graph = JobGraph::try_new_with_mode(repartition, OutputMode::Blocking)?;
+        let options = JobSchedulerOptions::default()
+            .with_shuffle_mode(OutputMode::Blocking)
+            .with_adaptive_enabled(false)
+            .with_task_max_attempts(1);
+        let mut scheduler = JobScheduler::new(options);
+        let job_id = JobId::from(101);
+        scheduler
+            .jobs
+            .insert(job_id, JobDescriptor::try_new(graph, JobState::Draining)?);
+        // Put the job into Running state without needing an ActorContext by testing the
+        // helper steps directly, matching the other unit tests.
+        let job = scheduler.jobs.get_mut(&job_id).ok_or("job missing")?;
+        succeed_all(job, 0);
+        JobScheduler::update_task_regions(job, &scheduler.options);
+        let actions = JobScheduler::schedule_task_regions(&scheduler.options, job_id, job);
+        assert_eq!(actions.len(), 2); // stage 1 partitions 0 and 1
+        job.stages[1].tasks[0].attempts[0].state = TaskState::Running;
+        job.stages[1].tasks[1].attempts[0].state = TaskState::Running;
+
+        // Partition 0 of stage 1 fails to fetch from stage 0 partition 0 attempt 0
+        let fetch_err = ShuffleFetchError {
+            worker_id: Some(1),
+            job_id: job_id.into(),
+            stage: 0,
+            partition: 0,
+            attempt: 0,
+            channel: 0,
+            unreachable: true,
+            message: "transport error: connection refused".to_string(),
+        };
+        scheduler.update_task(
+            &TaskKey {
+                job_id,
+                stage: 1,
+                partition: 0,
+                attempt: 0,
+            },
+            TaskState::Failed,
+            Some(fetch_err.to_string()),
+            Some(CommonErrorCause::ShuffleFetch(fetch_err.clone())),
+        );
+        // The driver invalidates the upstream producer task on the lost worker
+        // (even though the job state in this unit test is Draining, test the Descriptor logic)
+        let job = scheduler.jobs.get_mut(&job_id).ok_or("job missing")?;
+        job.stages[0].tasks[0].attempts[0].state = TaskState::Failed;
+        job.stages[0].tasks[0].attempts[0].recoverable_failure = true;
+
+        // Even with task_max_attempts = 1, neither region fails because both failures
+        // are recoverable (shuffle fetch / lost worker output).
+        JobScheduler::update_task_regions(job, &scheduler.options);
+        assert!(job
+            .regions
+            .iter()
+            .all(|r| !matches!(r.state, TaskRegionState::Failed)));
+
+        // Re-scheduling cancels the still-running consumer partition 1 and schedules
+        // a second attempt (attempt 1) of upstream stage 0 partition 0.
+        let actions = JobScheduler::schedule_task_regions(&scheduler.options, job_id, job);
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            JobAction::CancelTask { key } if key.stage == 1 && key.partition == 1 && key.attempt == 0
+        )));
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, JobAction::ScheduleTaskRegion { .. })));
+        assert_eq!(job.stages[0].tasks[0].attempts.len(), 2);
+        assert!(matches!(
+            job.stages[0].tasks[0].attempts[1].state,
+            TaskState::Created
+        ));
+
+        // Once the recomputed upstream attempt 1 succeeds, the downstream stage 1 is
+        // re-scheduled and reads from attempt 1 of stage 0.
+        job.stages[0].tasks[0].attempts[1].state = TaskState::Succeeded;
+        JobScheduler::update_task_regions(job, &scheduler.options);
+        let actions = JobScheduler::schedule_task_regions(&scheduler.options, job_id, job);
+        assert_eq!(actions.len(), 2);
+        assert_eq!(job.stages[1].tasks[0].attempts.len(), 2);
+        assert_eq!(job.stages[1].tasks[1].attempts.len(), 2);
+
+        let mock_assignment = MockAssignment {
+            assignment: TaskAssignment::Worker {
+                worker_id: crate::id::WorkerId::from(2),
+                slot: 0,
+            },
+        };
+        let job = scheduler.jobs.get(&job_id).ok_or("job missing")?;
+        let input = scheduler.get_task_input(
+            job,
+            &TaskKey {
+                job_id,
+                stage: 1,
+                partition: 0,
+                attempt: 1,
+            },
+            &job.graph.stages()[1].inputs[0],
+            &mock_assignment,
+        )?;
+        match input.locator {
+            TaskInputLocator::Worker { keys, .. } => {
+                assert_eq!(keys[0][0].1.attempt, 1);
+            }
+            _ => return Err("expected Worker locator".into()),
+        }
         Ok(())
     }
 }

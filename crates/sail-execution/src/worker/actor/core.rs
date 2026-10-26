@@ -111,8 +111,9 @@ impl Actor for WorkerActor {
         }
     }
 
-    async fn stop(self, _ctx: &mut ActorContext<Self>) {
+    async fn stop(mut self, _ctx: &mut ActorContext<Self>) {
         self.server.stop().await;
+        self.stream_manager.stop().await;
         info!("worker {} server has stopped", self.options.worker_id);
     }
 }

@@ -37,6 +37,27 @@ impl From<PythonErrorCause> for RemotePythonError {
     }
 }
 
+/// An error that occurs when a task fails to read the shuffle output of an upstream task.
+///
+/// This is a recoverable error in the cluster mode: the driver can recompute the
+/// upstream task output (e.g. when the worker that holds the output is lost) and retry
+/// the downstream task without counting the failure towards the task attempt limit.
+#[derive(Debug, Clone, Error, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[error("shuffle fetch failed for job {job_id} stage {stage} partition {partition} attempt {attempt} channel {channel}{}: {message}", .worker_id.map(|w| format!(" on worker {w}")).unwrap_or_default())]
+pub struct ShuffleFetchError {
+    /// The worker that holds the upstream task output, if known.
+    pub worker_id: Option<u64>,
+    pub job_id: u64,
+    pub stage: u64,
+    pub partition: u64,
+    pub attempt: u64,
+    pub channel: u64,
+    /// Whether the worker holding the output could not be reached at all.
+    pub unreachable: bool,
+    pub message: String,
+}
+
 /// A trait to extract Python error cause from a generic error.
 ///
 /// The implementation should inspect the provided error without
@@ -78,6 +99,7 @@ pub enum CommonErrorCause {
     Configuration(String),
     Execution(String),
     DeltaTable(String),
+    ShuffleFetch(ShuffleFetchError),
 }
 
 impl CommonErrorCause {
@@ -90,6 +112,9 @@ impl CommonErrorCause {
             return Self::Unknown("circular error reference".to_string());
         }
         seen.insert(ptr);
+        if let Some(e) = error.downcast_ref::<ShuffleFetchError>() {
+            return Self::ShuffleFetch(e.clone());
+        }
         if let Some(e) = error.downcast_ref::<ArrowError>() {
             return match e {
                 ArrowError::NotYetImplemented(x) => Self::NotImplemented(x.clone()),

@@ -389,6 +389,9 @@ impl From<CommonErrorCause> for SparkThrowable {
                 SparkThrowable::AnalysisException(x)
             }
             CommonErrorCause::DeltaTable(x) => SparkThrowable::QueryExecutionException(x),
+            CommonErrorCause::ShuffleFetch(e) => {
+                SparkThrowable::QueryExecutionException(e.to_string())
+            }
         }
     }
 }

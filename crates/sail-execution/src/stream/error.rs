@@ -113,6 +113,7 @@ impl From<CommonErrorCause> for TaskStreamError {
             CommonErrorCause::Python(cause) => {
                 Self::External(Arc::new(RemotePythonError::from(cause)))
             }
+            CommonErrorCause::ShuffleFetch(e) => Self::External(Arc::new(e)),
         }
     }
 }

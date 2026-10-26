@@ -192,9 +192,15 @@ impl Stream for JobOutputStream {
                         // because new streams may still be added.
                         Poll::Pending
                     }
-                    Poll::Ready(Some(result)) => Poll::Ready(Some(
-                        result.map_err(|e| DataFusionError::External(Box::new(e))),
-                    )),
+                    Poll::Ready(Some(Ok(batch))) => Poll::Ready(Some(Ok(batch))),
+                    Poll::Ready(Some(Err(_))) => {
+                        // A final-stage stream may fail while the job is still active
+                        // (for example because an upstream worker was lost and the stage
+                        // is being retried). Wait for the replacement stream or a terminal
+                        // `JobOutputItem::Error` from the scheduler.
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
+                    }
                 }
             }
             JobOutputState::Modifying => Poll::Pending,

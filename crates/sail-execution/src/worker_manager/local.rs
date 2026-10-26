@@ -38,6 +38,26 @@ impl LocalWorkerManager {
             session,
         }
     }
+
+    /// Stops a single worker in the local cluster.
+    #[cfg(test)]
+    pub async fn stop_worker(&self, id: WorkerId) -> ExecutionResult<()> {
+        use crate::worker::WorkerEvent;
+        let handle = {
+            let mut state = self.state.lock().await;
+            state.workers.remove(&id)
+        };
+        if let Some(handle) = handle {
+            let _ = handle.send(WorkerEvent::Shutdown).await;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub async fn worker_ids(&self) -> Vec<WorkerId> {
+        let state = self.state.lock().await;
+        state.workers.keys().copied().collect()
+    }
 }
 
 #[tonic::async_trait]

@@ -197,8 +197,21 @@ pub struct TaskAttemptDescriptor {
     /// This will always be false if the task does not belong to
     /// the final stages of the job.
     pub job_output_fetched: bool,
+    /// Whether this attempt failed or was invalidated because of a lost worker
+    /// or a lost upstream shuffle output, so it should not count towards the
+    /// task attempt limit.
+    pub recoverable_failure: bool,
     pub created_at: DateTime<Utc>,
     pub stopped_at: Option<DateTime<Utc>>,
+}
+
+impl TaskAttemptDescriptor {
+    /// Returns whether this attempt failed because of a recoverable condition
+    /// (such as a lost worker or a shuffle fetch failure from an upstream task),
+    /// rather than a failure of the task's own execution.
+    pub fn is_recoverable_failure(&self) -> bool {
+        self.recoverable_failure || matches!(self.cause, Some(CommonErrorCause::ShuffleFetch(_)))
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

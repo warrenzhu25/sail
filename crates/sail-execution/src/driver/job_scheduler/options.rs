@@ -38,6 +38,11 @@ impl Default for JobSchedulerOptions {
 
 #[expect(dead_code)]
 impl JobSchedulerOptions {
+    pub fn with_task_max_attempts(mut self, task_max_attempts: usize) -> Self {
+        self.task_max_attempts = task_max_attempts;
+        self
+    }
+
     pub fn with_shuffle_mode(mut self, shuffle_mode: OutputMode) -> Self {
         self.shuffle_mode = shuffle_mode;
         self
