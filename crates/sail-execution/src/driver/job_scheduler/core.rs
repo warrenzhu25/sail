@@ -513,6 +513,12 @@ impl JobScheduler {
         let mut tasks: Vec<(TaskPlacement, TaskSet)> = vec![];
         for (key, value) in stage_groups {
             for entries in value.buckets {
+                // Skip empty buckets. A region that only covers a subset of the stage
+                // partitions (e.g. a single partition of a blocking stage) would otherwise
+                // reserve one task slot per bucket for task sets with no tasks.
+                if entries.is_empty() {
+                    continue;
+                }
                 tasks.push((key.placement, TaskSet { entries }));
             }
         }
