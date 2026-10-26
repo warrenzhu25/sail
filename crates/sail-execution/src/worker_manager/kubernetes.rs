@@ -114,6 +114,7 @@ impl KubernetesWorkerManager {
             task_stream_buffer,
             task_stream_creation_timeout,
             rpc_retry_strategy,
+            shuffle_dir: _,
         } = options;
         let w3c_traceparent =
             SpanContext::current_local_parent().map(|x| x.encode_w3c_traceparent());

@@ -184,25 +184,25 @@ impl Stream for JobOutputStream {
             }
         }
         match &mut self.state {
-            JobOutputState::Active { inner, receiver: _ } => {
+            JobOutputState::Active { inner, receiver: _ } => loop {
                 match inner.as_mut().poll_next(cx) {
-                    Poll::Pending => Poll::Pending,
+                    Poll::Pending => break Poll::Pending,
                     Poll::Ready(None) => {
                         // We return pending even if all the existing streams are done,
                         // because new streams may still be added.
-                        Poll::Pending
+                        break Poll::Pending;
                     }
-                    Poll::Ready(Some(Ok(batch))) => Poll::Ready(Some(Ok(batch))),
+                    Poll::Ready(Some(Ok(batch))) => break Poll::Ready(Some(Ok(batch))),
                     Poll::Ready(Some(Err(_))) => {
                         // A final-stage stream may fail while the job is still active
                         // (for example because an upstream worker was lost and the stage
-                        // is being retried). Wait for the replacement stream or a terminal
-                        // `JobOutputItem::Error` from the scheduler.
-                        cx.waker().wake_by_ref();
-                        Poll::Pending
+                        // is being retried). The failed stream is terminated, and we wait
+                        // for the replacement stream or a terminal `JobOutputItem::Error`
+                        // from the scheduler while continuing to poll the other streams.
+                        continue;
                     }
                 }
-            }
+            },
             JobOutputState::Modifying => Poll::Pending,
             JobOutputState::Draining { inner } => match inner.as_mut().poll_next(cx) {
                 Poll::Pending => Poll::Pending,
@@ -261,8 +261,12 @@ impl Stream for TaskStreamWrapper {
             return Poll::Ready(None);
         };
         let poll = inner.as_mut().poll_next(cx);
-        if let Poll::Ready(Some(Ok(ref batch))) = poll {
-            self.count += batch.num_rows();
+        match poll {
+            Poll::Ready(Some(Ok(ref batch))) => self.count += batch.num_rows(),
+            // The stream is considered terminated after an error,
+            // so that it is never polled again.
+            Poll::Ready(Some(Err(_))) => self.inner = None,
+            _ => {}
         }
         poll
     }

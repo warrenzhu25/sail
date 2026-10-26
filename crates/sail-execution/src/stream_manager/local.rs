@@ -238,7 +238,16 @@ impl LocalStream for DiskStream {
 
     fn subscribe(&mut self) -> ExecutionResult<TaskStreamSource> {
         if !self.file_path.exists() {
-            return Ok(Box::pin(futures::stream::empty()));
+            // The data file is not created for empty streams, but the index file is always
+            // written when the stream is closed. If neither exists, the shuffle output has
+            // been lost (e.g. cleaned up), and we must not silently return an empty stream.
+            if self.index_path().exists() {
+                return Ok(Box::pin(futures::stream::empty()));
+            }
+            return Err(ExecutionError::InternalError(format!(
+                "shuffle output not found: {}",
+                self.file_path.display()
+            )));
         }
         let file = std::fs::File::open(&self.file_path)?;
         if file.metadata()?.len() == 0 {
@@ -518,6 +527,22 @@ mod tests {
         assert!(source.next().await.is_none());
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_disk_stream_lost_output_is_an_error() -> Result<()> {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sail_test_lost_{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&temp_dir)?;
+        let file_path = temp_dir.join("test_lost.data");
+        let mut disk_stream = DiskStream::new(file_path.clone());
+
+        let sink = disk_stream.publish().unwrap();
+        sink.close().await?;
+        // Simulate the shuffle output being cleaned up.
+        std::fs::remove_dir_all(&temp_dir)?;
+        assert!(disk_stream.subscribe().is_err());
         Ok(())
     }
 }

@@ -427,12 +427,12 @@ impl DriverActor {
         let message = format!("task failed for lost worker {worker_id}: {reason}");
         for key in &keys {
             self.job_scheduler
-                .invalidate_task_output(key, message.clone());
+                .invalidate_task_output(key, message.clone(), false);
         }
         let stream_message = format!("shuffle output lost on worker {worker_id} ({reason})");
         for key in &stream_keys {
             self.job_scheduler
-                .invalidate_task_output(key, stream_message.clone());
+                .invalidate_task_output(key, stream_message.clone(), false);
         }
 
         let job_ids = keys
@@ -461,11 +461,12 @@ impl DriverActor {
         if error.unreachable {
             if let Some(w) = error.worker_id {
                 self.mark_worker_lost(ctx, w.into(), "unreachable during shuffle fetch");
-                return;
             }
         }
+        // The producer output must be recomputed even if the worker was already marked
+        // as lost (or the producer stage was already inactive), since a consumer needs it.
         self.job_scheduler
-            .invalidate_task_output(&producer, error.to_string());
+            .invalidate_task_output(&producer, error.to_string(), true);
     }
 
     fn refresh_job(&mut self, ctx: &mut ActorContext<Self>, job_id: JobId) {

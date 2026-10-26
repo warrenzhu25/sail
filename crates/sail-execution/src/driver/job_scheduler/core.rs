@@ -39,6 +39,10 @@ use crate::task::scheduling::{
 };
 use crate::task::stats::TaskShuffleStats;
 
+/// The maximum number of attempts of a task that can fail for recoverable reasons
+/// (such as lost workers or lost upstream shuffle output) before the job fails.
+const MAX_RECOVERABLE_TASK_ATTEMPTS: usize = 16;
+
 impl JobScheduler {
     fn next_job_id(&mut self) -> ExecutionResult<JobId> {
         self.job_id_generator.next()
@@ -110,8 +114,19 @@ impl JobScheduler {
     /// (for example because the worker holding the output died or a downstream
     /// task failed to fetch from it), so that the task can be re-scheduled.
     ///
-    /// Returns `true` if the stage was still active and the attempt was invalidated.
-    pub fn invalidate_task_output(&mut self, key: &TaskKey, message: String) -> bool {
+    /// If `reactivate` is `false`, the output of an inactive stage (whose consumers have
+    /// all succeeded) is not invalidated since it is no longer needed. If `reactivate` is
+    /// `true`, the stage is reactivated so that the output is recomputed. This is needed
+    /// when a consumer task is re-run (e.g. because its own output was lost) and fails
+    /// to fetch the output of the inactive stage.
+    ///
+    /// Returns `true` if the attempt was invalidated.
+    pub fn invalidate_task_output(
+        &mut self,
+        key: &TaskKey,
+        message: String,
+        reactivate: bool,
+    ) -> bool {
         let Some(job) = self.jobs.get_mut(&key.job_id) else {
             return false;
         };
@@ -121,9 +136,28 @@ impl JobScheduler {
         let Some(stage) = job.stages.get_mut(key.stage) else {
             return false;
         };
-        // Once all consumers of the stage have succeeded, its output is no longer needed.
+        // Once all consumers of the stage have succeeded, its output is no longer needed,
+        // unless a consumer has to be re-run.
         if matches!(stage.state, StageState::Inactive) {
-            return false;
+            if !reactivate {
+                return false;
+            }
+            stage.state = StageState::Active;
+            stage.stopped_at = None;
+            // The shuffle output of all the partitions has been cleaned up when the stage
+            // became inactive, so all the partitions must be recomputed.
+            for task in stage.tasks.iter_mut() {
+                if let Some(attempt) = task
+                    .attempts
+                    .last_mut()
+                    .filter(|a| matches!(a.state, TaskState::Succeeded))
+                {
+                    attempt.state = TaskState::Failed;
+                    attempt.recoverable_failure = true;
+                    attempt.messages.push(message.clone());
+                    attempt.cause = Some(CommonErrorCause::Execution(message.clone()));
+                }
+            }
         }
         let Some(attempt) = stage
             .tasks
@@ -230,12 +264,17 @@ impl JobScheduler {
             let failed = region.tasks.iter().any(|t| {
                 let attempts = &job.stages[t.stage].tasks[t.partition].attempts;
                 if let Some(attempt) = attempts.last() {
-                    let non_recoverable_attempts = attempts
+                    let recoverable_attempts = attempts
                         .iter()
-                        .filter(|a| !a.is_recoverable_failure())
+                        .filter(|a| a.is_recoverable_failure())
                         .count();
+                    let non_recoverable_attempts = attempts.len() - recoverable_attempts;
+                    // Recoverable failures (lost workers or lost shuffle outputs) do not count
+                    // towards the task attempt limit, but they are still bounded so that a
+                    // job never retries forever.
                     if matches!(attempt.state, TaskState::Failed | TaskState::Canceled)
-                        && non_recoverable_attempts >= options.task_max_attempts
+                        && (non_recoverable_attempts >= options.task_max_attempts
+                            || recoverable_attempts >= MAX_RECOVERABLE_TASK_ATTEMPTS)
                     {
                         return true;
                     }

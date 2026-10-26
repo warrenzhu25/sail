@@ -171,7 +171,7 @@ mod tests {
         config.cluster.worker_max_count = 2;
         config.cluster.worker_task_slots = 1;
         config.cluster.worker_heartbeat_interval_secs = 1;
-        config.cluster.worker_heartbeat_timeout_secs = 1;
+        config.cluster.worker_heartbeat_timeout_secs = 2;
         config.cluster.task_stream_creation_timeout_secs = 1;
         config.cluster.task_max_attempts = 1;
         config.cluster.shuffle_mode = "blocking".to_string();
@@ -187,6 +187,7 @@ mod tests {
         let session = SessionContext::new();
         let worker_manager = Arc::new(LocalWorkerManager::new(runtime.clone(), session.clone()));
         let options = DriverOptions::new(&config, runtime, worker_manager.clone());
+        let shuffle_dir = options.shuffle_dir.clone();
         let mut system = ActorSystem::new();
         let runner = ClusterJobRunner::new(&mut system, options);
 
@@ -222,12 +223,7 @@ mod tests {
         // immediately so that stage 0 / stage 1 must recover via stage retry.
         let wm = worker_manager.clone();
         let killer = tokio::spawn(async move {
-            let dir = std::env::temp_dir()
-                .join("sail")
-                .join("shuffle")
-                .join("worker_1")
-                .join("1");
-            let _ = std::fs::remove_dir_all(&dir);
+            let dir = shuffle_dir.join("worker_1").join("1");
             for _ in 0..100_000 {
                 if dir.exists() {
                     let _ = wm.stop_worker(1.into()).await;

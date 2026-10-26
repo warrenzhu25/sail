@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,6 +27,9 @@ pub struct DriverOptions {
     pub task_stream_creation_timeout: Duration,
     pub task_max_attempts: usize,
     pub shuffle_mode: String,
+    /// The shuffle directory of this driver instance.
+    /// Local workers use subdirectories of this directory.
+    pub shuffle_dir: PathBuf,
     pub adaptive_shuffle_enabled: bool,
     pub adaptive_shuffle_target_partition_bytes: u64,
     pub rpc_retry_strategy: RetryStrategy,
@@ -64,6 +68,14 @@ impl DriverOptions {
             ),
             task_max_attempts: config.cluster.task_max_attempts,
             shuffle_mode: config.cluster.shuffle_mode.clone(),
+            // Each driver instance gets a unique shuffle directory, so that multiple drivers
+            // in the same process (e.g. one per session) or on the same host never share
+            // (or delete) each other's shuffle files.
+            shuffle_dir: shuffle_root_dir(&config.cluster.shuffle_dir).join(format!(
+                "driver-{}-{:016x}",
+                std::process::id(),
+                rand::random::<u64>()
+            )),
             adaptive_shuffle_enabled: config.cluster.adaptive_shuffle_enabled,
             adaptive_shuffle_target_partition_bytes: config
                 .cluster
@@ -71,5 +83,14 @@ impl DriverOptions {
             runtime,
             worker_manager,
         }
+    }
+}
+
+/// Returns the root directory for shuffle files given the configured value.
+pub(crate) fn shuffle_root_dir(configured: &str) -> PathBuf {
+    if configured.is_empty() {
+        std::env::temp_dir().join("sail").join("shuffle")
+    } else {
+        PathBuf::from(configured)
     }
 }

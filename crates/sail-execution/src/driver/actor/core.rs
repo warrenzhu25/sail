@@ -3,7 +3,7 @@ use std::mem;
 
 use fastrace::future::FutureExt;
 use fastrace::Span;
-use log::{error, info};
+use log::{error, info, warn};
 use sail_server::actor::{Actor, ActorAction, ActorContext};
 
 use crate::driver::job_scheduler::{JobScheduler, JobSchedulerOptions};
@@ -138,6 +138,13 @@ impl Actor for DriverActor {
         self.stream_manager.stop().await;
         if let Err(e) = self.worker_pool.close(ctx).await {
             error!("encountered error while stopping workers: {e}");
+        }
+        // Remove the shuffle directory of this driver instance, including the
+        // directories of local workers that may not have been cleaned up.
+        if self.options.shuffle_dir.exists() {
+            if let Err(e) = std::fs::remove_dir_all(&self.options.shuffle_dir) {
+                warn!("failed to remove shuffle directory: {e}");
+            }
         }
         if let Some(history) = self.history.take() {
             let _ = history.send(self.build_history());

@@ -35,7 +35,7 @@ impl From<&DriverOptions> for StreamManagerOptions {
         Self {
             task_stream_buffer: options.task_stream_buffer,
             task_stream_creation_timeout: options.task_stream_creation_timeout,
-            shuffle_dir: std::env::temp_dir().join("sail").join("shuffle"),
+            shuffle_dir: options.shuffle_dir.join("driver"),
         }
     }
 }
@@ -48,10 +48,7 @@ impl From<&WorkerOptions> for StreamManagerOptions {
             // Each worker gets its own shuffle directory so that stopping a worker or
             // cleaning up a stage on one worker in the local-cluster mode does not affect
             // the shuffle files of other workers.
-            shuffle_dir: std::env::temp_dir()
-                .join("sail")
-                .join("shuffle")
-                .join(format!("worker_{}", options.worker_id)),
+            shuffle_dir: options.shuffle_dir.clone(),
         }
     }
 }

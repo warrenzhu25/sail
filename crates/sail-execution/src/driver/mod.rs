@@ -20,4 +20,5 @@ pub(crate) use actor::DriverActor;
 pub(crate) use client::DriverClientSet;
 pub(crate) use event::{DriverEvent, TaskStatus};
 pub(crate) use gen::driver_service_client::DriverServiceClient;
+pub(crate) use options::shuffle_root_dir;
 pub use options::DriverOptions;
