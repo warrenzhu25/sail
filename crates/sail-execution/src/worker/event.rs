@@ -11,6 +11,7 @@ use crate::id::{JobId, TaskKey, TaskStreamKey, WorkerId};
 use crate::stream::reader::TaskStreamSource;
 use crate::stream::writer::{LocalStreamStorage, TaskStreamSink};
 use crate::task::definition::TaskDefinition;
+use crate::task::stats::TaskShuffleStats;
 use crate::worker::gen;
 
 pub enum WorkerEvent {
@@ -37,6 +38,7 @@ pub enum WorkerEvent {
         status: TaskStatus,
         message: Option<String>,
         cause: Option<CommonErrorCause>,
+        shuffle_stats: Option<TaskShuffleStats>,
     },
     ProbePendingLocalStream {
         key: TaskStreamKey,
@@ -154,6 +156,7 @@ impl SpanAssociation for WorkerEvent {
                 status,
                 message,
                 cause,
+                shuffle_stats: _,
             } => {
                 p.push((SpanAttribute::EXECUTION_JOB_ID, job_id.to_string()));
                 p.push((SpanAttribute::EXECUTION_STAGE, stage.to_string()));

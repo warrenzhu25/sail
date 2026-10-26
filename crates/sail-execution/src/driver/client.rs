@@ -11,6 +11,7 @@ use crate::error::{ExecutionError, ExecutionResult};
 use crate::id::{TaskKey, WorkerId};
 use crate::rpc::{ClientHandle, ClientOptions, ClientService};
 use crate::stream_service::TaskStreamFlightClient;
+use crate::task::stats::TaskShuffleStats;
 
 #[derive(Clone)]
 pub struct DriverClientSet {
@@ -94,6 +95,7 @@ impl DriverClient {
         status: TaskStatus,
         message: Option<String>,
         cause: Option<CommonErrorCause>,
+        shuffle_stats: Option<TaskShuffleStats>,
         sequence: u64,
     ) -> ExecutionResult<()> {
         let cause = cause
@@ -111,6 +113,10 @@ impl DriverClient {
             status: gen::TaskStatus::from(status) as i32,
             message,
             cause,
+            shuffle_stats: shuffle_stats.map(|x| gen::TaskShuffleStats {
+                channel_bytes: x.channel_bytes,
+                channel_records: x.channel_records,
+            }),
             sequence,
         });
         let response = self.inner.get().await?.report_task_status(request).await?;

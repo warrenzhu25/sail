@@ -9,6 +9,7 @@ use tokio::sync::oneshot;
 
 use crate::driver::{DriverEvent, TaskStatus};
 use crate::id::TaskKey;
+use crate::task::stats::TaskShuffleStats;
 use crate::worker::WorkerEvent;
 
 pub struct TaskRunner {
@@ -22,6 +23,7 @@ pub trait TaskRunnerMessage {
         status: TaskStatus,
         message: Option<String>,
         cause: Option<CommonErrorCause>,
+        shuffle_stats: Option<TaskShuffleStats>,
     ) -> Self;
 }
 
@@ -31,12 +33,14 @@ impl TaskRunnerMessage for DriverEvent {
         status: TaskStatus,
         message: Option<String>,
         cause: Option<CommonErrorCause>,
+        shuffle_stats: Option<TaskShuffleStats>,
     ) -> Self {
         DriverEvent::UpdateTask {
             key,
             status,
             message,
             cause,
+            shuffle_stats,
             sequence: None,
         }
     }
@@ -48,12 +52,14 @@ impl TaskRunnerMessage for WorkerEvent {
         status: TaskStatus,
         message: Option<String>,
         cause: Option<CommonErrorCause>,
+        shuffle_stats: Option<TaskShuffleStats>,
     ) -> Self {
         WorkerEvent::ReportTaskStatus {
             key,
             status,
             message,
             cause,
+            shuffle_stats,
         }
     }
 }

@@ -2,7 +2,6 @@ use std::any::Any;
 use std::fmt::Formatter;
 use std::sync::Arc;
 
-use datafusion::arrow::datatypes::Schema;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::{exec_datafusion_err, plan_err, Result};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
@@ -20,6 +19,7 @@ use futures::StreamExt;
 
 use crate::plan::ListListDisplay;
 use crate::stream::writer::{TaskStreamSinkState, TaskStreamWriter, TaskWriteLocation};
+use crate::task::stats::TaskShuffleStats;
 
 #[derive(Debug, Clone)]
 pub struct ShuffleWriteExec {
@@ -55,12 +55,13 @@ impl ShuffleWriteExec {
             _ => partitioning,
         };
         let properties = Arc::new(PlanProperties::new(
-            EquivalenceProperties::new(Arc::new(Schema::empty())),
+            EquivalenceProperties::new(TaskShuffleStats::schema()),
             // The shuffle write plan has the same number of partitions as the input plan.
             // For each partition that are executed, the data is further partitioned according to
             // the shuffle partitioning, resulting in multiple output streams.
             // These output streams are written to locations managed by the worker,
-            // while the return value of `.execute()` is always an empty stream.
+            // while the return value of `.execute()` is a stream with a single batch
+            // containing the per-channel shuffle statistics (see `TaskShuffleStats`).
             Partitioning::UnknownPartitioning(plan.output_partitioning().partition_count()),
             EmissionType::Final,
             Boundedness::Unbounded {
@@ -157,10 +158,9 @@ impl ExecutionPlan for ShuffleWriteExec {
             partition,
             num_input_partitions,
         )?;
-        let empty = RecordBatch::new_empty(self.schema());
         let output = futures::stream::once(async move {
-            shuffle_write(writer, stream, &locations, partitioner).await?;
-            Ok(empty)
+            let stats = shuffle_write(writer, stream, &locations, partitioner).await?;
+            stats.to_record_batch()
         });
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema(),
@@ -174,8 +174,9 @@ async fn shuffle_write(
     mut stream: SendableRecordBatchStream,
     locations: &[TaskWriteLocation],
     mut partitioner: BatchPartitioner,
-) -> Result<()> {
+) -> Result<TaskShuffleStats> {
     let schema = stream.schema();
+    let mut stats = TaskShuffleStats::new(locations.len());
     let mut partition_sinks = {
         let futures = locations
             .iter()
@@ -202,6 +203,8 @@ async fn shuffle_write(
             // even if the current batch does not have data for this partition.
             active += 1;
             if let Some(batch) = partitions[p].take() {
+                stats.channel_bytes[p] += batch.get_array_memory_size() as u64;
+                stats.channel_records[p] += batch.num_rows() as u64;
                 match sink.write(Ok(batch)).await {
                     TaskStreamSinkState::Ok => {}
                     TaskStreamSinkState::Error(e) => {
@@ -226,5 +229,5 @@ async fn shuffle_write(
         .into_iter()
         .filter_map(|s| s.map(|x| x.close()));
     try_join_all(futures).await?;
-    Ok(())
+    Ok(stats)
 }

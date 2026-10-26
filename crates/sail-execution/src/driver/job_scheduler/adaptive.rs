@@ -4,6 +4,7 @@ use std::path::Path;
 use log::debug;
 
 use crate::id::JobId;
+use crate::task::stats::TaskShuffleStats;
 
 /// Summary statistics for all partitions and channels produced by a shuffle stage.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +26,25 @@ impl StageShuffleStats {
             total_records: 0,
             missing_index_files: 0,
         }
+    }
+
+    /// Aggregates the shuffle stats reported by the workers for each upstream task.
+    pub fn from_task_stats<'a>(
+        channels: usize,
+        tasks: impl IntoIterator<Item = &'a TaskShuffleStats>,
+    ) -> Self {
+        let mut stats = Self::new(channels);
+        for task in tasks {
+            for (acc, b) in stats.channel_bytes.iter_mut().zip(&task.channel_bytes) {
+                *acc += b;
+                stats.total_bytes += b;
+            }
+            for (acc, r) in stats.channel_records.iter_mut().zip(&task.channel_records) {
+                *acc += *r as usize;
+                stats.total_records += *r as usize;
+            }
+        }
+        stats
     }
 
     /// Read shuffle stats from on-disk index files written by `DiskStream`.

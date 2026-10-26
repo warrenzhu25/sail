@@ -7,6 +7,7 @@ use tokio::sync::oneshot;
 
 use crate::driver::TaskStatus;
 use crate::id::{TaskKey, TaskKeyDisplay};
+use crate::task::stats::TaskShuffleStats;
 use crate::task_runner::TaskRunnerMessage;
 
 pub struct TaskMonitor<T: Actor> {
@@ -55,7 +56,7 @@ where
 
     /// Builds a "task is running" status message.
     fn running(key: TaskKey) -> T::Message {
-        T::Message::report_task_status(key, TaskStatus::Running, None, None)
+        T::Message::report_task_status(key, TaskStatus::Running, None, None, None)
     }
 
     /// Waits for a cancellation signal and builds a canceled status message.
@@ -66,11 +67,15 @@ where
             TaskStatus::Canceled,
             Some(format!("{} canceled", TaskKeyDisplay(&key))),
             None,
+            None,
         )
     }
 
     /// Drains the output stream and builds a succeeded or failed status message.
+    /// The shuffle statistics carried by the output batches (if any) are
+    /// included in the succeeded status message.
     async fn execute(key: TaskKey, mut stream: SendableRecordBatchStream) -> T::Message {
+        let mut shuffle_stats: Option<TaskShuffleStats> = None;
         let event = loop {
             let Some(batch) = stream.next().await else {
                 break T::Message::report_task_status(
@@ -78,13 +83,20 @@ where
                     TaskStatus::Succeeded,
                     None,
                     None,
+                    shuffle_stats,
                 );
             };
-            let error = match &batch {
-                Ok(_) => None,
+            let error = match batch.and_then(|b| TaskShuffleStats::try_from_record_batch(&b)) {
+                Ok(Some(stats)) => {
+                    shuffle_stats
+                        .get_or_insert_with(Default::default)
+                        .merge(&stats);
+                    None
+                }
+                Ok(None) => None,
                 Err(e) => Some((
                     format!("task error: {e}"),
-                    CommonErrorCause::new::<PyErrExtractor>(e),
+                    CommonErrorCause::new::<PyErrExtractor>(&e),
                 )),
             };
             if let Some((message, cause)) = error {
@@ -93,6 +105,7 @@ where
                     TaskStatus::Failed,
                     Some(message),
                     Some(cause),
+                    None,
                 );
             }
         };

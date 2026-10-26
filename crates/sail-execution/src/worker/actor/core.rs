@@ -74,7 +74,8 @@ impl Actor for WorkerActor {
                 status,
                 message,
                 cause,
-            } => self.handle_report_task_status(ctx, key, status, message, cause),
+                shuffle_stats,
+            } => self.handle_report_task_status(ctx, key, status, message, cause, shuffle_stats),
             WorkerEvent::ProbePendingLocalStream { key } => {
                 self.handle_probe_pending_local_stream(ctx, key)
             }

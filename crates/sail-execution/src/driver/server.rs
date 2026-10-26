@@ -13,6 +13,7 @@ use crate::driver::gen::{
 use crate::driver::{gen, DriverEvent};
 use crate::error::ExecutionError;
 use crate::id::{TaskKey, WorkerId};
+use crate::task::stats::TaskShuffleStats;
 
 pub struct DriverServer {
     handle: ActorHandle<DriverActor>,
@@ -113,6 +114,7 @@ impl DriverService for DriverServer {
             status,
             message,
             cause,
+            shuffle_stats,
             sequence,
         } = request;
         let status = gen::TaskStatus::try_from(status).map_err(ExecutionError::from)?;
@@ -130,6 +132,10 @@ impl DriverService for DriverServer {
             status: status.into(),
             message,
             cause,
+            shuffle_stats: shuffle_stats.map(|x| TaskShuffleStats {
+                channel_bytes: x.channel_bytes,
+                channel_records: x.channel_records,
+            }),
             sequence: Some(sequence),
         };
         self.handle

@@ -265,4 +265,86 @@ mod tests {
         );
         Ok(())
     }
+
+    /// Runs a multi-stage job with blocking (disk) shuffle and adaptive coalescing enabled,
+    /// and verifies that the shuffle statistics reported by the workers allow the driver to
+    /// coalesce the shuffle partitions, even though the shuffle files are stored in
+    /// worker-specific directories that the driver does not read.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_adaptive_coalescing_with_worker_reported_stats() -> datafusion::common::Result<()>
+    {
+        let mut config = AppConfig::load().unwrap();
+        config.cluster.worker_initial_count = 2;
+        config.cluster.worker_max_count = 2;
+        config.cluster.worker_task_slots = 4;
+        config.cluster.shuffle_mode = "blocking".to_string();
+        config.cluster.adaptive_shuffle_enabled = true;
+        config.cluster.adaptive_shuffle_target_partition_bytes = 64 * 1024 * 1024;
+
+        let handle = tokio::runtime::Handle::current();
+        let runtime = RuntimeHandle::new(handle.clone(), handle);
+        let session = SessionContext::new();
+        let worker_manager = Arc::new(LocalWorkerManager::new(runtime.clone(), session.clone()));
+        let options = DriverOptions::new(&config, runtime, worker_manager);
+        let mut system = ActorSystem::new();
+        let runner = ClusterJobRunner::new(&mut system, options);
+
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+        let partitions = (0..8)
+            .map(|p| {
+                let batch = RecordBatch::try_new(
+                    schema.clone(),
+                    vec![Arc::new(Int32Array::from_iter_values(
+                        p * 100..(p + 1) * 100,
+                    ))],
+                )?;
+                Ok(vec![batch])
+            })
+            .collect::<datafusion::common::Result<Vec<_>>>()?;
+        let source = MemorySourceConfig::try_new_exec(&partitions, schema, None)?;
+        let shuffle1: Arc<dyn ExecutionPlan> = Arc::new(RepartitionExec::try_new(
+            source,
+            Partitioning::Hash(vec![Arc::new(Column::new("x", 0))], 8),
+        )?);
+        let shuffle2: Arc<dyn ExecutionPlan> = Arc::new(CoalescePartitionsExec::new(shuffle1));
+
+        let mut stream = runner.execute(&session, shuffle2).await?;
+        let mut values = vec![];
+        while let Some(batch) = stream.next().await {
+            let batch = batch?;
+            let col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            values.extend(col.values().iter().copied());
+        }
+        values.sort_unstable();
+        assert_eq!(values, (0..800).collect::<Vec<_>>());
+
+        let (tx, rx) = oneshot::channel();
+        runner.stop(tx).await;
+        let history = rx.await.unwrap();
+        system.join().await;
+
+        // The stage reading the hash-partitioned shuffle output must have been coalesced
+        // from 8 partitions into a single partition since the data is tiny.
+        let stage1_partitions = history
+            .tasks
+            .iter()
+            .filter(|t| t.stage == 1)
+            .map(|t| t.partition)
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            stage1_partitions.len(),
+            1,
+            "expected stage 1 to be coalesced into one partition, tasks: {:?}",
+            history
+                .tasks
+                .iter()
+                .map(|t| (t.stage, t.partition, t.attempt))
+                .collect::<Vec<_>>()
+        );
+        Ok(())
+    }
 }

@@ -12,6 +12,7 @@ use crate::id::{JobId, TaskKey, TaskStreamKey, WorkerId};
 use crate::stream::reader::TaskStreamSource;
 use crate::stream::writer::{LocalStreamStorage, TaskStreamSink};
 use crate::task::definition::TaskDefinition;
+use crate::task::stats::TaskShuffleStats;
 use crate::worker::actor::WorkerActor;
 use crate::worker::event::{WorkerLocation, WorkerStreamOwner};
 use crate::worker::WorkerEvent;
@@ -126,6 +127,7 @@ impl WorkerActor {
         status: TaskStatus,
         message: Option<String>,
         cause: Option<CommonErrorCause>,
+        shuffle_stats: Option<TaskShuffleStats>,
     ) -> ActorAction {
         let sequence = self.sequence;
         self.sequence = match self.sequence.checked_add(1) {
@@ -145,9 +147,17 @@ impl WorkerActor {
                     let key = key.clone();
                     let message = message.clone();
                     let cause = cause.clone();
+                    let shuffle_stats = shuffle_stats.clone();
                     async move {
                         client
-                            .report_task_status(key, status, message, cause, sequence)
+                            .report_task_status(
+                                key,
+                                status,
+                                message,
+                                cause,
+                                shuffle_stats,
+                                sequence,
+                            )
                             .await
                     }
                 })

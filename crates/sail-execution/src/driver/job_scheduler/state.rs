@@ -11,6 +11,7 @@ use crate::driver::output::JobOutputManager;
 use crate::error::ExecutionResult;
 use crate::id::JobId;
 use crate::job_graph::JobGraph;
+use crate::task::stats::TaskShuffleStats;
 
 /// Tracks graph/topology and runtime state for a single job.
 pub struct JobDescriptor {
@@ -201,6 +202,9 @@ pub struct TaskAttemptDescriptor {
     /// or a lost upstream shuffle output, so it should not count towards the
     /// task attempt limit.
     pub recoverable_failure: bool,
+    /// The per-channel shuffle output statistics reported by the worker
+    /// when the task attempt succeeded.
+    pub shuffle_stats: Option<TaskShuffleStats>,
     pub created_at: DateTime<Utc>,
     pub stopped_at: Option<DateTime<Utc>>,
 }

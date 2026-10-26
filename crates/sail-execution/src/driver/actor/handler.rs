@@ -26,6 +26,7 @@ use crate::stream::error::TaskStreamError;
 use crate::stream::reader::TaskStreamSource;
 use crate::stream::writer::{LocalStreamStorage, TaskStreamSink};
 use crate::task::scheduling::{TaskAssignment, TaskAssignmentGetter, TaskStreamAssignment};
+use crate::task::stats::TaskShuffleStats;
 
 impl DriverActor {
     pub(super) fn handle_server_ready(
@@ -173,6 +174,7 @@ impl DriverActor {
         status: TaskStatus,
         message: Option<String>,
         cause: Option<CommonErrorCause>,
+        shuffle_stats: Option<TaskShuffleStats>,
         sequence: Option<u64>,
     ) -> ActorAction {
         if let Some(sequence) = sequence {
@@ -194,6 +196,9 @@ impl DriverActor {
                 self.refresh_job(ctx, key.job_id);
             }
             TaskStatus::Succeeded => {
+                if let Some(stats) = shuffle_stats {
+                    self.job_scheduler.record_task_shuffle_stats(&key, stats);
+                }
                 self.job_scheduler
                     .update_task(&key, TaskState::Succeeded, message, cause);
                 self.task_assigner.unassign_task(&key);
@@ -254,6 +259,7 @@ impl DriverActor {
                 status: TaskStatus::Failed,
                 message: Some(message),
                 cause: Some(cause),
+                shuffle_stats: None,
                 sequence: None,
             })
         }
@@ -583,6 +589,7 @@ impl DriverActor {
                             status: TaskStatus::Failed,
                             message: Some(e.to_string()),
                             cause: Some(CommonErrorCause::new::<PyErrExtractor>(&e)),
+                            shuffle_stats: None,
                             sequence: None,
                         });
                         continue;

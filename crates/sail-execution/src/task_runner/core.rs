@@ -55,6 +55,7 @@ impl TaskRunner {
                     TaskStatus::Failed,
                     Some(format!("failed to execute plan: {e}")),
                     Some(CommonErrorCause::new::<PyErrExtractor>(&e)),
+                    None,
                 );
                 ctx.send(event);
                 return;

@@ -36,7 +36,15 @@ message ReportTaskStatusRequest {
   optional string message = 6;
   // An optional JSON string that contains the cause of the task failure.
   optional string cause = 7;
+  // Per-channel statistics of the shuffle output written by the task.
+  // This is only set when the task succeeds.
+  optional TaskShuffleStats shuffle_stats = 8;
   uint64 sequence = 101;
+}
+
+message TaskShuffleStats {
+  repeated uint64 channel_bytes = 1;
+  repeated uint64 channel_records = 2;
 }
 
 enum TaskStatus {

@@ -37,6 +37,7 @@ use crate::task::definition::{
 use crate::task::scheduling::{
     TaskAssignment, TaskAssignmentGetter, TaskOutputKind, TaskRegion, TaskSet, TaskSetEntry,
 };
+use crate::task::stats::TaskShuffleStats;
 
 impl JobScheduler {
     fn next_job_id(&mut self) -> ExecutionResult<JobId> {
@@ -89,6 +90,19 @@ impl JobScheduler {
         attempt.messages.extend(message);
         if let Some(cause) = cause {
             attempt.cause = Some(cause);
+        }
+    }
+
+    /// Records the shuffle output statistics reported by the worker for a task attempt.
+    pub fn record_task_shuffle_stats(&mut self, key: &TaskKey, stats: TaskShuffleStats) {
+        if let Some(attempt) = self
+            .jobs
+            .get_mut(&key.job_id)
+            .and_then(|job| job.stages.get_mut(key.stage))
+            .and_then(|stage| stage.tasks.get_mut(key.partition))
+            .and_then(|task| task.attempts.get_mut(key.attempt))
+        {
+            attempt.shuffle_stats = Some(stats);
         }
     }
 
@@ -380,6 +394,7 @@ impl JobScheduler {
                         cause: None,
                         job_output_fetched: false,
                         recoverable_failure: false,
+                        shuffle_stats: None,
                         created_at: Utc::now(),
                         stopped_at: None,
                     });
@@ -517,14 +532,29 @@ impl JobScheduler {
             let upstream_attempts: Vec<usize> = (0..upstream_partitions)
                 .map(|p| Self::get_latest_task_attempt(job, u, p).unwrap_or(0))
                 .collect();
-            let stats = StageShuffleStats::from_disk(
-                &options.shuffle_dir,
-                job_id,
-                u,
-                upstream_partitions,
-                channels,
-                &upstream_attempts,
-            );
+            // Prefer the statistics reported by the workers, which are available
+            // regardless of where the shuffle files are stored. Fall back to reading
+            // the shuffle index files when the statistics have not been reported.
+            let reported = (0..upstream_partitions)
+                .map(|p| {
+                    job.stages[u].tasks[p]
+                        .attempts
+                        .get(upstream_attempts[p])
+                        .and_then(|a| a.shuffle_stats.as_ref())
+                        .filter(|x| x.channels() == channels)
+                })
+                .collect::<Option<Vec<_>>>();
+            let stats = match reported {
+                Some(reported) => StageShuffleStats::from_task_stats(channels, reported),
+                None => StageShuffleStats::from_disk(
+                    &options.shuffle_dir,
+                    job_id,
+                    u,
+                    upstream_partitions,
+                    channels,
+                    &upstream_attempts,
+                ),
+            };
             if stats.missing_index_files > 0 {
                 // The statistics are incomplete (e.g. the shuffle files live on remote workers
                 // that the driver cannot access). Do not make decisions based on them.
@@ -1165,6 +1195,7 @@ mod tests {
                 cause: None,
                 job_output_fetched: false,
                 recoverable_failure: false,
+                shuffle_stats: None,
                 created_at: Utc::now(),
                 stopped_at: None,
             });
@@ -1230,6 +1261,7 @@ mod tests {
                 cause: None,
                 job_output_fetched: false,
                 recoverable_failure: false,
+                shuffle_stats: None,
                 created_at: Utc::now(),
                 stopped_at: None,
             });
@@ -1287,6 +1319,7 @@ mod tests {
             cause: None,
             job_output_fetched: false,
             recoverable_failure: false,
+            shuffle_stats: None,
             created_at: Utc::now(),
             stopped_at: None,
         });
@@ -1429,6 +1462,7 @@ mod tests {
                 cause: None,
                 job_output_fetched: false,
                 recoverable_failure: false,
+                shuffle_stats: None,
                 created_at: Utc::now(),
                 stopped_at: None,
             });
@@ -1441,6 +1475,7 @@ mod tests {
                 cause: None,
                 job_output_fetched: false,
                 recoverable_failure: false,
+                shuffle_stats: None,
                 created_at: Utc::now(),
                 stopped_at: None,
             });
@@ -1507,6 +1542,7 @@ mod tests {
                 cause: None,
                 job_output_fetched: false,
                 recoverable_failure: false,
+                shuffle_stats: None,
                 created_at: Utc::now(),
                 stopped_at: None,
             });
@@ -1562,6 +1598,7 @@ mod tests {
                 cause: None,
                 job_output_fetched: false,
                 recoverable_failure: false,
+                shuffle_stats: None,
                 created_at: Utc::now(),
                 stopped_at: None,
             });
