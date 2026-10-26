@@ -176,7 +176,6 @@ impl fmt::Display for InputMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputMode {
     Pipelined,
-    #[cfg_attr(not(test), expect(dead_code))]
     Blocking,
 }
 

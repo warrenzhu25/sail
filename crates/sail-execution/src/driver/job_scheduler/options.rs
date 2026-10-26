@@ -79,10 +79,14 @@ impl From<&DriverOptions> for JobSchedulerOptions {
         Self {
             task_launch_timeout: options.task_launch_timeout,
             task_max_attempts: options.task_max_attempts,
-            shuffle_mode: OutputMode::Pipelined,
+            shuffle_mode: if options.shuffle_mode.eq_ignore_ascii_case("blocking") {
+                OutputMode::Blocking
+            } else {
+                OutputMode::Pipelined
+            },
             shuffle_dir: std::env::temp_dir().join("sail").join("shuffle"),
-            adaptive_enabled: true,
-            target_partition_size: 64 * 1024 * 1024,
+            adaptive_enabled: options.adaptive_shuffle_enabled,
+            target_partition_size: options.adaptive_shuffle_target_partition_bytes,
             min_partition_size: 1024 * 1024,
             skew_factor: 5.0,
             min_skew_threshold: 128 * 1024 * 1024,

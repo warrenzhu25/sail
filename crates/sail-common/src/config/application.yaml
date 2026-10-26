@@ -185,6 +185,30 @@
   default: "3"
   description: The maximum number of attempts for a task.
 
+- key: cluster.shuffle_mode
+  type: string
+  default: "pipelined"
+  description: |
+    The shuffle mode for stage boundaries. Valid values are `pipelined` and `blocking`.
+    * `pipelined` streams shuffle data in memory between concurrently running stages.
+    * `blocking` materializes shuffle data to local disk (under the system temporary directory)
+      and runs downstream stages after upstream stages complete.
+  experimental: true
+
+- key: cluster.adaptive_shuffle_enabled
+  type: boolean
+  default: "true"
+  description: |
+    Whether to adaptively coalesce shuffle partitions based on materialized shuffle statistics.
+    This only takes effect when `cluster.shuffle_mode` is `blocking`.
+  experimental: true
+
+- key: cluster.adaptive_shuffle_target_partition_bytes
+  type: number
+  default: "67108864"
+  description: The target size in bytes for each coalesced shuffle partition.
+  experimental: true
+
 - key: cluster.rpc_retry_strategy.type
   type: string
   default: "fixed"
