@@ -12,6 +12,8 @@ pub struct StageShuffleStats {
     pub channel_records: Vec<usize>,
     pub total_bytes: u64,
     pub total_records: usize,
+    /// The number of index files that could not be read.
+    pub missing_index_files: usize,
 }
 
 impl StageShuffleStats {
@@ -21,6 +23,7 @@ impl StageShuffleStats {
             channel_records: vec![0; channels],
             total_bytes: 0,
             total_records: 0,
+            missing_index_files: 0,
         }
     }
 
@@ -63,6 +66,7 @@ impl StageShuffleStats {
                     }
                     Err(e) => {
                         debug!("could not read shuffle index file {index_file:?}: {e}");
+                        stats.missing_index_files += 1;
                     }
                 }
             }
@@ -113,6 +117,7 @@ impl StageShuffleStats {
     }
 
     /// Determines if downstream join should be optimized to broadcast join.
+    #[cfg(test)]
     pub fn should_broadcast_join(&self, auto_broadcast_threshold: u64) -> bool {
         self.total_bytes > 0 && self.total_bytes <= auto_broadcast_threshold
     }
