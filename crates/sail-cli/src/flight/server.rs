@@ -8,7 +8,7 @@ use sail_telemetry::telemetry::{init_telemetry, shutdown_telemetry, ResourceOpti
 use tokio::net::TcpListener;
 
 async fn shutdown() {
-    let _ = tokio::signal::ctrl_c().await;
+    crate::signal::wait_for_shutdown_signal().await;
     info!("Shutting down the Flight SQL server...");
 }
 
