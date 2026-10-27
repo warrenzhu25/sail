@@ -51,6 +51,10 @@ pub enum DriverEvent {
         worker_id: WorkerId,
         instant: Instant,
     },
+    WorkerExited {
+        worker_id: WorkerId,
+        reason: String,
+    },
     ExecuteJob {
         plan: Arc<dyn ExecutionPlan>,
         context: Arc<TaskContext>,
@@ -164,6 +168,7 @@ impl SpanAssociation for DriverEvent {
             DriverEvent::ProbePendingWorker { .. } => "ProbePendingWorker",
             DriverEvent::ProbeIdleWorker { .. } => "ProbeIdleWorker",
             DriverEvent::ProbeLostWorker { .. } => "ProbeLostWorker",
+            DriverEvent::WorkerExited { .. } => "WorkerExited",
             DriverEvent::ExecuteJob { .. } => "ExecuteJob",
             DriverEvent::CleanUpJob { .. } => "CleanUpJob",
             DriverEvent::UpdateTask { .. } => "UpdateTask",
@@ -209,6 +214,10 @@ impl SpanAssociation for DriverEvent {
             | DriverEvent::ProbeLostWorker {
                 worker_id,
                 instant: _,
+            }
+            | DriverEvent::WorkerExited {
+                worker_id,
+                reason: _,
             } => {
                 p.push((SpanAttribute::CLUSTER_WORKER_ID, worker_id.to_string()));
             }

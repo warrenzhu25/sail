@@ -98,9 +98,32 @@ impl DriverActor {
         ctx: &mut ActorContext<Self>,
         worker_id: WorkerId,
     ) -> ActorAction {
-        if self.worker_pool.fail_worker_if_pending(ctx, worker_id) {
+        if self
+            .worker_pool
+            .fail_worker_if_pending(ctx, worker_id, "worker registration timeout")
+        {
             self.task_assigner.track_worker_failed_to_start();
             self.scale_up_workers(ctx);
+        }
+        ActorAction::Continue
+    }
+
+    pub(super) fn handle_worker_exited(
+        &mut self,
+        ctx: &mut ActorContext<Self>,
+        worker_id: WorkerId,
+        reason: String,
+    ) -> ActorAction {
+        let reason = format!("worker exited unexpectedly: {reason}");
+        if self
+            .worker_pool
+            .fail_worker_if_pending(ctx, worker_id, &reason)
+        {
+            self.task_assigner.track_worker_failed_to_start();
+            self.scale_up_workers(ctx);
+        } else if self.task_assigner.is_worker_active(worker_id) {
+            warn!("worker {worker_id} is lost: {reason}");
+            self.mark_worker_lost(ctx, worker_id, &reason);
         }
         ActorAction::Continue
     }

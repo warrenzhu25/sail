@@ -89,9 +89,16 @@ impl WorkerPool {
             shuffle_dir: self.options.shuffle_dir.clone(),
         };
         let worker_manager = Arc::clone(&self.worker_manager);
+        let handle = ctx.handle().clone();
         ctx.spawn(async move {
             if let Err(e) = worker_manager.launch_worker(worker_id, options).await {
                 error!("failed to start worker {worker_id}: {e}");
+                return;
+            }
+            if let Some(reason) = worker_manager.wait_for_worker_exit(worker_id).await {
+                let _ = handle
+                    .send(DriverEvent::WorkerExited { worker_id, reason })
+                    .await;
             }
         });
     }
@@ -234,16 +241,16 @@ impl WorkerPool {
         &mut self,
         ctx: &mut ActorContext<DriverActor>,
         worker_id: WorkerId,
+        message: &str,
     ) -> bool {
         let Some(worker) = self.workers.get_mut(&worker_id) else {
             warn!("worker {worker_id} not found");
             return false;
         };
         if matches!(&worker.state, WorkerState::Pending) {
-            warn!("worker {worker_id} registration timeout");
-            let message = "worker registration timeout".to_string();
+            warn!("worker {worker_id} failed: {message}");
             worker.state = WorkerState::Failed;
-            worker.messages.push(message);
+            worker.messages.push(message.to_string());
             // The worker may still be starting, so we ask the worker manager
             // to terminate it.
             self.release_worker(ctx, worker_id);

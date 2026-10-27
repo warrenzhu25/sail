@@ -177,12 +177,16 @@ async fn test_process_cluster_blocking_shuffle() -> Result<()> {
 }
 
 /// Kills a worker process with `SIGKILL` while the job is running, and verifies that
-/// the driver recovers via task and stage retry and returns the complete result.
+/// the driver detects the worker exit, recovers via task and stage retry,
+/// and returns the complete result.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_process_cluster_worker_killed() -> Result<()> {
     let root = temp_root("process-cluster-kill");
     let mut config = test_config(&root);
     config.cluster.worker_task_slots = 1;
+    // Use a long heartbeat timeout so that the job can only finish in time if
+    // the driver is notified of the worker process exit.
+    config.cluster.worker_heartbeat_timeout_secs = 600;
     config.cluster.task_stream_creation_timeout_secs = 1;
     config.cluster.task_max_attempts = 1;
     config.cluster.adaptive_shuffle_enabled = false;
@@ -223,7 +227,10 @@ async fn test_process_cluster_worker_killed() -> Result<()> {
         None
     });
 
-    let values = collect_values(&runner, plan).await?;
+    #[expect(clippy::unwrap_used)]
+    let values = tokio::time::timeout(Duration::from_secs(120), collect_values(&runner, plan))
+        .await
+        .unwrap()?;
     #[expect(clippy::unwrap_used)]
     let killed = killer.await.unwrap();
     assert!(killed.is_some(), "no worker process was killed");

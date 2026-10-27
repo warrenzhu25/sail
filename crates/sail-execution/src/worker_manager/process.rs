@@ -7,7 +7,7 @@ use log::{error, info, warn};
 use sail_common::config::CliConfigEnv;
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::{Child, Command};
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{oneshot, watch, Mutex};
 use tokio::task::JoinHandle;
 
 use crate::error::{ExecutionError, ExecutionResult};
@@ -45,6 +45,8 @@ struct ProcessWorker {
     stop: Option<oneshot::Sender<Duration>>,
     /// The supervisor task that waits for the process to exit.
     supervisor: JoinHandle<()>,
+    /// The receiver for the description of how the process exited.
+    exit: watch::Receiver<Option<String>>,
 }
 
 /// A worker manager that launches each worker as a separate `sail worker` OS process
@@ -183,6 +185,7 @@ async fn supervise(
     id: WorkerId,
     mut child: Child,
     mut stop: oneshot::Receiver<Duration>,
+    exit: watch::Sender<Option<String>>,
     shuffle_dir: PathBuf,
 ) {
     let pid = child.id();
@@ -198,14 +201,24 @@ async fn supervise(
             }
         }
     };
-    match status {
-        Ok(status) if status.success() => info!("worker {id} process exited"),
-        Ok(status) => warn!("worker {id} process exited with {status}"),
-        Err(e) => error!("failed to wait for worker {id} process: {e}"),
-    }
+    let description = match status {
+        Ok(status) if status.success() => {
+            info!("worker {id} process exited");
+            format!("process exited with {status}")
+        }
+        Ok(status) => {
+            warn!("worker {id} process exited with {status}");
+            format!("process exited with {status}")
+        }
+        Err(e) => {
+            error!("failed to wait for worker {id} process: {e}");
+            format!("failed to wait for process: {e}")
+        }
+    };
     if let Some(pid) = pid {
         remove_worker_shuffle_dirs(&shuffle_dir, id, pid);
     }
+    let _ = exit.send(Some(description));
 }
 
 #[tonic::async_trait]
@@ -240,16 +253,31 @@ impl WorkerManager for ProcessWorkerManager {
             forward_output(id, stderr);
         }
         let (tx, rx) = oneshot::channel();
-        let supervisor = tokio::spawn(supervise(id, child, rx, shuffle_dir));
+        let (exit_tx, exit_rx) = watch::channel(None);
+        let supervisor = tokio::spawn(supervise(id, child, rx, exit_tx, shuffle_dir));
         workers.insert(
             id,
             ProcessWorker {
                 pid,
                 stop: Some(tx),
                 supervisor,
+                exit: exit_rx,
             },
         );
         Ok(())
+    }
+
+    async fn wait_for_worker_exit(&self, id: WorkerId) -> Option<String> {
+        let mut exit = {
+            let workers = self.workers.lock().await;
+            workers.get(&id)?.exit.clone()
+        };
+        let result = match exit.wait_for(|x| x.is_some()).await {
+            Ok(x) => x.clone(),
+            // The supervisor is gone without reporting the exit (e.g. it was aborted).
+            Err(_) => Some("the worker process supervisor has stopped".to_string()),
+        };
+        result
     }
 
     async fn stop_worker(&self, id: WorkerId) -> ExecutionResult<()> {
@@ -421,10 +449,23 @@ exec sleep 1000
         assert!(is_process_alive(pid2));
         assert_eq!(manager.worker_pids().await.len(), 1);
 
+        let exit = manager.wait_for_worker_exit(1.into()).await;
+        assert!(exit.as_deref().is_some_and(|x| x.contains("SIGKILL")));
+
         // A worker process that exits unexpectedly is detected and cleaned up.
         // SAFETY: Sending a signal to a child process is safe.
         assert_eq!(unsafe { libc::kill(pid2 as libc::pid_t, libc::SIGKILL) }, 0);
-        assert!(wait_for(|| worker_dirs(&shuffle_dir, 2).is_empty()).await);
+        let exit = tokio::time::timeout(
+            Duration::from_secs(5),
+            manager.wait_for_worker_exit(2.into()),
+        )
+        .await
+        .unwrap();
+        assert!(
+            exit.as_deref().is_some_and(|x| x.contains("SIGKILL")),
+            "{exit:?}"
+        );
+        assert!(worker_dirs(&shuffle_dir, 2).is_empty());
 
         // A new worker can be launched after the previous workers have exited.
         manager
@@ -438,6 +479,7 @@ exec sleep 1000
         assert!(!is_process_alive(pid3));
         assert!(worker_dirs(&shuffle_dir, 3).is_empty());
         assert!(manager.worker_pids().await.is_empty());
+        assert!(manager.wait_for_worker_exit(3.into()).await.is_none());
 
         std::fs::remove_dir_all(&root).unwrap();
     }
