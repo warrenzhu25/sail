@@ -20,6 +20,9 @@ pub struct JobDescriptor {
     pub stages: Vec<StageDescriptor>,
     pub regions: Vec<TaskRegionDescriptor>,
     pub state: JobState,
+    /// A reason that the job must fail even though its tasks may still be retried,
+    /// e.g. when the job output can no longer be produced consistently.
+    pub failure: Option<String>,
     pub created_at: DateTime<Utc>,
     pub stopped_at: Option<DateTime<Utc>>,
 }
@@ -73,6 +76,7 @@ impl JobDescriptor {
             topology,
             stages,
             regions,
+            failure: None,
             state,
             created_at: Utc::now(),
             stopped_at: None,

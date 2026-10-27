@@ -2,8 +2,13 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::Utc;
+use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::physical_expr_common::physical_expr::is_volatile;
 use datafusion::physical_plan::display::DisplayableExecutionPlan;
+use datafusion::physical_plan::filter::FilterExec;
+use datafusion::physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
+use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use datafusion_proto::physical_plan::to_proto::serialize_physical_expr;
 use datafusion_proto::physical_plan::AsExecutionPlan;
@@ -43,6 +48,36 @@ use crate::task::stats::TaskShuffleStats;
 /// The maximum number of attempts of a task that can fail for recoverable reasons
 /// (such as lost workers or lost upstream shuffle output) before the job fails.
 const MAX_RECOVERABLE_TASK_ATTEMPTS: usize = 16;
+
+/// Returns whether the output of a stage may differ when its tasks are re-run.
+///
+/// This is the case for round-robin output partitioning (the channel of each row depends
+/// on the order of the input batches), limits (the rows returned depend on the input order),
+/// and volatile expressions (e.g. random numbers).
+/// Hash output partitioning of deterministic rows is deterministic regardless of the
+/// order of the input rows.
+fn is_stage_output_indeterminate(stage: &Stage) -> bool {
+    if matches!(stage.distribution, OutputDistribution::RoundRobin { channels } if channels > 1) {
+        return true;
+    }
+    let mut indeterminate = false;
+    let _ = stage.plan.apply(|node| {
+        let any = node.as_any();
+        let volatile = if let Some(projection) = any.downcast_ref::<ProjectionExec>() {
+            projection.expr().iter().any(|e| is_volatile(&e.expr))
+        } else if let Some(filter) = any.downcast_ref::<FilterExec>() {
+            is_volatile(filter.predicate())
+        } else {
+            false
+        };
+        if volatile || any.is::<GlobalLimitExec>() || any.is::<LocalLimitExec>() {
+            indeterminate = true;
+            return Ok(TreeNodeRecursion::Stop);
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    indeterminate
+}
 
 impl JobScheduler {
     fn next_job_id(&mut self) -> ExecutionResult<JobId> {
@@ -140,6 +175,11 @@ impl JobScheduler {
         if !matches!(job.state, JobState::Running { .. }) {
             return false;
         }
+        let indeterminate = job
+            .graph
+            .stages()
+            .get(key.stage)
+            .is_some_and(is_stage_output_indeterminate);
         let Some(stage) = job.stages.get_mut(key.stage) else {
             return false;
         };
@@ -183,8 +223,59 @@ impl JobScheduler {
             attempt.stopped_at = Some(Utc::now());
         }
         attempt.messages.push(message.clone());
-        attempt.cause = Some(CommonErrorCause::Execution(message));
+        attempt.cause = Some(CommonErrorCause::Execution(message.clone()));
+        if indeterminate {
+            Self::roll_back_consumers(job, key.stage, &message);
+        }
         true
+    }
+
+    /// Invalidates the task attempts of all (transitive) consumers of a stage whose
+    /// output is indeterminate and is being recomputed. The recomputed output may differ
+    /// from the output that the consumers have already read (e.g. rows may be assigned
+    /// to different round-robin channels), so the consumers must read the output again
+    /// to avoid duplicated or missing rows.
+    ///
+    /// If the job output has already been fetched from a final stage, the result
+    /// cannot be rolled back, so the job is marked to fail.
+    fn roll_back_consumers(job: &mut JobDescriptor, stage: usize, message: &str) {
+        let message = format!(
+            "rerun since the indeterminate output of stage {stage} is recomputed: {message}"
+        );
+        let mut queue = job.topology.stages[stage].consumers.clone();
+        let mut visited = HashSet::new();
+        while let Some(c) = queue.pop() {
+            if !visited.insert(c) {
+                continue;
+            }
+            let is_final = job.topology.stages[c].consumers.is_empty();
+            let descriptor = &mut job.stages[c];
+            for task in descriptor.tasks.iter_mut() {
+                let Some(attempt) = task.attempts.last_mut() else {
+                    continue;
+                };
+                if is_final && attempt.job_output_fetched && job.failure.is_none() {
+                    job.failure = Some(format!(
+                        "cannot recover the job since the output of stage {stage} is \
+                         indeterminate and must be recomputed after the job output \
+                         has been returned"
+                    ));
+                }
+                // Running attempts are canceled when their task regions are scheduled,
+                // since the regions of their inputs are no longer succeeded.
+                if matches!(attempt.state, TaskState::Succeeded) {
+                    attempt.state = TaskState::Failed;
+                    attempt.recoverable_failure = true;
+                    attempt.messages.push(message.clone());
+                    attempt.cause = Some(CommonErrorCause::Execution(message.clone()));
+                }
+            }
+            if matches!(descriptor.state, StageState::Inactive) {
+                descriptor.state = StageState::Active;
+                descriptor.stopped_at = None;
+            }
+            queue.extend(job.topology.stages[c].consumers.iter().copied());
+        }
     }
 
     pub fn get_task_state(&self, key: &TaskKey) -> Option<TaskState> {
@@ -233,12 +324,16 @@ impl JobScheduler {
 
         Self::update_task_regions(job, &self.options);
 
-        if job
-            .regions
-            .iter()
-            .any(|x| matches!(x.state, TaskRegionState::Failed))
+        if job.failure.is_some()
+            || job
+                .regions
+                .iter()
+                .any(|x| matches!(x.state, TaskRegionState::Failed))
         {
-            let cause = Self::infer_job_failure_cause(job);
+            let cause = match &job.failure {
+                Some(message) => CommonErrorCause::Execution(message.clone()),
+                None => Self::infer_job_failure_cause(job),
+            };
             if let JobState::Running { output, .. } = &job.state {
                 actions.push(JobAction::FailJobOutput {
                     handle: output.handle(),
@@ -2043,6 +2138,77 @@ mod tests {
             }
             _ => return Err("expected Worker locator".into()),
         }
+        Ok(())
+    }
+
+    fn graph_for(plan: Arc<dyn ExecutionPlan>) -> Result<JobGraph, Box<dyn std::error::Error>> {
+        Ok(JobGraph::try_new_with_mode(plan, OutputMode::Blocking)?)
+    }
+
+    #[test]
+    fn test_stage_output_determinism() -> Result<(), Box<dyn std::error::Error>> {
+        use datafusion::physical_expr::expressions::Column;
+        use datafusion::physical_plan::limit::GlobalLimitExec;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+        let source: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(schema.clone()));
+        let hash = |input: Arc<dyn ExecutionPlan>| -> Result<_, Box<dyn std::error::Error>> {
+            Ok(Arc::new(RepartitionExec::try_new(
+                input,
+                Partitioning::Hash(vec![Arc::new(Column::new("x", 0))], 2),
+            )?) as Arc<dyn ExecutionPlan>)
+        };
+
+        // Round-robin output depends on the input batch order.
+        let graph = graph_for(Arc::new(RepartitionExec::try_new(
+            source.clone(),
+            Partitioning::RoundRobinBatch(2),
+        )?))?;
+        assert!(is_stage_output_indeterminate(&graph.stages()[0]));
+
+        // Hash output of deterministic rows is deterministic.
+        let graph = graph_for(hash(source.clone())?)?;
+        assert!(!is_stage_output_indeterminate(&graph.stages()[0]));
+
+        // A limit selects rows depending on the input order.
+        let graph = graph_for(hash(Arc::new(GlobalLimitExec::new(source, 0, Some(10))))?)?;
+        assert!(is_stage_output_indeterminate(&graph.stages()[0]));
+        Ok(())
+    }
+
+    /// When the indeterminate output of a stage is recomputed, the consumers that have
+    /// read the previous output must be re-run, and the job must fail if the job output
+    /// has already been returned.
+    #[test]
+    fn test_indeterminate_output_rolls_back_consumers() -> Result<(), Box<dyn std::error::Error>> {
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+        let graph = graph_for(Arc::new(RepartitionExec::try_new(
+            Arc::new(EmptyExec::new(schema)),
+            Partitioning::RoundRobinBatch(2),
+        )?))?;
+        let mut job = JobDescriptor::try_new(graph, JobState::Draining)?;
+        assert!(is_stage_output_indeterminate(&job.graph.stages()[0]));
+        succeed_all(&mut job, 0);
+        succeed_all(&mut job, 1);
+
+        JobScheduler::roll_back_consumers(&mut job, 0, "output lost");
+        assert!(job.stages[1].tasks.iter().all(|t| {
+            t.attempts
+                .last()
+                .is_some_and(|a| matches!(a.state, TaskState::Failed) && a.is_recoverable_failure())
+        }));
+        // The producer stage itself is not affected by the rollback.
+        assert!(job.stages[0]
+            .tasks
+            .iter()
+            .all(|t| matches!(t.attempts[0].state, TaskState::Succeeded)));
+        assert!(job.failure.is_none());
+
+        // Once the job output has been fetched from the final stage, the job cannot recover.
+        succeed_all(&mut job, 1);
+        job.stages[1].tasks[0].attempts[1].job_output_fetched = true;
+        JobScheduler::roll_back_consumers(&mut job, 0, "output lost");
+        assert!(job.failure.is_some());
         Ok(())
     }
 }
