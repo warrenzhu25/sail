@@ -5,6 +5,7 @@ pub(super) mod job_scheduler;
 mod options;
 pub(super) mod output;
 mod server;
+pub(crate) mod shuffle_dir;
 mod task_assigner;
 pub(super) mod worker_pool;
 

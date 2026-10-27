@@ -75,11 +75,8 @@ impl DriverOptions {
             // Each driver instance gets a unique shuffle directory, so that multiple drivers
             // in the same process (e.g. one per session) or on the same host never share
             // (or delete) each other's shuffle files.
-            shuffle_dir: shuffle_root_dir(&config.cluster.shuffle_dir).join(format!(
-                "driver-{}-{:016x}",
-                std::process::id(),
-                rand::random::<u64>()
-            )),
+            shuffle_dir: shuffle_root_dir(&config.cluster.shuffle_dir)
+                .join(crate::driver::shuffle_dir::driver_shuffle_dir_name()),
             shuffle_spill_threshold: config.cluster.shuffle_spill_threshold_bytes,
             shuffle_fsync: config.cluster.shuffle_fsync,
             adaptive_shuffle_enabled: config.cluster.adaptive_shuffle_enabled,

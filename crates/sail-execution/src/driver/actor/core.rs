@@ -45,6 +45,13 @@ impl Actor for DriverActor {
     }
 
     async fn start(&mut self, ctx: &mut ActorContext<Self>) {
+        // Remove the shuffle directories left behind by crashed drivers on this host.
+        if let Some(root) = self.options.shuffle_dir.parent() {
+            let root = root.to_path_buf();
+            crate::stream_manager::shuffle_file::run_blocking_in_background(move || {
+                crate::driver::shuffle_dir::remove_stale_driver_shuffle_dirs(&root);
+            });
+        }
         let addr = (
             self.options.driver_listen_host.clone(),
             self.options.driver_listen_port,
