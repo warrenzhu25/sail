@@ -55,6 +55,13 @@ impl TaskAssigner {
         required_workers
     }
 
+    /// Tracks workers that are started outside of [`Self::request_workers`]
+    /// (e.g. the initial workers), so that they count toward the maximum worker count
+    /// until they become active or fail to start.
+    pub fn track_workers_requested(&mut self, count: usize) {
+        self.requested_worker_count = self.requested_worker_count.saturating_add(count);
+    }
+
     pub fn track_worker_failed_to_start(&mut self) {
         self.requested_worker_count = self.requested_worker_count.saturating_sub(1);
     }
@@ -335,5 +342,54 @@ impl TaskSlotAssigner {
             }
         }
         Ok(assignments)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::driver::task_assigner::TaskAssignerOptions;
+    use crate::task::scheduling::{TaskOutputKind, TaskSet, TaskSetEntry};
+
+    fn region(tasks: usize) -> TaskRegion {
+        TaskRegion {
+            tasks: (0..tasks)
+                .map(|partition| {
+                    let set = TaskSet {
+                        entries: vec![TaskSetEntry {
+                            key: TaskKey {
+                                job_id: JobId::from(1),
+                                stage: 0,
+                                partition,
+                                attempt: 0,
+                            },
+                            output: TaskOutputKind::Local,
+                        }],
+                    };
+                    (TaskPlacement::Worker, set)
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn test_request_workers_counts_initial_workers() {
+        let mut assigner = TaskAssigner::new(TaskAssignerOptions::new(1, 2));
+        // Two initial workers are starting but have not registered yet.
+        assigner.track_workers_requested(2);
+        assigner.enqueue_tasks(region(8));
+        assert_eq!(assigner.request_workers(), 0);
+
+        // One initial worker registers and the other fails to start,
+        // so one more worker can be requested.
+        assigner.activate_worker(WorkerId::from(1));
+        assigner.track_worker_failed_to_start();
+        assert_eq!(assigner.request_workers(), 1);
+        assert_eq!(assigner.request_workers(), 0);
+
+        // A lost worker can be replaced.
+        assigner.activate_worker(WorkerId::from(3));
+        assigner.deactivate_worker(WorkerId::from(1));
+        assert_eq!(assigner.request_workers(), 1);
     }
 }

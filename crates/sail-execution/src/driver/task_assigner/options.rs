@@ -14,3 +14,13 @@ impl From<&DriverOptions> for TaskAssignerOptions {
         }
     }
 }
+
+#[cfg(test)]
+impl TaskAssignerOptions {
+    pub fn new(worker_task_slots: usize, worker_max_count: usize) -> Self {
+        Self {
+            worker_task_slots,
+            worker_max_count,
+        }
+    }
+}

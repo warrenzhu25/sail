@@ -45,6 +45,8 @@ impl DriverActor {
         };
         info!("driver server is ready on port {port}");
         self.worker_pool.set_driver_server_port(port);
+        self.task_assigner
+            .track_workers_requested(self.options.worker_initial_count);
         for _ in 0..self.options.worker_initial_count {
             self.worker_pool.start_worker(ctx);
         }
