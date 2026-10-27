@@ -6,7 +6,7 @@ use datafusion::arrow::datatypes::SchemaRef;
 use fastrace::collector::SpanContext;
 use fastrace::Span;
 use futures::TryStreamExt;
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use sail_common_datafusion::error::CommonErrorCause;
 use sail_python_udf::error::PyErrExtractor;
 use sail_server::actor::ActorContext;
@@ -30,7 +30,12 @@ impl WorkerPool {
         let worker_ids = self.workers.keys().cloned().collect::<Vec<_>>();
         for worker_id in worker_ids.into_iter() {
             // TODO: Should we wait for the spawned tasks for stopping the workers?
-            self.stop_worker(ctx, worker_id, Some("closing worker pool".to_string()));
+            self.stop_worker(
+                ctx,
+                worker_id,
+                Some("closing worker pool".to_string()),
+                false,
+            );
         }
         // TODO: support timeout for worker manager stop
         self.worker_manager.stop().await?;
@@ -142,11 +147,14 @@ impl WorkerPool {
         }
     }
 
+    /// Stops a worker. If `lost` is `true`, the worker is considered lost (e.g. it has
+    /// missed heartbeats or is unreachable), so failing to contact the worker is expected.
     pub fn stop_worker(
         &mut self,
         ctx: &mut ActorContext<DriverActor>,
         worker_id: WorkerId,
         reason: Option<String>,
+        lost: bool,
     ) {
         let Some(worker) = self.workers.get_mut(&worker_id) else {
             warn!("worker {worker_id} not found");
@@ -165,8 +173,12 @@ impl WorkerPool {
                     Ok(x) => {
                         let client = x.core;
                         ctx.spawn(async move {
-                            if let Err(e) = client.stop_worker().await {
-                                error!("failed to stop worker {worker_id}: {e}");
+                            match client.stop_worker().await {
+                                Ok(_) => {}
+                                Err(e) if lost => {
+                                    debug!("failed to stop lost worker {worker_id}: {e}");
+                                }
+                                Err(e) => warn!("failed to stop worker {worker_id}: {e}"),
                             }
                         });
                         worker.state = WorkerState::Completed;
@@ -388,11 +400,19 @@ impl WorkerPool {
             warn!("worker {worker_id} not found");
             return;
         };
+        if !matches!(worker.state, WorkerState::Running { .. }) {
+            // The worker has stopped or is known to be lost, so the task is no longer running.
+            debug!(
+                "skipped stopping {} in inactive worker {worker_id}",
+                TaskKeyDisplay(key)
+            );
+            return;
+        }
         Self::track_worker_activity(ctx, worker_id, worker, &self.options);
         let client = match Self::get_client_set(worker_id, worker, &self.options) {
             Ok(x) => x.core,
             Err(e) => {
-                error!(
+                warn!(
                     "failed to stop {} in worker {worker_id}: {e}",
                     TaskKeyDisplay(key)
                 );
@@ -402,7 +422,7 @@ impl WorkerPool {
         let key = key.clone();
         ctx.spawn(async move {
             if let Err(e) = client.stop_task(key.clone()).await {
-                error!("failed to stop {}: {e}", TaskKeyDisplay(&key));
+                warn!("failed to stop {}: {e}", TaskKeyDisplay(&key));
             }
         });
     }
@@ -450,6 +470,12 @@ impl WorkerPool {
             warn!("worker {worker_id} not found");
             return;
         };
+        if !matches!(worker.state, WorkerState::Running { .. }) {
+            // The worker has stopped or is known to be lost, and its shuffle files
+            // are removed together with the worker shuffle directory.
+            debug!("skipped cleaning up job {job_id} in inactive worker {worker_id}");
+            return;
+        }
         Self::track_worker_activity(ctx, worker_id, worker, &self.options);
         Self::clean_up_job_for_worker(ctx, job_id, stage, worker_id, worker, &self.options);
     }
@@ -490,13 +516,13 @@ impl WorkerPool {
         let client = match Self::get_client_set(worker_id, worker, options) {
             Ok(x) => x.core,
             Err(e) => {
-                error!("failed to clean up job in worker {worker_id}: {e}");
+                warn!("failed to clean up job in worker {worker_id}: {e}");
                 return;
             }
         };
         ctx.spawn(async move {
             if let Err(e) = client.clean_up_job(job_id, stage).await {
-                error!("failed to clean up job in worker {worker_id}: {e}");
+                warn!("failed to clean up job in worker {worker_id}: {e}");
             }
         });
     }

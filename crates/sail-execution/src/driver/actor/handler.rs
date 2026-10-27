@@ -148,6 +148,7 @@ impl DriverActor {
                 ctx,
                 worker_id,
                 Some("worker has been idle for too long".to_string()),
+                false,
             );
             self.task_assigner.deactivate_worker(worker_id);
         }
@@ -452,7 +453,7 @@ impl DriverActor {
             return;
         }
         self.worker_pool
-            .stop_worker(ctx, worker_id, Some(reason.to_string()));
+            .stop_worker(ctx, worker_id, Some(reason.to_string()), true);
 
         let keys = self.task_assigner.find_worker_tasks(worker_id);
         let stream_keys = self.task_assigner.find_worker_local_streams(worker_id);
