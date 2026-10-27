@@ -346,6 +346,14 @@ impl JobScheduler {
             if matches!(job.stages[s].state, StageState::Inactive) {
                 continue;
             }
+            // The blocking (disk) shuffle output is kept until the job completes,
+            // so that if a worker is lost, only the partitions on that worker need to be
+            // recomputed. Otherwise, recomputing a lost partition whose input has been
+            // cleaned up requires recomputing all the partitions of the upstream stages,
+            // which may cascade all the way to the beginning of the job.
+            if matches!(job.graph.stages()[s].mode, OutputMode::Blocking) {
+                continue;
+            }
             let all_consumers_succeeded = stage.consumers.iter().all(|&c| {
                 !job.stages[c].tasks.is_empty()
                     && job.stages[c].tasks.iter().all(|t| {
@@ -1442,6 +1450,38 @@ mod tests {
         assert!(!temp_dir.join(format!("{job_id}")).exists());
 
         let _ = std::fs::remove_dir_all(temp_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_blocking_shuffle_output_kept_until_job_completes(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+        for (mode, expect_cleanup) in [(OutputMode::Blocking, false), (OutputMode::Pipelined, true)]
+        {
+            let repartition = Arc::new(RepartitionExec::try_new(
+                Arc::new(EmptyExec::new(schema.clone())),
+                Partitioning::RoundRobinBatch(2),
+            )?);
+            let graph = JobGraph::try_new_with_mode(repartition, mode)?;
+            let job_id = JobId::from(102);
+            let mut job = JobDescriptor::try_new(graph, JobState::Draining)?;
+            let last = job.stages.len() - 1;
+            for s in 0..=last {
+                succeed_all(&mut job, s);
+            }
+            // All consumers of stage 0 have succeeded.
+            let actions = JobScheduler::clean_up_job_by_stage(job_id, &mut job);
+            let cleaned = actions.iter().any(|a| {
+                matches!(a, JobAction::CleanUpJob { job_id: j, stage: Some(0) } if *j == job_id)
+            });
+            assert_eq!(cleaned, expect_cleanup, "mode: {mode}");
+            assert_eq!(
+                matches!(job.stages[0].state, StageState::Inactive),
+                expect_cleanup,
+                "mode: {mode}"
+            );
+        }
         Ok(())
     }
 
