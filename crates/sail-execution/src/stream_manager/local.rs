@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use datafusion::arrow::array::RecordBatch;
 use datafusion::common::Result;
@@ -21,6 +21,10 @@ use crate::stream_manager::shuffle_file::{
 pub trait LocalStream: Send {
     fn publish(&mut self) -> ExecutionResult<Box<dyn TaskStreamSink>>;
     fn subscribe(&mut self) -> ExecutionResult<TaskStreamSource>;
+
+    /// Aborts the stream if it is being written, so that readers do not wait for it.
+    /// The default implementation does nothing.
+    fn abort(&mut self, _reason: &str) {}
 }
 
 /// A memory stream that can be read multiple times.
@@ -186,6 +190,9 @@ pub(crate) struct DiskStream {
     data_path: PathBuf,
     channel: usize,
     writer: Option<Arc<MapOutputWriter>>,
+    /// A reference to the shared map output writer for aborting the map output,
+    /// which does not keep the writer alive.
+    writer_ref: Weak<MapOutputWriter>,
     status: Option<watch::Receiver<MapOutputStatus>>,
     senders: Vec<mpsc::Sender<TaskStreamResult<RecordBatch>>>,
 }
@@ -202,6 +209,7 @@ impl DiskStream {
             data_path,
             channel,
             status: Some(writer.subscribe_status()),
+            writer_ref: Arc::downgrade(&writer),
             writer: Some(writer),
             senders,
         }
@@ -213,6 +221,7 @@ impl DiskStream {
             data_path,
             channel,
             writer: None,
+            writer_ref: Weak::new(),
             status: None,
             senders: vec![],
         }
@@ -228,7 +237,14 @@ impl LocalStream for DiskStream {
             writer,
             channel: self.channel,
             senders: std::mem::take(&mut self.senders),
+            closed: false,
         }))
+    }
+
+    fn abort(&mut self, reason: &str) {
+        if let Some(writer) = self.writer_ref.upgrade() {
+            writer.abort(reason);
+        }
     }
 
     fn subscribe(&mut self) -> ExecutionResult<TaskStreamSource> {
@@ -297,6 +313,8 @@ struct DiskStreamSink {
     writer: Arc<MapOutputWriter>,
     channel: usize,
     senders: Vec<mpsc::Sender<TaskStreamResult<RecordBatch>>>,
+    /// Whether the sink has been closed successfully.
+    closed: bool,
 }
 
 #[tonic::async_trait]
@@ -336,9 +354,25 @@ impl TaskStreamSink for DiskStreamSink {
 
     async fn close(mut self: Box<Self>) -> Result<()> {
         self.writer.close(self.channel).await?;
+        self.closed = true;
         // Drop senders to close channels for any pending receivers
         self.senders.clear();
         Ok(())
+    }
+}
+
+impl Drop for DiskStreamSink {
+    fn drop(&mut self) {
+        if !self.closed {
+            // The sink is dropped without being closed (e.g. the map task has failed or has
+            // been canceled), so the map output can never be completed. We abort the map
+            // output so that readers waiting for it fail immediately, even if the channels
+            // that have not been created yet still hold a reference to the writer.
+            self.writer.abort(&format!(
+                "shuffle output channel {} was not completed",
+                self.channel
+            ));
+        }
     }
 }
 
@@ -357,7 +391,7 @@ mod tests {
     use crate::stream_manager::shuffle_file::{
         ShuffleIndex, ShuffleWriteOptions, DEFAULT_SHUFFLE_SPILL_THRESHOLD,
     };
-    use crate::stream_manager::{StreamManager, StreamManagerOptions};
+    use crate::stream_manager::{LocalStreamState, StreamManager, StreamManagerOptions};
 
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("sail_test_{name}_{}", rand::random::<u64>()));
@@ -768,6 +802,109 @@ mod tests {
         drop(streams);
         assert_eq!(pool.reserved(), 0);
 
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    fn map_task_key(channel: usize) -> TaskStreamKey {
+        TaskStreamKey {
+            job_id: JobId::from(1),
+            stage: 2,
+            partition: 3,
+            attempt: 4,
+            channel,
+        }
+    }
+
+    async fn expect_error_soon(source: TaskStreamSource) {
+        let mut source = source;
+        let item = tokio::time::timeout(std::time::Duration::from_secs(5), source.next())
+            .await
+            .expect("the reader should not wait for the aborted map output");
+        assert!(matches!(item, Some(Err(_))), "expected an error");
+    }
+
+    /// A map task fails after creating only some of its output channels. The channel sink
+    /// is dropped without being closed, which aborts the map output immediately, even though
+    /// the stream manager still holds the writer for the channels not created yet.
+    #[tokio::test]
+    async fn test_disk_stream_partial_channels_sink_dropped() -> Result<()> {
+        let dir = temp_dir("partial_dropped");
+        let options = StreamManagerOptions::default().with_shuffle_dir(dir.clone());
+        let mut manager = StreamManager::new(options);
+        let storage = LocalStreamStorage::Disk { channels: 3 };
+        let mut sink0 = manager
+            .create_local_stream(map_task_key(0), storage, schema())
+            .unwrap();
+        let sink1 = manager
+            .create_local_stream(map_task_key(1), storage, schema())
+            .unwrap();
+        assert_eq!(manager.map_outputs.len(), 1);
+        sink0.write(Ok(batch(vec![1]))).await;
+        let source = match manager.local_streams.get_mut(&map_task_key(0)) {
+            Some(LocalStreamState::Created { stream }) => stream.subscribe().unwrap(),
+            _ => panic!("stream not created"),
+        };
+        let reader = tokio::spawn(expect_error_soon(source));
+        tokio::task::yield_now().await;
+        // The map task fails.
+        drop(sink0);
+        drop(sink1);
+        reader.await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// When a map task attempt ends without succeeding, the stream manager aborts its
+    /// output, so that readers of created channels and pending readers of channels that
+    /// have not been created fail immediately.
+    #[tokio::test]
+    async fn test_disk_stream_abort_task_output() -> Result<()> {
+        let dir = temp_dir("abort_task");
+        let options = StreamManagerOptions::default().with_shuffle_dir(dir.clone());
+        let mut manager = StreamManager::new(options);
+        let storage = LocalStreamStorage::Disk { channels: 3 };
+        let mut sink0 = manager
+            .create_local_stream(map_task_key(0), storage, schema())
+            .unwrap();
+        sink0.write(Ok(batch(vec![1]))).await;
+        let source0 = match manager.local_streams.get_mut(&map_task_key(0)) {
+            Some(LocalStreamState::Created { stream }) => stream.subscribe().unwrap(),
+            _ => panic!("stream not created"),
+        };
+        // A reader is waiting for channel 2, which has not been created.
+        let (tx, rx) = mpsc::channel(4);
+        manager.local_streams.insert(
+            map_task_key(2),
+            LocalStreamState::Pending { senders: vec![tx] },
+        );
+        let reader0 = tokio::spawn(expect_error_soon(source0));
+        let reader2 = tokio::spawn(expect_error_soon(Box::pin(ReceiverStream::new(rx))));
+        tokio::task::yield_now().await;
+
+        // The sink is still alive (e.g. the task is stuck), but the task has been reported
+        // as failed or canceled.
+        let task = crate::id::TaskKey {
+            job_id: JobId::from(1),
+            stage: 2,
+            partition: 3,
+            attempt: 4,
+        };
+        manager.abort_task_output(&task, "canceled");
+        reader0.await.unwrap();
+        reader2.await.unwrap();
+        assert!(manager.map_outputs.is_empty());
+        // The channels cannot be created anymore, and the sink no longer accepts data.
+        assert!(manager
+            .create_local_stream(map_task_key(2), storage, schema())
+            .is_err());
+        assert!(matches!(
+            sink0.write(Ok(batch(vec![2]))).await,
+            TaskStreamSinkState::Error(_)
+        ));
+        assert!(sink0.close().await.is_err());
+        // The partial output is cleaned up.
+        wait_until(|| list_files(&dir.join("1").join("2")).is_empty()).await;
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     }

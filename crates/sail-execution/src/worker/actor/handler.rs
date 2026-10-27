@@ -129,6 +129,10 @@ impl WorkerActor {
         cause: Option<CommonErrorCause>,
         shuffle_stats: Option<TaskShuffleStats>,
     ) -> ActorAction {
+        if matches!(status, TaskStatus::Failed | TaskStatus::Canceled) {
+            let reason = message.as_deref().unwrap_or("task failed or canceled");
+            self.stream_manager.abort_task_output(&key, reason);
+        }
         let sequence = self.sequence;
         self.sequence = match self.sequence.checked_add(1) {
             Some(x) => x,

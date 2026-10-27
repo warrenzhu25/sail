@@ -24,6 +24,7 @@ use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Take, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use datafusion::arrow::array::RecordBatch;
@@ -496,6 +497,8 @@ fn write_map_output(
 pub(crate) struct MapOutputWriter {
     state: tokio::sync::Mutex<MapOutputState>,
     status: watch::Sender<MapOutputStatus>,
+    /// Whether the map output has been aborted, after which no more data is accepted.
+    aborted: AtomicBool,
 }
 
 impl MapOutputWriter {
@@ -524,6 +527,7 @@ impl MapOutputWriter {
                 reservation: None,
             }),
             status,
+            aborted: AtomicBool::new(false),
         })
     }
 
@@ -555,13 +559,45 @@ impl MapOutputWriter {
     }
 
     fn fail(&self, e: DataFusionError) -> DataFusionError {
-        self.status
-            .send_replace(MapOutputStatus::Failed(e.to_string()));
+        self.abort(&e.to_string());
         e
+    }
+
+    /// Aborts the map output if it is not finalized yet (e.g. because the map task has
+    /// failed or has been canceled). Readers waiting for the map output are notified
+    /// immediately, and no more data is accepted. The partial output is cleaned up
+    /// when the writer is dropped.
+    pub fn abort(&self, reason: &str) {
+        self.aborted.store(true, Ordering::Release);
+        self.status.send_if_modified(|status| {
+            if *status == MapOutputStatus::Writing {
+                *status = MapOutputStatus::Failed(reason.to_string());
+                true
+            } else {
+                false
+            }
+        });
+        // Release the buffered data early if the writer is not in use.
+        if let Ok(mut state) = self.state.try_lock() {
+            if !state.finalized {
+                let _ = state.take_buffers();
+                state.free_memory();
+            }
+        }
+    }
+
+    fn check_aborted(&self) -> Result<()> {
+        if self.aborted.load(Ordering::Acquire) {
+            return Err(DataFusionError::Execution(
+                "the shuffle output has been aborted".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     pub async fn write(&self, channel: usize, batch: RecordBatch) -> Result<()> {
         let mut state = self.state.lock().await;
+        self.check_aborted()?;
         if state.closed.get(channel) != Some(&false) {
             return Err(DataFusionError::Internal(format!(
                 "cannot write to closed or invalid shuffle channel {channel}"
@@ -586,6 +622,7 @@ impl MapOutputWriter {
     /// Closes the channel. The map output is finalized when all channels are closed.
     pub async fn close(&self, channel: usize) -> Result<()> {
         let mut state = self.state.lock().await;
+        self.check_aborted()?;
         match state.closed.get_mut(channel) {
             Some(closed @ false) => *closed = true,
             _ => {
@@ -597,7 +634,14 @@ impl MapOutputWriter {
         state.num_closed += 1;
         if state.num_closed == state.closed.len() {
             state.finalize().await.map_err(|e| self.fail(e))?;
-            self.status.send_replace(MapOutputStatus::Finalized);
+            self.status.send_if_modified(|status| {
+                if *status == MapOutputStatus::Writing {
+                    *status = MapOutputStatus::Finalized;
+                    true
+                } else {
+                    false
+                }
+            });
         }
         Ok(())
     }

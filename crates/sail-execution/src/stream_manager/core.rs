@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 use tonic::codegen::tokio_stream::wrappers::ReceiverStream;
 
 use crate::error::{ExecutionError, ExecutionResult};
-use crate::id::{JobId, TaskStreamKey, TaskStreamKeyDisplay};
+use crate::id::{JobId, TaskKey, TaskKeyDisplay, TaskStreamKey, TaskStreamKeyDisplay};
 use crate::stream::error::{TaskStreamError, TaskStreamResult};
 use crate::stream::reader::TaskStreamSource;
 use crate::stream::writer::{LocalStreamStorage, TaskStreamSink};
@@ -240,7 +240,45 @@ impl StreamManager {
         }
     }
 
+    /// Aborts the disk-backed output of the task attempt if it has not been completed,
+    /// which is called when the task attempt ends without succeeding (e.g. when the task
+    /// fails or is canceled). Readers of any output channel then fail immediately instead
+    /// of waiting for the channel to be created or the output to be finalized.
+    pub fn abort_task_output(&mut self, key: &TaskKey, reason: &str) {
+        let map_output = MapOutputKey::from(key);
+        if let Some((writer, _)) = self.map_outputs.remove(&map_output) {
+            writer.abort(reason);
+        }
+        let cause = CommonErrorCause::Execution(format!(
+            "task {} ended without completing its output: {reason}",
+            TaskKeyDisplay(key)
+        ));
+        for (k, state) in self.local_streams.iter_mut() {
+            if MapOutputKey::from(k) != map_output {
+                continue;
+            }
+            match state {
+                LocalStreamState::Pending { senders } => {
+                    Self::fail_senders(senders, &cause);
+                    *state = LocalStreamState::Failed {
+                        cause: cause.clone(),
+                    };
+                }
+                LocalStreamState::Created { stream } => stream.abort(reason),
+                LocalStreamState::Failed { .. } => {}
+            }
+        }
+    }
+
     pub async fn stop(&mut self) {
+        for (writer, _) in self.map_outputs.values() {
+            writer.abort("the stream manager has stopped");
+        }
+        for state in self.local_streams.values_mut() {
+            if let LocalStreamState::Created { stream } = state {
+                stream.abort("the stream manager has stopped");
+            }
+        }
         self.local_streams.clear();
         self.map_outputs.clear();
         let shuffle_dir = self.options.shuffle_dir.clone();
@@ -316,6 +354,17 @@ impl StreamManager {
                     senders,
                 )))
             }
+        }
+    }
+}
+
+impl From<&TaskKey> for MapOutputKey {
+    fn from(key: &TaskKey) -> Self {
+        Self {
+            job_id: key.job_id,
+            stage: key.stage,
+            partition: key.partition,
+            attempt: key.attempt,
         }
     }
 }

@@ -218,6 +218,11 @@ impl DriverActor {
             }
             self.task_sequences.insert(key.clone(), sequence);
         }
+        if matches!(status, TaskStatus::Failed | TaskStatus::Canceled) {
+            // The task may have run on the driver and written disk-backed output.
+            let reason = message.as_deref().unwrap_or("task failed or canceled");
+            self.stream_manager.abort_task_output(&key, reason);
+        }
         match status {
             TaskStatus::Running => {
                 self.job_scheduler
