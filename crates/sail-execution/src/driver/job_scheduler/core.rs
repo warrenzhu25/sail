@@ -1193,6 +1193,7 @@ mod tests {
     use datafusion::physical_plan::Partitioning;
 
     use super::*;
+    use crate::stream_manager::shuffle_file::write_test_shuffle_index;
 
     #[test]
     fn test_adaptive_disk_shuffle_coalescing_workflow() -> Result<(), Box<dyn std::error::Error>> {
@@ -1203,19 +1204,9 @@ mod tests {
         std::fs::create_dir_all(&stage_dir)?;
 
         // Map partition 0, attempt 0: channels 0..4 (each 100 bytes)
-        for c in 0..4 {
-            std::fs::write(
-                stage_dir.join(format!("shuffle_0_0_{c}.index")),
-                "100\n10\n",
-            )?;
-        }
+        write_test_shuffle_index(&stage_dir, 0, 0, &[(100, 10); 4])?;
         // Map partition 1, attempt 0: channels 0..4 (each 100 bytes)
-        for c in 0..4 {
-            std::fs::write(
-                stage_dir.join(format!("shuffle_1_0_{c}.index")),
-                "100\n10\n",
-            )?;
-        }
+        write_test_shuffle_index(&stage_dir, 1, 0, &[(100, 10); 4])?;
 
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
         let empty = Arc::new(EmptyExec::new(schema));
@@ -1292,9 +1283,7 @@ mod tests {
         let stage_dir = temp_dir.join(format!("{job_id}")).join("0");
         std::fs::create_dir_all(&stage_dir)?;
 
-        for c in 0..4 {
-            std::fs::write(stage_dir.join(format!("shuffle_0_0_{c}.index")), "10\n1\n")?;
-        }
+        write_test_shuffle_index(&stage_dir, 0, 0, &[(10, 1); 4])?;
 
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
         let empty = Arc::new(EmptyExec::new(schema));
@@ -1430,8 +1419,8 @@ mod tests {
         std::fs::create_dir_all(&stage0_dir)?;
         std::fs::create_dir_all(&stage1_dir)?;
 
-        std::fs::write(stage0_dir.join("shuffle_0_0_0.data"), b"data")?;
-        std::fs::write(stage1_dir.join("shuffle_0_0_0.data"), b"data")?;
+        std::fs::write(stage0_dir.join("shuffle_0_0.data"), b"data")?;
+        std::fs::write(stage1_dir.join("shuffle_0_0.data"), b"data")?;
 
         assert!(stage0_dir.exists());
         assert!(stage1_dir.exists());
@@ -1498,16 +1487,12 @@ mod tests {
         // Stage 0 dir (left upstream)
         let stage0_dir = temp_dir.join(format!("{job_id}")).join("0");
         std::fs::create_dir_all(&stage0_dir)?;
-        for c in 0..4 {
-            std::fs::write(stage0_dir.join(format!("shuffle_0_0_{c}.index")), "50\n5\n")?;
-        }
+        write_test_shuffle_index(&stage0_dir, 0, 0, &[(50, 5); 4])?;
 
         // Stage 1 dir (right upstream)
         let stage1_dir = temp_dir.join(format!("{job_id}")).join("1");
         std::fs::create_dir_all(&stage1_dir)?;
-        for c in 0..4 {
-            std::fs::write(stage1_dir.join(format!("shuffle_0_0_{c}.index")), "50\n5\n")?;
-        }
+        write_test_shuffle_index(&stage1_dir, 0, 0, &[(50, 5); 4])?;
 
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
         let empty1 = Arc::new(EmptyExec::new(schema.clone()));
@@ -1602,12 +1587,7 @@ mod tests {
         let stage_dir = temp_dir.join(format!("{job_id}")).join("0");
         std::fs::create_dir_all(&stage_dir)?;
 
-        for c in 0..4 {
-            std::fs::write(
-                stage_dir.join(format!("shuffle_0_0_{c}.index")),
-                "100\n10\n",
-            )?;
-        }
+        write_test_shuffle_index(&stage_dir, 0, 0, &[(100, 10); 4])?;
 
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
         let empty = Arc::new(EmptyExec::new(schema));
@@ -1701,12 +1681,7 @@ mod tests {
         let job_id = JobId::from(5);
         let stage_dir = temp_dir.join(format!("{job_id}")).join("0");
         std::fs::create_dir_all(&stage_dir)?;
-        for c in 0..4 {
-            std::fs::write(
-                stage_dir.join(format!("shuffle_0_0_{c}.index")),
-                "100\n10\n",
-            )?;
-        }
+        write_test_shuffle_index(&stage_dir, 0, 0, &[(100, 10); 4])?;
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
         let repartition = Arc::new(RepartitionExec::try_new(
             Arc::new(EmptyExec::new(schema)),
@@ -1787,9 +1762,7 @@ mod tests {
             succeed_all(&mut job, s);
             let dir = temp_dir.join(format!("{job_id}")).join(format!("{s}"));
             std::fs::create_dir_all(&dir)?;
-            for c in 0..4 {
-                std::fs::write(dir.join(format!("shuffle_0_0_{c}.index")), "100\n10\n")?;
-            }
+            write_test_shuffle_index(&dir, 0, 0, &[(100, 10); 4])?;
         }
         let options = JobSchedulerOptions::default()
             .with_shuffle_mode(OutputMode::Blocking)
@@ -1831,12 +1804,7 @@ mod tests {
         let job_id = JobId::from(7);
         let stage_dir = temp_dir.join(format!("{job_id}")).join("0");
         std::fs::create_dir_all(&stage_dir)?;
-        for c in 0..4 {
-            std::fs::write(
-                stage_dir.join(format!("shuffle_0_0_{c}.index")),
-                "100\n10\n",
-            )?;
-        }
+        write_test_shuffle_index(&stage_dir, 0, 0, &[(100, 10); 4])?;
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
         let repartition = Arc::new(RepartitionExec::try_new(
             Arc::new(EmptyExec::new(schema)),

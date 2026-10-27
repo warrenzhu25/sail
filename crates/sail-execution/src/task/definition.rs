@@ -576,7 +576,7 @@ impl TaskOutput {
                 .collect(),
             TaskOutputLocator::LocalDisk => (0..channels)
                 .map(|channel| TaskWriteLocation::Local {
-                    storage: LocalStreamStorage::Disk,
+                    storage: LocalStreamStorage::Disk { channels },
                     key: TaskStreamKey {
                         job_id: key.job_id,
                         stage: key.stage,

@@ -4,6 +4,7 @@ use std::path::Path;
 use log::debug;
 
 use crate::id::JobId;
+use crate::stream_manager::shuffle_file::{MapOutputKey, ShuffleIndex};
 use crate::task::stats::TaskShuffleStats;
 
 /// Summary statistics for all partitions and channels produced by a shuffle stage.
@@ -47,7 +48,7 @@ impl StageShuffleStats {
         stats
     }
 
-    /// Read shuffle stats from on-disk index files written by `DiskStream`.
+    /// Read shuffle stats from the on-disk index files of the map outputs.
     pub fn from_disk(
         shuffle_dir: &Path,
         job_id: JobId,
@@ -57,38 +58,37 @@ impl StageShuffleStats {
         attempts: &[usize],
     ) -> Self {
         let mut stats = Self::new(channels);
-        let stage_dir = shuffle_dir
-            .join(format!("{job_id}"))
-            .join(format!("{stage}"));
-
         for p in 0..partitions {
-            let attempt = attempts.get(p).copied().unwrap_or(0);
-            for (c, (channel_byte_acc, channel_record_acc)) in stats
-                .channel_bytes
-                .iter_mut()
-                .zip(stats.channel_records.iter_mut())
-                .enumerate()
-            {
-                let index_file = stage_dir.join(format!("shuffle_{p}_{attempt}_{c}.index"));
-                match std::fs::read_to_string(&index_file) {
-                    Ok(content) => {
-                        let mut lines = content.lines();
-                        if let (Some(bytes_str), Some(records_str)) = (lines.next(), lines.next()) {
-                            if let (Ok(bytes), Ok(records)) =
-                                (bytes_str.parse::<u64>(), records_str.parse::<usize>())
-                            {
-                                *channel_byte_acc += bytes;
-                                *channel_record_acc += records;
-                                stats.total_bytes += bytes;
-                                stats.total_records += records;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        debug!("could not read shuffle index file {index_file:?}: {e}");
-                        stats.missing_index_files += 1;
-                    }
+            let key = MapOutputKey {
+                job_id,
+                stage,
+                partition: p,
+                attempt: attempts.get(p).copied().unwrap_or(0),
+            };
+            let index_file = key.index_path(shuffle_dir);
+            let index = match ShuffleIndex::read(&index_file) {
+                Ok(index) if index.channels() == channels => index,
+                Ok(index) => {
+                    debug!(
+                        "shuffle index file {index_file:?} has {} channels but {channels} are expected",
+                        index.channels()
+                    );
+                    stats.missing_index_files += 1;
+                    continue;
                 }
+                Err(e) => {
+                    debug!("could not read shuffle index file {index_file:?}: {e}");
+                    stats.missing_index_files += 1;
+                    continue;
+                }
+            };
+            for c in 0..channels {
+                let bytes = index.channel_bytes(c).unwrap_or(0);
+                let records = index.channel_records(c).unwrap_or(0) as usize;
+                stats.channel_bytes[c] += bytes;
+                stats.channel_records[c] += records;
+                stats.total_bytes += bytes;
+                stats.total_records += records;
             }
         }
         stats
@@ -229,6 +229,7 @@ pub fn split_skew_partition(num_map_partitions: usize, num_splits: usize) -> Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stream_manager::shuffle_file::write_test_shuffle_index;
 
     #[test]
     fn test_effective_target_partition_size() {
@@ -314,21 +315,29 @@ mod tests {
         std::fs::create_dir_all(&job_dir)?;
 
         // Map partition 0, attempt 0
-        std::fs::write(job_dir.join("shuffle_0_0_0.index"), "100\n10\n")?;
-        std::fs::write(job_dir.join("shuffle_0_0_1.index"), "200\n20\n")?;
-        // Map partition 1, attempt 0
-        std::fs::write(job_dir.join("shuffle_1_0_0.index"), "300\n30\n")?;
-        std::fs::write(job_dir.join("shuffle_1_0_1.index"), "400\n40\n")?;
+        write_test_shuffle_index(&job_dir, 0, 0, &[(100, 10), (200, 20)])?;
+        // Map partition 1, attempt 1
+        write_test_shuffle_index(&job_dir, 1, 1, &[(300, 30), (400, 40)])?;
+        // A stale attempt that must be ignored
+        write_test_shuffle_index(&job_dir, 1, 0, &[(1, 1), (1, 1)])?;
 
-        let stats = StageShuffleStats::from_disk(&temp_dir, JobId::from(1), 0, 2, 2, &[0, 0]);
+        let stats = StageShuffleStats::from_disk(&temp_dir, JobId::from(1), 0, 2, 2, &[0, 1]);
 
         assert_eq!(stats.channel_bytes, vec![400, 600]);
         assert_eq!(stats.channel_records, vec![40, 60]);
         assert_eq!(stats.total_bytes, 1000);
         assert_eq!(stats.total_records, 100);
 
+        assert_eq!(stats.missing_index_files, 0);
+
         let coalesced = stats.coalesce(1500);
         assert_eq!(coalesced, vec![0..2]);
+
+        // Missing map outputs and channel count mismatches are reported.
+        let stats = StageShuffleStats::from_disk(&temp_dir, JobId::from(1), 0, 3, 2, &[0, 1, 0]);
+        assert_eq!(stats.missing_index_files, 1);
+        let stats = StageShuffleStats::from_disk(&temp_dir, JobId::from(1), 0, 2, 3, &[0, 1]);
+        assert_eq!(stats.missing_index_files, 2);
 
         let _ = std::fs::remove_dir_all(temp_dir);
         Ok(())
