@@ -44,6 +44,7 @@ url = { workspace = true }
 readonly = { workspace = true }
 indexmap = { workspace = true }
 chrono = { workspace = true }
+crc32fast = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = { workspace = true }

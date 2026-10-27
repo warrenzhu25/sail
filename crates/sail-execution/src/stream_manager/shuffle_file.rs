@@ -49,7 +49,10 @@ const SHUFFLE_FILE_BUFFER_SIZE: usize = 256 * 1024;
 /// before the buffered data is spilled to disk.
 pub(crate) const DEFAULT_SHUFFLE_SPILL_THRESHOLD: usize = 64 * 1024 * 1024;
 
+/// The magic bytes of an index file without channel checksums.
 const SHUFFLE_INDEX_MAGIC: &[u8; 8] = b"SAILSHI1";
+/// The magic bytes of an index file with channel checksums.
+const SHUFFLE_INDEX_MAGIC_WITH_CHECKSUMS: &[u8; 8] = b"SAILSHI2";
 
 /// The options for writing the disk shuffle output of a map task.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,10 +117,13 @@ fn index_path(data_path: &Path) -> PathBuf {
 /// The binary format (all integers are little-endian `u64`) is:
 /// the magic bytes `SAILSHI1`, the number of channels `C`,
 /// `C + 1` byte offsets into the data file, and `C` record counts.
+/// With the magic bytes `SAILSHI2`, the record counts are followed by `C` CRC-32
+/// checksums of the channel data (stored in the low 32 bits of each value).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ShuffleIndex {
     offsets: Vec<u64>,
     records: Vec<u64>,
+    checksums: Option<Vec<u32>>,
 }
 
 impl ShuffleIndex {
@@ -135,7 +141,29 @@ impl ShuffleIndex {
                     .to_string(),
             ));
         }
-        Ok(Self { offsets, records })
+        Ok(Self {
+            offsets,
+            records,
+            checksums: None,
+        })
+    }
+
+    /// Sets the CRC-32 checksums of the channel data.
+    pub fn with_checksums(mut self, checksums: Vec<u32>) -> ExecutionResult<Self> {
+        if checksums.len() != self.records.len() {
+            return Err(ExecutionError::InternalError(format!(
+                "invalid shuffle index: {} checksums for {} channels",
+                checksums.len(),
+                self.records.len()
+            )));
+        }
+        self.checksums = Some(checksums);
+        Ok(self)
+    }
+
+    /// Returns the CRC-32 checksum of the channel data, if the index has checksums.
+    pub fn channel_checksum(&self, channel: usize) -> Option<u32> {
+        self.checksums.as_ref()?.get(channel).copied()
     }
 
     /// Creates an index for consecutive channels with the given sizes.
@@ -147,7 +175,11 @@ impl ShuffleIndex {
             offsets.push(offsets[offsets.len() - 1] + bytes);
             records.push(*rows);
         }
-        Self { offsets, records }
+        Self {
+            offsets,
+            records,
+            checksums: None,
+        }
     }
 
     pub fn channels(&self) -> usize {
@@ -171,10 +203,23 @@ impl ShuffleIndex {
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(16 + 8 * (self.offsets.len() + self.records.len()));
-        out.extend_from_slice(SHUFFLE_INDEX_MAGIC);
+        let checksums = self.checksums.iter().flatten().map(|x| u64::from(*x));
+        let mut out = Vec::with_capacity(
+            16 + 8 * (self.offsets.len() + self.records.len() + self.records.len()),
+        );
+        out.extend_from_slice(if self.checksums.is_some() {
+            SHUFFLE_INDEX_MAGIC_WITH_CHECKSUMS
+        } else {
+            SHUFFLE_INDEX_MAGIC
+        });
         out.extend_from_slice(&(self.channels() as u64).to_le_bytes());
-        for x in self.offsets.iter().chain(self.records.iter()) {
+        for x in self
+            .offsets
+            .iter()
+            .chain(self.records.iter())
+            .copied()
+            .chain(checksums)
+        {
             out.extend_from_slice(&x.to_le_bytes());
         }
         out
@@ -183,9 +228,15 @@ impl ShuffleIndex {
     pub fn decode(data: &[u8]) -> ExecutionResult<Self> {
         let invalid =
             |m: &str| ExecutionError::InternalError(format!("invalid shuffle index: {m}"));
+        let has_checksums = if data.starts_with(SHUFFLE_INDEX_MAGIC_WITH_CHECKSUMS) {
+            true
+        } else if data.starts_with(SHUFFLE_INDEX_MAGIC) {
+            false
+        } else {
+            return Err(invalid("bad magic"));
+        };
         let mut values = data
             .get(8..)
-            .filter(|_| data.starts_with(SHUFFLE_INDEX_MAGIC))
             .ok_or_else(|| invalid("bad magic"))?
             .chunks(8)
             .map(|x| x.try_into().map(u64::from_le_bytes));
@@ -194,7 +245,7 @@ impl ShuffleIndex {
             _ => return Err(invalid("missing channel count")),
         };
         let expected = channels
-            .checked_mul(2)
+            .checked_mul(if has_checksums { 3 } else { 2 })
             .and_then(|x| x.checked_add(1))
             .ok_or_else(|| invalid("bad channel count"))?;
         if data.len() != 16 + 8 * expected {
@@ -203,8 +254,18 @@ impl ShuffleIndex {
         let values = values
             .collect::<Result<Vec<_>, _>>()
             .map_err(|_| invalid("truncated"))?;
-        let (offsets, records) = values.split_at(channels + 1);
-        Self::try_new(offsets.to_vec(), records.to_vec())
+        let (offsets, rest) = values.split_at(channels + 1);
+        let (records, checksums) = rest.split_at(channels);
+        let index = Self::try_new(offsets.to_vec(), records.to_vec())?;
+        if has_checksums {
+            let checksums = checksums
+                .iter()
+                .map(|x| u32::try_from(*x).map_err(|_| invalid("bad checksum")))
+                .collect::<ExecutionResult<Vec<_>>>()?;
+            index.with_checksums(checksums)
+        } else {
+            Ok(index)
+        }
     }
 
     /// Reads the index file. A missing index file means that the map output
@@ -255,17 +316,29 @@ pub(crate) fn write_test_shuffle_index(
 struct CountingWriter<W> {
     inner: W,
     position: u64,
+    /// The checksum of the bytes written since the last call to [`Self::take_checksum`].
+    hasher: crc32fast::Hasher,
 }
 
 impl<W> CountingWriter<W> {
     fn new(inner: W) -> Self {
-        Self { inner, position: 0 }
+        Self {
+            inner,
+            position: 0,
+            hasher: crc32fast::Hasher::new(),
+        }
+    }
+
+    /// Returns the checksum of the bytes written since the last call, and resets it.
+    fn take_checksum(&mut self) -> u32 {
+        std::mem::take(&mut self.hasher).finalize()
     }
 }
 
 impl<W: Write> Write for CountingWriter<W> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let n = self.inner.write(buf)?;
+        self.hasher.update(&buf[..n]);
         self.position += n as u64;
         Ok(n)
     }
@@ -492,6 +565,7 @@ fn write_map_output(
     };
     let mut offsets = Vec::with_capacity(buffers.len() + 1);
     offsets.push(0);
+    let mut checksums = Vec::with_capacity(buffers.len());
     for (c, batches) in buffers.iter().enumerate() {
         if let Some((file, ranges)) = spill.as_mut() {
             for (offset, length) in &ranges[c] {
@@ -500,6 +574,7 @@ fn write_map_output(
         }
         encode_batches(&mut out, batches)?;
         offsets.push(out.position);
+        checksums.push(out.take_checksum());
     }
     drop(buffers);
     let file = out
@@ -515,6 +590,7 @@ fn write_map_output(
     }
     std::fs::rename(&tmp_data_path, data_path)?;
     let index = ShuffleIndex::try_new(offsets, records)
+        .and_then(|x| x.with_checksums(checksums))
         .map_err(|e| DataFusionError::Internal(e.to_string()))?;
     index.write(&index_path(data_path), fsync)?;
     if fsync {
@@ -683,10 +759,33 @@ impl MapOutputWriter {
 
 /// A reader of a byte range of a data file, which may be shared by multiple
 /// consecutive Arrow IPC stream readers.
+/// A reader that computes the CRC-32 checksum of the bytes read.
+struct ChecksumReader<R> {
+    inner: R,
+    hasher: crc32fast::Hasher,
+}
+
+impl<R: Read> Read for ChecksumReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.hasher.update(&buf[..n]);
+        Ok(n)
+    }
+}
+
 #[derive(Clone)]
-struct RegionReader(Arc<Mutex<BufReader<Take<File>>>>);
+struct RegionReader(Arc<Mutex<BufReader<ChecksumReader<Take<File>>>>>);
 
 impl RegionReader {
+    /// Returns the checksum of the bytes read from the file so far.
+    fn checksum(&self) -> std::io::Result<u32> {
+        let reader = self
+            .0
+            .lock()
+            .map_err(|_| std::io::Error::other("poisoned shuffle region reader"))?;
+        Ok(reader.get_ref().hasher.clone().finalize())
+    }
+
     fn is_exhausted(&self) -> std::io::Result<bool> {
         let mut reader = self
             .0
@@ -707,6 +806,8 @@ impl Read for RegionReader {
 
 struct RegionStreamState {
     region: RegionReader,
+    /// The expected checksum of the region, if the index has checksums.
+    checksum: Option<u32>,
     current: Option<StreamReader<RegionReader>>,
     done: bool,
 }
@@ -725,13 +826,31 @@ impl RegionStreamState {
         out
     }
 
+    fn verify_checksum(&self) -> Result<(), ArrowError> {
+        let Some(expected) = self.checksum else {
+            return Ok(());
+        };
+        let actual = self.region.checksum()?;
+        if actual != expected {
+            return Err(ArrowError::IoError(
+                format!(
+                    "shuffle data checksum mismatch: expected {expected:08x}, found {actual:08x}"
+                ),
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "checksum mismatch"),
+            ));
+        }
+        Ok(())
+    }
+
     fn read_next(&mut self) -> Option<Result<RecordBatch, ArrowError>> {
         loop {
             let reader = match self.current.as_mut() {
                 Some(x) => x,
                 None => {
                     match self.region.is_exhausted() {
-                        Ok(true) => return None,
+                        // All the bytes of the region have been read, so the checksum
+                        // can be verified.
+                        Ok(true) => return self.verify_checksum().err().map(Err),
                         Ok(false) => {}
                         Err(e) => return Some(Err(e.into())),
                     }
@@ -791,10 +910,14 @@ fn open_map_output_channel(
     file.seek(SeekFrom::Start(start))?;
     let reader = BufReader::with_capacity(
         SHUFFLE_FILE_BUFFER_SIZE.min((end - start) as usize),
-        file.take(end - start),
+        ChecksumReader {
+            inner: file.take(end - start),
+            hasher: crc32fast::Hasher::new(),
+        },
     );
     Ok(Some(RegionStreamState {
         region: RegionReader(Arc::new(Mutex::new(reader))),
+        checksum: index.channel_checksum(channel),
         current: None,
         done: false,
     }))

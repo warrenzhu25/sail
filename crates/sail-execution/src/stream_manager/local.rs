@@ -1020,6 +1020,62 @@ mod tests {
         assert!(ShuffleIndex::try_new(vec![0, 10, 5], vec![1, 1]).is_err());
         assert!(ShuffleIndex::try_new(vec![1, 10], vec![1]).is_err());
         assert!(ShuffleIndex::try_new(vec![0, 10], vec![1, 1]).is_err());
+
+        // index with checksums
+        let index = index.with_checksums(vec![1, 2, u32::MAX]).unwrap();
+        let data = index.encode();
+        assert_eq!(&data[..8], b"SAILSHI2");
+        assert_eq!(data.len(), 16 + 8 * 10);
+        assert_eq!(ShuffleIndex::decode(&data).unwrap(), index);
+        assert_eq!(index.channel_checksum(2), Some(u32::MAX));
+        assert!(ShuffleIndex::decode(&data[..data.len() - 8]).is_err());
+        assert!(index.with_checksums(vec![1]).is_err());
+    }
+
+    /// Corrupted shuffle data is detected when reading the affected channel,
+    /// while the other channels can still be read.
+    #[tokio::test]
+    async fn test_disk_stream_corrupted_data_is_an_error() -> Result<()> {
+        let dir = temp_dir("corrupted");
+        let data_path = dir.join("shuffle_0_0.data");
+        let channels = 4;
+        let data = test_data(channels);
+        let mut streams = create_streams(&data_path, channels, DEFAULT_SHUFFLE_SPILL_THRESHOLD);
+        write_channels(&mut streams, &data).await?;
+        let index = ShuffleIndex::read(&dir.join("shuffle_0_0.index")).unwrap();
+        assert!(index.channel_checksum(3).is_some());
+
+        // Change a value in the data buffer of channel 3 (300 -> 301). The data can
+        // still be decoded as Arrow IPC data, so only the checksum can detect it.
+        let (start, end) = index.channel_range(3).unwrap();
+        let mut bytes = std::fs::read(&data_path)?;
+        let region = &bytes[start as usize..end as usize];
+        let value = 300i32.to_le_bytes();
+        let offset = region
+            .windows(value.len())
+            .position(|w| w == value)
+            .expect("value not found in the channel data");
+        bytes[start as usize + offset] ^= 0x01;
+        std::fs::write(&data_path, bytes)?;
+
+        let mut source = DiskStream::existing(data_path.clone(), 3)
+            .subscribe()
+            .unwrap();
+        let mut error = None;
+        while let Some(x) = source.next().await {
+            if let Err(e) = x {
+                error = Some(e);
+                break;
+            }
+        }
+        assert!(error.is_some(), "corrupted shuffle data was not detected");
+        // The other channels are not affected.
+        for (c, batches) in data.iter().enumerate().take(3) {
+            let mut existing = DiskStream::existing(data_path.clone(), c);
+            assert_eq!(&read_all(existing.subscribe().unwrap()).await, batches);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
     }
 
     #[tokio::test]
