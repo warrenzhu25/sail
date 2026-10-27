@@ -348,6 +348,7 @@ exec sleep 1000
             },
             shuffle_dir,
             shuffle_spill_threshold: 1024,
+            shuffle_fsync: false,
         }
     }
 

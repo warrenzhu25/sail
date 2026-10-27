@@ -88,6 +88,7 @@ impl WorkerPool {
             rpc_retry_strategy: self.options.rpc_retry_strategy.clone(),
             shuffle_dir: self.options.shuffle_dir.clone(),
             shuffle_spill_threshold: self.options.shuffle_spill_threshold,
+            shuffle_fsync: self.options.shuffle_fsync,
         };
         let worker_manager = Arc::clone(&self.worker_manager);
         let handle = ctx.handle().clone();

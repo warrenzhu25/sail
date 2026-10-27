@@ -41,6 +41,7 @@ impl From<&DriverOptions> for StreamManagerOptions {
             shuffle_dir: options.shuffle_dir.join("driver"),
             shuffle_write: ShuffleWriteOptions {
                 spill_threshold: options.shuffle_spill_threshold,
+                fsync: options.shuffle_fsync,
             },
         }
     }
@@ -57,6 +58,7 @@ impl From<&WorkerOptions> for StreamManagerOptions {
             shuffle_dir: options.shuffle_dir.clone(),
             shuffle_write: ShuffleWriteOptions {
                 spill_threshold: options.shuffle_spill_threshold,
+                fsync: options.shuffle_fsync,
             },
         }
     }

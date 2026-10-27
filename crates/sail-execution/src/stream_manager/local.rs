@@ -586,6 +586,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_disk_stream_fsync() -> Result<()> {
+        let dir = temp_dir("fsync");
+        let data_path = dir.join("shuffle_0_0.data");
+        let channels = 5;
+        let data = test_data(channels);
+        let size = batch(vec![1, 2, 3]).get_array_memory_size();
+        let writer = Arc::new(MapOutputWriter::try_new(
+            data_path.clone(),
+            channels,
+            ShuffleWriteOptions::default()
+                .with_spill_threshold(size * 2)
+                .with_fsync(true),
+        )?);
+        let mut streams = (0..channels)
+            .map(|c| DiskStream::new(data_path.clone(), c, writer.clone(), vec![]))
+            .collect::<Vec<_>>();
+        drop(writer);
+        write_channels(&mut streams, &data).await?;
+        assert_eq!(
+            list_files(&dir),
+            vec!["shuffle_0_0.data", "shuffle_0_0.index"]
+        );
+        for (c, batches) in data.iter().enumerate() {
+            assert_eq!(&read_all(streams[c].subscribe().unwrap()).await, batches);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_disk_stream_spill_every_batch() -> Result<()> {
         let dir = temp_dir("spill_all");
         let data_path = dir.join("shuffle_0_0.data");

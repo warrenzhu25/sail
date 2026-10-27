@@ -47,6 +47,7 @@ pub(crate) fn build_worker_env(
         // The worker manager decides the worker shuffle directory instead.
         shuffle_dir: _,
         shuffle_spill_threshold,
+        shuffle_fsync,
     } = options;
     let WorkerEnvOptions {
         listen_host,
@@ -100,6 +101,10 @@ pub(crate) fn build_worker_env(
         (
             ClusterConfigEnv::SHUFFLE_SPILL_THRESHOLD_BYTES.to_string(),
             shuffle_spill_threshold.to_string(),
+        ),
+        (
+            ClusterConfigEnv::SHUFFLE_FSYNC.to_string(),
+            shuffle_fsync.to_string(),
         ),
     ];
     if random_port {
@@ -178,6 +183,7 @@ mod tests {
             },
             shuffle_dir: PathBuf::from("/driver/shuffle"),
             shuffle_spill_threshold: 1024,
+            shuffle_fsync: true,
         }
     }
 
@@ -214,6 +220,7 @@ mod tests {
             get(ClusterConfigEnv::SHUFFLE_SPILL_THRESHOLD_BYTES),
             Some("1024")
         );
+        assert_eq!(get(ClusterConfigEnv::SHUFFLE_FSYNC), Some("true"));
         assert_eq!(
             get(ClusterConfigEnv::RPC_RETRY_STRATEGY),
             Some("{ fixed = { max_count = 3, delay_secs = 2 } }")

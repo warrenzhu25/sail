@@ -20,6 +20,7 @@ pub struct WorkerPoolOptions {
     pub rpc_retry_strategy: RetryStrategy,
     pub shuffle_dir: PathBuf,
     pub shuffle_spill_threshold: usize,
+    pub shuffle_fsync: bool,
 }
 
 impl From<&DriverOptions> for WorkerPoolOptions {
@@ -37,6 +38,7 @@ impl From<&DriverOptions> for WorkerPoolOptions {
             rpc_retry_strategy: options.rpc_retry_strategy.clone(),
             shuffle_dir: options.shuffle_dir.clone(),
             shuffle_spill_threshold: options.shuffle_spill_threshold,
+            shuffle_fsync: options.shuffle_fsync,
         }
     }
 }

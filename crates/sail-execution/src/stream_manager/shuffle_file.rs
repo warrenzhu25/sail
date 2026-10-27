@@ -56,12 +56,15 @@ const SHUFFLE_INDEX_MAGIC: &[u8; 8] = b"SAILSHI1";
 pub(crate) struct ShuffleWriteOptions {
     /// The maximum size (in bytes) of buffered output before it is spilled to disk.
     pub spill_threshold: usize,
+    /// Whether to sync the data and index files (and their directory) to stable storage.
+    pub fsync: bool,
 }
 
 impl Default for ShuffleWriteOptions {
     fn default() -> Self {
         Self {
             spill_threshold: DEFAULT_SHUFFLE_SPILL_THRESHOLD,
+            fsync: false,
         }
     }
 }
@@ -70,6 +73,12 @@ impl ShuffleWriteOptions {
     #[cfg(test)]
     pub fn with_spill_threshold(mut self, spill_threshold: usize) -> Self {
         self.spill_threshold = spill_threshold;
+        self
+    }
+
+    #[cfg(test)]
+    pub fn with_fsync(mut self, fsync: bool) -> Self {
+        self.fsync = fsync;
         self
     }
 }
@@ -214,9 +223,16 @@ impl ShuffleIndex {
     }
 
     /// Writes the index file atomically.
-    pub fn write(&self, path: &Path) -> std::io::Result<()> {
+    /// If `fsync` is `true`, the file is synced to stable storage before it is renamed.
+    /// The caller is responsible for syncing the directory after the rename.
+    pub fn write(&self, path: &Path, fsync: bool) -> std::io::Result<()> {
         let tmp = path.with_extension("index.tmp");
-        std::fs::write(&tmp, self.encode())?;
+        let mut file = File::create(&tmp)?;
+        file.write_all(&self.encode())?;
+        if fsync {
+            file.sync_all()?;
+        }
+        drop(file);
         std::fs::rename(&tmp, path)
     }
 }
@@ -229,8 +245,10 @@ pub(crate) fn write_test_shuffle_index(
     attempt: usize,
     stats: &[(u64, u64)],
 ) -> std::io::Result<()> {
-    ShuffleIndex::from_channel_stats(stats)
-        .write(&stage_dir.join(format!("shuffle_{partition}_{attempt}.index")))
+    ShuffleIndex::from_channel_stats(stats).write(
+        &stage_dir.join(format!("shuffle_{partition}_{attempt}.index")),
+        false,
+    )
 }
 
 /// A writer wrapper that tracks the number of bytes written.
@@ -346,6 +364,7 @@ struct MapOutputState {
     data_path: PathBuf,
     spill_path: PathBuf,
     spill_threshold: usize,
+    fsync: bool,
     buffers: Vec<Vec<RecordBatch>>,
     buffered_bytes: usize,
     records: Vec<u64>,
@@ -396,8 +415,9 @@ impl MapOutputState {
         let records = std::mem::take(&mut self.records);
         let data_path = self.data_path.clone();
         let spill_path = self.spill_path.clone();
+        let fsync = self.fsync;
         tokio::task::spawn_blocking(move || {
-            write_map_output(&data_path, &spill_path, buffers, spill, records)
+            write_map_output(&data_path, &spill_path, buffers, spill, records, fsync)
         })
         .await
         .map_err(|e| DataFusionError::External(Box::new(e)))??;
@@ -458,6 +478,7 @@ fn write_map_output(
     buffers: Vec<Vec<RecordBatch>>,
     spill: Option<SpillFile>,
     records: Vec<u64>,
+    fsync: bool,
 ) -> Result<()> {
     let tmp_data_path = data_path.with_extension("data.tmp");
     let file = File::create(&tmp_data_path)?;
@@ -480,16 +501,27 @@ fn write_map_output(
         offsets.push(out.position);
     }
     drop(buffers);
-    out.inner
+    let file = out
+        .inner
         .into_inner()
         .map_err(|e| DataFusionError::IoError(e.into_error()))?;
+    if fsync {
+        file.sync_all()?;
+    }
+    drop(file);
     if spill.take().is_some() {
         std::fs::remove_file(spill_path)?;
     }
     std::fs::rename(&tmp_data_path, data_path)?;
     let index = ShuffleIndex::try_new(offsets, records)
         .map_err(|e| DataFusionError::Internal(e.to_string()))?;
-    index.write(&index_path(data_path))?;
+    index.write(&index_path(data_path), fsync)?;
+    if fsync {
+        // Make the renames durable.
+        if let Some(dir) = data_path.parent() {
+            File::open(dir)?.sync_all()?;
+        }
+    }
     Ok(())
 }
 
@@ -517,6 +549,7 @@ impl MapOutputWriter {
                 data_path,
                 spill_path,
                 spill_threshold: options.spill_threshold,
+                fsync: options.fsync,
                 buffers: vec![vec![]; channels],
                 buffered_bytes: 0,
                 records: vec![0; channels],

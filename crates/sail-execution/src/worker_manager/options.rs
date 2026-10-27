@@ -17,4 +17,5 @@ pub struct WorkerLaunchOptions {
     /// configured shuffle directory instead.
     pub shuffle_dir: PathBuf,
     pub shuffle_spill_threshold: usize,
+    pub shuffle_fsync: bool,
 }

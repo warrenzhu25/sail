@@ -27,6 +27,8 @@ pub struct WorkerOptions {
     pub shuffle_dir: PathBuf,
     /// The size of buffered shuffle output of a map task before it is spilled to disk.
     pub shuffle_spill_threshold: usize,
+    /// Whether to sync the shuffle files to stable storage.
+    pub shuffle_fsync: bool,
     pub runtime: RuntimeHandle,
     pub session: SessionContext,
 }
@@ -63,6 +65,7 @@ impl WorkerOptions {
                 ),
             ),
             shuffle_spill_threshold: config.cluster.shuffle_spill_threshold_bytes,
+            shuffle_fsync: config.cluster.shuffle_fsync,
             runtime,
             session,
         }
@@ -89,6 +92,7 @@ impl WorkerOptions {
             rpc_retry_strategy: options.rpc_retry_strategy,
             shuffle_dir: options.shuffle_dir.join(format!("worker_{id}")),
             shuffle_spill_threshold: options.shuffle_spill_threshold,
+            shuffle_fsync: options.shuffle_fsync,
             runtime: runtime.clone(),
             session,
         }
