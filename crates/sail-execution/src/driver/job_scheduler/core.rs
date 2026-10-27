@@ -30,6 +30,7 @@ use crate::job_graph::{
     InputMode, JobGraph, OutputDistribution, OutputMode, Stage, StageInput, TaskPlacement,
 };
 use crate::plan::StageInputExec;
+use crate::stream_manager::shuffle_file::run_blocking_in_place;
 use crate::task::definition::{
     TaskDefinition, TaskInput, TaskInputKey, TaskInputLocator, TaskOutput, TaskOutputDistribution,
     TaskOutputLocator,
@@ -599,14 +600,18 @@ impl JobScheduler {
                 .collect::<Option<Vec<_>>>();
             let stats = match reported {
                 Some(reported) => StageShuffleStats::from_task_stats(channels, reported),
-                None => StageShuffleStats::from_disk(
-                    &options.shuffle_dir,
-                    job_id,
-                    u,
-                    upstream_partitions,
-                    channels,
-                    &upstream_attempts,
-                ),
+                // Reading the index files is blocking I/O, but it is rare since the
+                // statistics are normally reported by the workers.
+                None => run_blocking_in_place(|| {
+                    StageShuffleStats::from_disk(
+                        &options.shuffle_dir,
+                        job_id,
+                        u,
+                        upstream_partitions,
+                        channels,
+                        &upstream_attempts,
+                    )
+                }),
             };
             if stats.missing_index_files > 0 {
                 // The statistics are incomplete (e.g. the shuffle files live on remote workers

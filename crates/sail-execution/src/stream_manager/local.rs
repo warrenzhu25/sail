@@ -246,7 +246,10 @@ impl LocalStream for DiskStream {
             None => MapOutputStatus::Finalized,
         };
         match status {
-            MapOutputStatus::Finalized => read_map_output_channel(&self.data_path, self.channel),
+            MapOutputStatus::Finalized => Ok(read_map_output_channel(
+                self.data_path.clone(),
+                self.channel,
+            )),
             MapOutputStatus::Failed(e) => Err(ExecutionError::InternalError(format!(
                 "shuffle output failed for {}: {e}",
                 self.data_path.display()
@@ -271,10 +274,7 @@ impl LocalStream for DiskStream {
                     };
                     match result {
                         Ok(MapOutputStatus::Finalized) => {
-                            match read_map_output_channel(&data_path, channel) {
-                                Ok(x) => x,
-                                Err(e) => error(e.to_string()),
-                            }
+                            read_map_output_channel(data_path.clone(), channel)
                         }
                         Ok(MapOutputStatus::Failed(e)) => error(format!(
                             "shuffle output failed for {}: {e}",
@@ -397,6 +397,25 @@ mod tests {
         out
     }
 
+    /// Returns whether the source (or reading from it) fails before returning any data.
+    async fn read_error(source: ExecutionResult<TaskStreamSource>) -> bool {
+        match source {
+            Ok(mut source) => matches!(source.next().await, Some(Err(_))),
+            Err(_) => true,
+        }
+    }
+
+    /// Waits until the condition holds, which may depend on background work.
+    async fn wait_until(condition: impl Fn() -> bool) {
+        for _ in 0..500 {
+            if condition() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("condition not met in time");
+    }
+
     /// Writes the given batches for each channel, interleaving writes across channels.
     async fn write_channels(streams: &mut [DiskStream], data: &[Vec<RecordBatch>]) -> Result<()> {
         let mut sinks = streams
@@ -462,9 +481,7 @@ mod tests {
             let mut existing = DiskStream::existing(data_path.clone(), c);
             assert_eq!(&read_all(existing.subscribe().unwrap()).await, batches);
         }
-        assert!(DiskStream::existing(data_path.clone(), channels)
-            .subscribe()
-            .is_err());
+        assert!(read_error(DiskStream::existing(data_path.clone(), channels).subscribe()).await);
 
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())
@@ -628,7 +645,7 @@ mod tests {
         assert!(source.next().await.unwrap().is_err());
         assert!(streams[1].subscribe().is_err());
         // The partial output is cleaned up.
-        assert!(list_files(&dir).is_empty());
+        wait_until(|| list_files(&dir).is_empty()).await;
 
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())
@@ -645,8 +662,37 @@ mod tests {
 
         // Simulate the shuffle output being cleaned up.
         std::fs::remove_dir_all(&dir)?;
-        assert!(streams[0].subscribe().is_err());
-        assert!(DiskStream::existing(data_path, 0).subscribe().is_err());
+        assert!(read_error(streams[0].subscribe()).await);
+        assert!(read_error(DiskStream::existing(data_path, 0).subscribe()).await);
+        Ok(())
+    }
+
+    /// Reading a channel happens lazily in blocking tasks, which works on a single-threaded
+    /// runtime, returns all batches in order across multiple read chunks, and stops
+    /// reading when the stream is dropped.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_disk_stream_read_in_blocking_tasks() -> Result<()> {
+        let dir = temp_dir("blocking_read");
+        let data_path = dir.join("shuffle_0_0.data");
+        // There are more batches than what is read in a single blocking operation.
+        let data = vec![(0..100).map(|i| batch(vec![i, i + 1])).collect::<Vec<_>>()];
+        let mut streams = create_streams(&data_path, 1, 1000);
+        write_channels(&mut streams, &data).await?;
+
+        // Subscribing to a missing map output does not touch the file system,
+        // and the error is returned when the stream is polled.
+        let mut missing = DiskStream::existing(dir.join("shuffle_9_9.data"), 0);
+        let mut source = missing.subscribe().unwrap();
+        assert!(source.next().await.unwrap().is_err());
+        assert!(source.next().await.is_none());
+
+        assert_eq!(read_all(streams[0].subscribe().unwrap()).await, data[0]);
+
+        let mut source = streams[0].subscribe().unwrap();
+        assert_eq!(source.next().await.unwrap().unwrap(), data[0][0]);
+        drop(source);
+
+        let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     }
 
@@ -731,7 +777,7 @@ mod tests {
         );
 
         manager.remove_local_streams(JobId::from(1), Some(2));
-        assert!(!stage_dir.exists());
+        wait_until(|| !stage_dir.exists()).await;
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     }

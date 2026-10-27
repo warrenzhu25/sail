@@ -216,7 +216,11 @@ async fn supervise(
         }
     };
     if let Some(pid) = pid {
-        remove_worker_shuffle_dirs(&shuffle_dir, id, pid);
+        // Removing the directories may block for a long time if there are large files.
+        let _ = tokio::task::spawn_blocking(move || {
+            remove_worker_shuffle_dirs(&shuffle_dir, id, pid);
+        })
+        .await;
     }
     let _ = exit.send(Some(description));
 }
@@ -447,10 +451,17 @@ exec sleep 1000
         assert!(wait_for(|| worker_dirs(&shuffle_dir, 1).is_empty()).await);
         assert!(!is_process_alive(pid1));
         assert!(is_process_alive(pid2));
-        assert_eq!(manager.worker_pids().await.len(), 1);
 
+        // The exit is published after the shuffle directory is removed.
         let exit = manager.wait_for_worker_exit(1.into()).await;
         assert!(exit.as_deref().is_some_and(|x| x.contains("SIGKILL")));
+        for _ in 0..100 {
+            if manager.worker_pids().await.len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(manager.worker_pids().await.len(), 1);
 
         // A worker process that exits unexpectedly is detected and cleaned up.
         // SAFETY: Sending a signal to a child process is safe.

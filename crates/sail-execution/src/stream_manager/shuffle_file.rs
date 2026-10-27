@@ -20,6 +20,7 @@
 //! copying the spilled byte ranges of each channel followed by the remaining
 //! in-memory batches of that channel.
 
+use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Take, Write};
 use std::path::{Path, PathBuf};
@@ -34,7 +35,7 @@ use tokio::sync::watch;
 
 use crate::error::{ExecutionError, ExecutionResult};
 use crate::id::JobId;
-use crate::stream::error::TaskStreamError;
+use crate::stream::error::{TaskStreamError, TaskStreamResult};
 use crate::stream::reader::TaskStreamSource;
 
 /// The buffer size for reading and writing shuffle files.
@@ -336,12 +337,15 @@ impl MapOutputState {
     }
 
     async fn spill(&mut self) -> Result<()> {
-        let mut spill = match self.spill.take() {
-            Some(x) => x,
-            None => SpillFile::create(&self.spill_path, self.closed.len())?,
-        };
+        let spill = self.spill.take();
+        let spill_path = self.spill_path.clone();
+        let channels = self.closed.len();
         let buffers = self.take_buffers();
         let spill = tokio::task::spawn_blocking(move || {
+            let mut spill = match spill {
+                Some(x) => x,
+                None => SpillFile::create(&spill_path, channels)?,
+            };
             spill.spill(&buffers)?;
             Ok::<_, DataFusionError>(spill)
         })
@@ -371,10 +375,44 @@ impl Drop for MapOutputState {
     fn drop(&mut self) {
         if !self.finalized {
             // The map task did not complete, so we clean up the partial output.
-            let _ = std::fs::remove_file(&self.spill_path);
-            let _ = std::fs::remove_file(self.data_path.with_extension("data.tmp"));
-            let _ = std::fs::remove_file(index_path(&self.data_path).with_extension("index.tmp"));
+            // The spill file may be large, so it is removed in the background.
+            let paths = [
+                self.spill_path.clone(),
+                self.data_path.with_extension("data.tmp"),
+                index_path(&self.data_path).with_extension("index.tmp"),
+            ];
+            let spill = self.spill.take();
+            run_blocking_in_background(move || {
+                drop(spill);
+                for path in paths {
+                    let _ = std::fs::remove_file(path);
+                }
+            });
         }
+    }
+}
+
+/// Runs blocking work (e.g. file system operations) in the background,
+/// off the asynchronous worker threads if there is a Tokio runtime.
+/// The work is run inline if there is no Tokio runtime.
+pub(crate) fn run_blocking_in_background(f: impl FnOnce() + Send + 'static) {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            let _ = handle.spawn_blocking(f);
+        }
+        Err(_) => f(),
+    }
+}
+
+/// Runs blocking work that the caller must wait for. If the caller runs on a worker
+/// thread of a multi-threaded Tokio runtime, the runtime is informed so that other
+/// tasks scheduled on this thread can be moved to other worker threads.
+pub(crate) fn run_blocking_in_place<R>(f: impl FnOnce() -> R) -> R {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
     }
 }
 
@@ -563,11 +601,18 @@ impl RegionStreamState {
     }
 }
 
-/// Reads the data of one channel of a completed map output.
-pub(crate) fn read_map_output_channel(
+/// The maximum number of record batches decoded in one blocking read operation.
+const SHUFFLE_READ_MAX_BATCHES: usize = 16;
+
+/// The maximum (in-memory) size of record batches decoded in one blocking read operation.
+const SHUFFLE_READ_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+/// Opens one channel of a completed map output for reading.
+/// Returns `None` if the channel is empty.
+fn open_map_output_channel(
     data_path: &Path,
     channel: usize,
-) -> ExecutionResult<TaskStreamSource> {
+) -> ExecutionResult<Option<RegionStreamState>> {
     let index = ShuffleIndex::read(&index_path(data_path))?;
     let (start, end) = index.channel_range(channel).ok_or_else(|| {
         ExecutionError::InternalError(format!(
@@ -593,24 +638,111 @@ pub(crate) fn read_map_output_channel(
         )));
     }
     if start == end {
-        return Ok(Box::pin(futures::stream::empty()));
+        return Ok(None);
     }
     file.seek(SeekFrom::Start(start))?;
     let reader = BufReader::with_capacity(
         SHUFFLE_FILE_BUFFER_SIZE.min((end - start) as usize),
         file.take(end - start),
     );
-    let state = RegionStreamState {
+    Ok(Some(RegionStreamState {
         region: RegionReader(Arc::new(Mutex::new(reader))),
         current: None,
         done: false,
-    };
-    let stream = futures::stream::unfold(state, |mut state| async move {
-        let batch = state.next_batch()?;
-        Some((
-            batch.map_err(|e| TaskStreamError::Unknown(e.to_string())),
-            state,
-        ))
-    });
-    Ok(Box::pin(stream))
+    }))
+}
+
+/// The blocking reader of one channel of a completed map output.
+enum ChannelReader {
+    Unopened { data_path: PathBuf, channel: usize },
+    Open(RegionStreamState),
+    Done,
+}
+
+impl ChannelReader {
+    fn is_done(&self) -> bool {
+        matches!(self, ChannelReader::Done)
+    }
+
+    /// Reads the next few record batches, which performs blocking I/O.
+    /// The reader is done after the channel is exhausted or after the first error.
+    fn read_chunk(&mut self) -> Vec<TaskStreamResult<RecordBatch>> {
+        if let ChannelReader::Unopened { data_path, channel } = self {
+            match open_map_output_channel(data_path, *channel) {
+                Ok(Some(state)) => *self = ChannelReader::Open(state),
+                Ok(None) => {
+                    *self = ChannelReader::Done;
+                    return vec![];
+                }
+                Err(e) => {
+                    *self = ChannelReader::Done;
+                    return vec![Err(TaskStreamError::Unknown(e.to_string()))];
+                }
+            }
+        }
+        let ChannelReader::Open(state) = self else {
+            return vec![];
+        };
+        let mut out = vec![];
+        let mut bytes = 0;
+        let mut done = false;
+        while out.len() < SHUFFLE_READ_MAX_BATCHES && bytes < SHUFFLE_READ_MAX_BYTES {
+            match state.next_batch() {
+                Some(Ok(batch)) => {
+                    bytes += batch.get_array_memory_size();
+                    out.push(Ok(batch));
+                }
+                Some(Err(e)) => {
+                    out.push(Err(TaskStreamError::Unknown(e.to_string())));
+                    done = true;
+                    break;
+                }
+                None => {
+                    done = true;
+                    break;
+                }
+            }
+        }
+        if done {
+            *self = ChannelReader::Done;
+        }
+        out
+    }
+}
+
+/// Reads the data of one channel of a completed map output.
+///
+/// The returned stream is lazy. Opening the files and reading and decoding the data
+/// happen in blocking tasks, off the asynchronous worker threads, and only when the
+/// stream is polled, so the consumer controls the pace of reading (backpressure).
+/// Errors (e.g. missing shuffle output) are returned as stream items.
+pub(crate) fn read_map_output_channel(data_path: PathBuf, channel: usize) -> TaskStreamSource {
+    let reader = ChannelReader::Unopened { data_path, channel };
+    let stream = futures::stream::unfold(
+        (Some(reader), VecDeque::new()),
+        |(mut reader, mut pending)| async move {
+            loop {
+                if let Some(item) = pending.pop_front() {
+                    return Some((item, (reader, pending)));
+                }
+                let mut r = reader.take().filter(|r| !r.is_done())?;
+                match tokio::task::spawn_blocking(move || {
+                    let chunk = r.read_chunk();
+                    (r, chunk)
+                })
+                .await
+                {
+                    Ok((r, chunk)) => {
+                        reader = Some(r);
+                        pending.extend(chunk);
+                    }
+                    Err(e) => {
+                        let error = TaskStreamError::Unknown(format!("shuffle read failed: {e}"));
+                        return Some((Err(error), (None, pending)));
+                    }
+                }
+            }
+        },
+    );
+    Box::pin(stream)
 }

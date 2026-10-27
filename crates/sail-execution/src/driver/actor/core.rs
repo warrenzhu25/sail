@@ -144,10 +144,19 @@ impl Actor for DriverActor {
         }
         // Remove the shuffle directory of this driver instance, including the
         // directories of local workers that may not have been cleaned up.
-        if self.options.shuffle_dir.exists() {
-            if let Err(e) = std::fs::remove_dir_all(&self.options.shuffle_dir) {
-                warn!("failed to remove shuffle directory: {e}");
+        let shuffle_dir = self.options.shuffle_dir.clone();
+        let removed = tokio::task::spawn_blocking(move || {
+            if shuffle_dir.exists() {
+                std::fs::remove_dir_all(&shuffle_dir)
+            } else {
+                Ok(())
             }
+        })
+        .await;
+        match removed {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => warn!("failed to remove shuffle directory: {e}"),
+            Err(e) => warn!("failed to remove shuffle directory: {e}"),
         }
         if let Some(history) = self.history.take() {
             let _ = history.send(self.build_history());

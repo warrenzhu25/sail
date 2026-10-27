@@ -19,7 +19,7 @@ use crate::stream::writer::{LocalStreamStorage, TaskStreamSink};
 use crate::stream_manager::local::{DiskStream, LocalStream, MemoryStream};
 use crate::stream_manager::options::StreamManagerOptions;
 use crate::stream_manager::shuffle_file::{
-    MapOutputKey, MapOutputWriter, DEFAULT_SHUFFLE_SPILL_THRESHOLD,
+    run_blocking_in_background, MapOutputKey, MapOutputWriter, DEFAULT_SHUFFLE_SPILL_THRESHOLD,
 };
 use crate::stream_manager::{LocalStreamState, StreamManager, StreamManagerMessage};
 
@@ -182,27 +182,27 @@ impl StreamManager {
     }
 
     pub fn remove_local_streams(&mut self, job_id: JobId, stage: Option<usize>) {
-        if let Some(stage) = stage {
+        let dir = if let Some(stage) = stage {
             self.local_streams
                 .retain(|key, _| key.job_id != job_id || key.stage != stage);
             self.map_outputs
                 .retain(|key, _| key.job_id != job_id || key.stage != stage);
-            let stage_dir = self
-                .options
+            self.options
                 .shuffle_dir
                 .join(format!("{job_id}"))
-                .join(format!("{stage}"));
-            if stage_dir.exists() {
-                let _ = std::fs::remove_dir_all(stage_dir);
-            }
+                .join(format!("{stage}"))
         } else {
             self.local_streams.retain(|key, _| key.job_id != job_id);
             self.map_outputs.retain(|key, _| key.job_id != job_id);
-            let job_dir = self.options.shuffle_dir.join(format!("{job_id}"));
-            if job_dir.exists() {
-                let _ = std::fs::remove_dir_all(job_dir);
+            self.options.shuffle_dir.join(format!("{job_id}"))
+        };
+        // Removing the directory may take a long time if there are large files,
+        // so we do not block the caller (an actor) on it.
+        run_blocking_in_background(move || {
+            if dir.exists() {
+                let _ = std::fs::remove_dir_all(dir);
             }
-        }
+        });
     }
 
     pub fn remove_remote_streams<T>(
@@ -243,9 +243,13 @@ impl StreamManager {
     pub async fn stop(&mut self) {
         self.local_streams.clear();
         self.map_outputs.clear();
-        if self.options.shuffle_dir.exists() {
-            let _ = std::fs::remove_dir_all(&self.options.shuffle_dir);
-        }
+        let shuffle_dir = self.options.shuffle_dir.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            if shuffle_dir.exists() {
+                let _ = std::fs::remove_dir_all(&shuffle_dir);
+            }
+        })
+        .await;
     }
 
     /// Returns the shared writer for the disk-backed output of the map task.
