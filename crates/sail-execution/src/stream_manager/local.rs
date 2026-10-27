@@ -386,7 +386,7 @@ impl Drop for DiskStreamSink {
 
 #[cfg(test)]
 mod tests {
-    #![expect(clippy::unwrap_used)]
+    #![expect(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use std::path::Path;
 
@@ -850,9 +850,9 @@ mod tests {
         }
         let mut max_reserved = 0;
         for i in 0..10 {
-            for (c, sink) in sinks.iter_mut().enumerate() {
+            for (sink, batches) in sinks.iter_mut().zip(data.iter()) {
                 assert!(matches!(
-                    sink.write(Ok(data[c][i].clone())).await,
+                    sink.write(Ok(batches[i].clone())).await,
                     TaskStreamSinkState::Ok
                 ));
                 max_reserved = max_reserved.max(pool.reserved());

@@ -454,7 +454,8 @@ impl Drop for MapOutputState {
 pub(crate) fn run_blocking_in_background(f: impl FnOnce() + Send + 'static) {
     match tokio::runtime::Handle::try_current() {
         Ok(handle) => {
-            let _ = handle.spawn_blocking(f);
+            // The task is detached; the join handle is not needed.
+            drop(handle.spawn_blocking(f));
         }
         Err(_) => f(),
     }
