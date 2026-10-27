@@ -194,24 +194,39 @@ pub(crate) struct DiskStream {
     /// which does not keep the writer alive.
     writer_ref: Weak<MapOutputWriter>,
     status: Option<watch::Receiver<MapOutputStatus>>,
-    senders: Vec<mpsc::Sender<TaskStreamResult<RecordBatch>>>,
 }
 
 impl DiskStream {
     /// Creates a stream for a channel that will be written via the shared map output writer.
+    ///
+    /// The `senders` belong to readers that subscribed to the channel before it was
+    /// created. Like any other reader, they only receive data after the map output is
+    /// finalized, and they receive an error (without any data) if the map task fails.
     pub fn new(
         data_path: PathBuf,
         channel: usize,
         writer: Arc<MapOutputWriter>,
         senders: Vec<mpsc::Sender<TaskStreamResult<RecordBatch>>>,
     ) -> Self {
+        let status = writer.subscribe_status();
+        for tx in senders {
+            let mut source =
+                finalized_map_output_source(status.clone(), data_path.clone(), channel);
+            tokio::spawn(async move {
+                while let Some(item) = source.next().await {
+                    // The receiver is gone if it no longer needs the data.
+                    if tx.send(item).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
         Self {
             data_path,
             channel,
-            status: Some(writer.subscribe_status()),
+            status: Some(status),
             writer_ref: Arc::downgrade(&writer),
             writer: Some(writer),
-            senders,
         }
     }
 
@@ -223,7 +238,6 @@ impl DiskStream {
             writer: None,
             writer_ref: Weak::new(),
             status: None,
-            senders: vec![],
         }
     }
 }
@@ -236,7 +250,6 @@ impl LocalStream for DiskStream {
         Ok(Box::new(DiskStreamSink {
             writer,
             channel: self.channel,
-            senders: std::mem::take(&mut self.senders),
             closed: false,
         }))
     }
@@ -274,45 +287,55 @@ impl LocalStream for DiskStream {
             MapOutputStatus::Writing => {
                 // The map output is not complete yet, so we wait for it to be finalized
                 // before reading the data. We never return partial data.
-                let mut status = self.status.clone().ok_or_else(|| {
+                let status = self.status.clone().ok_or_else(|| {
                     ExecutionError::InternalError("missing map output status".to_string())
                 })?;
-                let data_path = self.data_path.clone();
-                let channel = self.channel;
-                let source = async move {
-                    let result = status
-                        .wait_for(|x| *x != MapOutputStatus::Writing)
-                        .await
-                        .map(|x| x.clone());
-                    let error = |m: String| -> TaskStreamSource {
-                        Box::pin(futures::stream::once(async move {
-                            Err(TaskStreamError::Unknown(m))
-                        }))
-                    };
-                    match result {
-                        Ok(MapOutputStatus::Finalized) => {
-                            read_map_output_channel(data_path.clone(), channel)
-                        }
-                        Ok(MapOutputStatus::Failed(e)) => error(format!(
-                            "shuffle output failed for {}: {e}",
-                            data_path.display()
-                        )),
-                        Ok(MapOutputStatus::Writing) | Err(_) => error(format!(
-                            "shuffle output was not completed: {}",
-                            data_path.display()
-                        )),
-                    }
-                };
-                Ok(Box::pin(futures::stream::once(source).flatten()))
+                Ok(finalized_map_output_source(
+                    status,
+                    self.data_path.clone(),
+                    self.channel,
+                ))
             }
         }
     }
 }
 
+/// Returns a source that waits for the map output to be finalized and then reads
+/// the channel from disk. The source returns an error without any data if the map
+/// output fails or is aborted, or if the writer is dropped without finalizing it.
+fn finalized_map_output_source(
+    mut status: watch::Receiver<MapOutputStatus>,
+    data_path: PathBuf,
+    channel: usize,
+) -> TaskStreamSource {
+    let source = async move {
+        let result = status
+            .wait_for(|x| *x != MapOutputStatus::Writing)
+            .await
+            .map(|x| x.clone());
+        let error = |m: String| -> TaskStreamSource {
+            Box::pin(futures::stream::once(async move {
+                Err(TaskStreamError::Unknown(m))
+            }))
+        };
+        match result {
+            Ok(MapOutputStatus::Finalized) => read_map_output_channel(data_path, channel),
+            Ok(MapOutputStatus::Failed(e)) => error(format!(
+                "shuffle output failed for {}: {e}",
+                data_path.display()
+            )),
+            Ok(MapOutputStatus::Writing) | Err(_) => error(format!(
+                "shuffle output was not completed: {}",
+                data_path.display()
+            )),
+        }
+    };
+    Box::pin(futures::stream::once(source).flatten())
+}
+
 struct DiskStreamSink {
     writer: Arc<MapOutputWriter>,
     channel: usize,
-    senders: Vec<mpsc::Sender<TaskStreamResult<RecordBatch>>>,
     /// Whether the sink has been closed successfully.
     closed: bool,
 }
@@ -329,22 +352,9 @@ impl TaskStreamSink for DiskStreamSink {
             }
         };
 
-        if let Err(e) = self.writer.write(self.channel, batch.clone()).await {
+        if let Err(e) = self.writer.write(self.channel, batch).await {
             return TaskStreamSinkState::Error(e);
         }
-
-        // Forward the batch to any waiting receivers. The batch must not be dropped
-        // when the channel is full, so we wait for capacity. Receivers that have gone
-        // away are removed since they no longer need the data.
-        let mut i = 0;
-        while i < self.senders.len() {
-            if self.senders[i].send(Ok(batch.clone())).await.is_err() {
-                self.senders.swap_remove(i);
-            } else {
-                i += 1;
-            }
-        }
-
         TaskStreamSinkState::Ok
     }
 
@@ -355,8 +365,6 @@ impl TaskStreamSink for DiskStreamSink {
     async fn close(mut self: Box<Self>) -> Result<()> {
         self.writer.close(self.channel).await?;
         self.closed = true;
-        // Drop senders to close channels for any pending receivers
-        self.senders.clear();
         Ok(())
     }
 }
@@ -639,14 +647,55 @@ mod tests {
         let mut sink = stream.publish().unwrap();
         assert!(stream.publish().is_err());
         sink.write(Ok(b.clone())).await;
+        // The pending receiver does not get any data before the map output is finalized.
+        tokio::task::yield_now().await;
+        assert!(rx.try_recv().is_err());
         sink.close().await?;
 
-        // Receiver from pending senders should get the batch and channel close
+        // The pending receiver reads the finalized output from disk.
         assert_eq!(rx.recv().await.unwrap().unwrap(), b);
         assert!(rx.recv().await.is_none());
 
         // Subsequent subscribers can still read from disk
         assert_eq!(read_all(stream.subscribe().unwrap()).await, vec![b]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// A reader that subscribed before the channel was created never sees partial data
+    /// if the map task fails after writing some data.
+    #[tokio::test]
+    async fn test_disk_stream_pending_sender_with_failed_writer() -> Result<()> {
+        let dir = temp_dir("senders_failed");
+        let data_path = dir.join("shuffle_0_0.data");
+        let writer = Arc::new(MapOutputWriter::try_new(
+            data_path.clone(),
+            2,
+            ShuffleWriteOptions::default(),
+        )?);
+        let (tx, rx) = mpsc::channel(16);
+        let mut stream0 = DiskStream::new(data_path.clone(), 0, writer.clone(), vec![tx]);
+        let mut stream1 = DiskStream::new(data_path.clone(), 1, writer, vec![]);
+        let mut sink0 = stream0.publish().unwrap();
+        let sink1 = stream1.publish().unwrap();
+        for i in 0..20 {
+            assert!(matches!(
+                sink0.write(Ok(batch(vec![i]))).await,
+                TaskStreamSinkState::Ok
+            ));
+        }
+        sink0.close().await?;
+        // The map task fails before closing the other channel.
+        drop(sink1);
+
+        let mut source: TaskStreamSource = Box::pin(ReceiverStream::new(rx));
+        let mut items = vec![];
+        while let Some(item) = source.next().await {
+            items.push(item);
+        }
+        assert_eq!(items.len(), 1);
+        assert!(items[0].is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())
