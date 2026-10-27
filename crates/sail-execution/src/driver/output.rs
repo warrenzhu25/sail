@@ -47,6 +47,13 @@ impl JobOutputManager {
             sender: self.sender.clone(),
         }
     }
+
+    /// Creates a job output manager whose output is discarded.
+    #[cfg(test)]
+    pub fn discarding() -> Self {
+        let (sender, _) = mpsc::channel(1);
+        Self { sender }
+    }
 }
 
 pub enum JobOutputItem {

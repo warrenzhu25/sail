@@ -120,6 +120,12 @@ impl JobScheduler {
     /// when a consumer task is re-run (e.g. because its own output was lost) and fails
     /// to fetch the output of the inactive stage.
     ///
+    /// Only stages whose output has been cleaned up become inactive while the job is
+    /// running. The blocking (disk) shuffle output is kept until the job completes
+    /// (see [`Self::clean_up_job_by_stage`]), so a blocking stage stays active and only
+    /// the given partition is invalidated and recomputed. The output of an inactive
+    /// (pipelined) stage is gone for all partitions, so all of them are recomputed.
+    ///
     /// Returns `true` if the attempt was invalidated.
     pub fn invalidate_task_output(
         &mut self,
@@ -1470,6 +1476,75 @@ mod tests {
                 expect_cleanup,
                 "mode: {mode}"
             );
+        }
+        Ok(())
+    }
+
+    /// When a consumer fails to fetch the output of a finished stage, the blocking
+    /// shuffle output of the other partitions is still available (it is kept until the
+    /// job completes), so only the lost partition is recomputed. The pipelined output of
+    /// an inactive stage has been cleaned up, so all the partitions are recomputed.
+    #[test]
+    fn test_invalidate_task_output_after_consumers_succeeded(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use crate::driver::output::JobOutputManager;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+        for mode in [OutputMode::Blocking, OutputMode::Pipelined] {
+            let repartition = Arc::new(RepartitionExec::try_new(
+                Arc::new(EmptyExec::new(schema.clone()).with_partitions(3)),
+                Partitioning::RoundRobinBatch(2),
+            )?);
+            let graph = JobGraph::try_new_with_mode(repartition, mode)?;
+            let job_id = JobId::from(103);
+            let state = JobState::Running {
+                output: JobOutputManager::discarding(),
+                context: Arc::new(TaskContext::default()),
+            };
+            let mut job = JobDescriptor::try_new(graph, state)?;
+            assert_eq!(job.stages[0].tasks.len(), 3, "mode: {mode}");
+            for s in 0..job.stages.len() {
+                succeed_all(&mut job, s);
+            }
+            let _ = JobScheduler::clean_up_job_by_stage(job_id, &mut job);
+            let mut scheduler = JobScheduler::new(JobSchedulerOptions::default());
+            scheduler.jobs.insert(job_id, job);
+            let key = TaskKey {
+                job_id,
+                stage: 0,
+                partition: 1,
+                attempt: 0,
+            };
+            let lost = |scheduler: &JobScheduler| -> Vec<bool> {
+                scheduler.jobs[&job_id].stages[0]
+                    .tasks
+                    .iter()
+                    .map(|t| matches!(t.attempts[0].state, TaskState::Failed))
+                    .collect()
+            };
+
+            match mode {
+                OutputMode::Blocking => {
+                    // A lost worker invalidates the output, whether a consumer needs it or not.
+                    assert!(scheduler.invalidate_task_output(&key, "lost".to_string(), false));
+                    assert_eq!(lost(&scheduler), vec![false, true, false]);
+                    assert!(scheduler.invalidate_task_output(&key, "fetch".to_string(), true));
+                    assert_eq!(lost(&scheduler), vec![false, true, false]);
+                    let job = &scheduler.jobs[&job_id];
+                    assert!(matches!(job.stages[0].state, StageState::Active));
+                    assert!(job.stages[0].tasks[1].attempts[0].recoverable_failure);
+                }
+                OutputMode::Pipelined => {
+                    // The output of the inactive stage is no longer needed.
+                    assert!(!scheduler.invalidate_task_output(&key, "lost".to_string(), false));
+                    assert_eq!(lost(&scheduler), vec![false, false, false]);
+                    // A consumer needs the output again, which has been cleaned up.
+                    assert!(scheduler.invalidate_task_output(&key, "fetch".to_string(), true));
+                    assert_eq!(lost(&scheduler), vec![true, true, true]);
+                    let job = &scheduler.jobs[&job_id];
+                    assert!(matches!(job.stages[0].state, StageState::Active));
+                }
+            }
         }
         Ok(())
     }
