@@ -4,6 +4,7 @@ use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion::common::{plan_datafusion_err, JoinType, Result};
 use datafusion::physical_expr::Partitioning;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+use datafusion::physical_plan::coop::CooperativeExec;
 use datafusion::physical_plan::joins::{
     CrossJoinExec, HashJoinExec, NestedLoopJoinExec, PartitionMode, PiecewiseMergeJoinExec,
 };
@@ -40,6 +41,21 @@ impl JobGraph {
             stages: vec![],
             schema: plan.schema(),
         };
+        if is_driver_only_plan(&plan) {
+            // Run the entire plan in a single driver stage. Otherwise, the job would have
+            // a worker stage that forwards the driver stage output, and the loss of
+            // the worker would cause the driver stage (e.g. a catalog command with side
+            // effects such as dropping a view) to be executed again.
+            graph.stages.push(Stage {
+                inputs: vec![],
+                plan,
+                group: String::new(),
+                mode: OutputMode::Pipelined,
+                distribution: OutputDistribution::RoundRobin { channels: 1 },
+                placement: TaskPlacement::Driver,
+            });
+            return Ok(graph);
+        }
         let last = build_job_graph(plan, PartitionUsage::Once, &mut graph, shuffle_mode)?;
         let (last, inputs) = rewrite_inputs(last)?;
         graph.stages.push(Stage {
@@ -52,6 +68,16 @@ impl JobGraph {
         });
         Ok(graph)
     }
+}
+
+/// Returns whether the plan only consists of a node that must run on the driver,
+/// optionally wrapped in nodes that do not affect the output.
+fn is_driver_only_plan(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    let mut node = plan;
+    while let Some(coop) = node.as_any().downcast_ref::<CooperativeExec>() {
+        node = coop.input();
+    }
+    node.as_any().is::<SystemTableExec>() || node.as_any().is::<CatalogCommandExec>()
 }
 
 fn ensure_single_input_partition_for_global_limit(
@@ -382,4 +408,37 @@ fn create_driver_stage(
         StageInput::new(s, InputMode::Forward),
         plan.properties().clone(),
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::physical_plan::empty::EmptyExec;
+    use sail_catalog::command::CatalogCommand;
+
+    use super::*;
+
+    #[test]
+    fn test_driver_only_plan_runs_in_single_driver_stage() -> ExecutionResult<()> {
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Utf8, false)]));
+        let command: Arc<dyn ExecutionPlan> = Arc::new(CatalogCommandExec::new(
+            CatalogCommand::CurrentCatalog,
+            schema.clone(),
+        ));
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(CooperativeExec::new(command));
+        let graph = JobGraph::try_new_with_mode(plan, OutputMode::Blocking)?;
+        assert_eq!(graph.stages().len(), 1);
+        let stage = &graph.stages()[0];
+        assert_eq!(stage.placement, TaskPlacement::Driver);
+        assert!(stage.inputs.is_empty());
+        assert!(matches!(stage.mode, OutputMode::Pipelined));
+
+        // Other plans still end with a worker stage.
+        let plan: Arc<dyn ExecutionPlan> =
+            Arc::new(CooperativeExec::new(Arc::new(EmptyExec::new(schema))));
+        let graph = JobGraph::try_new_with_mode(plan, OutputMode::Blocking)?;
+        assert_eq!(graph.stages().len(), 1);
+        assert_eq!(graph.stages()[0].placement, TaskPlacement::Worker);
+        Ok(())
+    }
 }
