@@ -121,9 +121,13 @@ impl DriverActor {
         {
             self.task_assigner.track_worker_failed_to_start();
             self.scale_up_workers(ctx);
-        } else if self.task_assigner.is_worker_active(worker_id) {
-            warn!("worker {worker_id} is lost: {reason}");
-            self.mark_worker_lost(ctx, worker_id, &reason);
+        } else {
+            // The worker is gone, so there is no need to ask it to stop.
+            self.worker_pool.fail_worker_if_running(worker_id, &reason);
+            if self.task_assigner.is_worker_active(worker_id) {
+                warn!("worker {worker_id} is lost: {reason}");
+                self.mark_worker_lost(ctx, worker_id, &reason);
+            }
         }
         ActorAction::Continue
     }

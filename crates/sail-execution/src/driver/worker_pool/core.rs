@@ -260,6 +260,20 @@ impl WorkerPool {
         }
     }
 
+    /// Marks a running worker as failed without contacting the worker,
+    /// which is used when the worker is known to have exited.
+    pub fn fail_worker_if_running(&mut self, worker_id: WorkerId, message: &str) {
+        let Some(worker) = self.workers.get_mut(&worker_id) else {
+            warn!("worker {worker_id} not found");
+            return;
+        };
+        if matches!(&worker.state, WorkerState::Running { .. }) {
+            worker.state = WorkerState::Failed;
+            worker.stopped_at = Some(Utc::now());
+            worker.messages.push(message.to_string());
+        }
+    }
+
     pub fn get_worker_last_update(&mut self, worker_id: WorkerId) -> Option<Instant> {
         let Some(worker) = self.workers.get_mut(&worker_id) else {
             warn!("worker {worker_id} not found");
