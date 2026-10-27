@@ -1,6 +1,8 @@
+mod env;
 mod kubernetes;
 mod local;
 mod options;
+mod process;
 
 pub(crate) use options::WorkerLaunchOptions;
 
@@ -16,6 +18,17 @@ pub trait WorkerManager: Send + Sync + 'static {
         options: WorkerLaunchOptions,
     ) -> ExecutionResult<()>;
 
+    /// Stop a single worker on a best-effort basis.
+    /// The driver may have attempted to send a shutdown event to the worker
+    /// at this point, so the worker manager should give the worker a chance to
+    /// exit gracefully before forcefully terminating it.
+    /// This is also called for workers that are considered lost, which may still be
+    /// running but unresponsive.
+    /// The default implementation does nothing and relies on the worker to exit on its own.
+    async fn stop_worker(&self, _id: WorkerId) -> ExecutionResult<()> {
+        Ok(())
+    }
+
     /// Stop all workers on a best-effort basis.
     /// The driver have attempted to sent shutdown events to all workers
     /// at this point, but it is unknown whether the events have been received.
@@ -29,3 +42,4 @@ pub trait WorkerManager: Send + Sync + 'static {
 
 pub use kubernetes::{KubernetesWorkerManager, KubernetesWorkerManagerOptions};
 pub use local::LocalWorkerManager;
+pub use process::{ProcessWorkerManager, ProcessWorkerManagerOptions};

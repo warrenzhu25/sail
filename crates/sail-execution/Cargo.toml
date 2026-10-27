@@ -45,6 +45,9 @@ readonly = { workspace = true }
 indexmap = { workspace = true }
 chrono = { workspace = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }
+
 [build-dependencies]
 prost-build = { workspace = true }
 tonic-prost-build = { workspace = true }

@@ -2,11 +2,17 @@
   type: string
   default: "local"
   description: |
-    The running mode for Sail. Valid values are `local`, `local-cluster`, and `kubernetes-cluster`.
+    The running mode for Sail. Valid values are `local`, `local-cluster`, `local-process-cluster`,
+    and `kubernetes-cluster`.
     
     * In `local` mode, Sail runs in a single process, while query execution is still parallelized via threads.
     * In `local-cluster` mode, Sail starts a cluster within a single process. The driver and workers run on different threads
       in the same process and communicate with each other via RPC.
+    * In `local-process-cluster` mode (experimental), Sail starts a cluster on the local host where each worker
+      runs as a separate `sail worker` OS process. The driver and workers communicate with each other via RPC.
+      This mode requires Sail to run as the standalone `sail` executable, which is used to launch the workers.
+      Workers are configured via environment variables in the same way as Kubernetes worker pods, and they
+      inherit the environment of the driver process.
     * In `kubernetes-cluster` mode, Sail manages a cluster in Kubernetes. The driver and workers run in separate
       pods and communicate with each other via RPC.
 

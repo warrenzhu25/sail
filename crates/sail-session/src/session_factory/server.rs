@@ -20,6 +20,7 @@ use sail_execution::driver::DriverOptions;
 use sail_execution::job_runner::{ClusterJobRunner, LocalJobRunner};
 use sail_execution::worker_manager::{
     KubernetesWorkerManager, KubernetesWorkerManagerOptions, LocalWorkerManager,
+    ProcessWorkerManager, ProcessWorkerManagerOptions,
 };
 use sail_physical_optimizer::{get_physical_optimizers, PhysicalOptimizerOptions};
 use sail_server::actor::{ActorHandle, ActorSystem};
@@ -167,6 +168,18 @@ impl ServerSessionFactory {
                     .map_err(|e| internal_datafusion_err!("{e}"))?;
                 Box::new(ClusterJobRunner::new(system.deref_mut(), options))
             }
+            ExecutionMode::LocalProcessCluster => {
+                let options = ProcessWorkerManagerOptions::from_current_exe()
+                    .map_err(|e| internal_datafusion_err!("{e}"))?;
+                let worker_manager = Arc::new(ProcessWorkerManager::new(options));
+                let options =
+                    DriverOptions::new(&self.config, self.runtime.clone(), worker_manager);
+                let mut system = self
+                    .system
+                    .lock()
+                    .map_err(|e| internal_datafusion_err!("{e}"))?;
+                Box::new(ClusterJobRunner::new(system.deref_mut(), options))
+            }
             ExecutionMode::KubernetesCluster => {
                 let options = KubernetesWorkerManagerOptions {
                     image: self.config.kubernetes.image.clone(),
@@ -180,6 +193,7 @@ impl ServerSessionFactory {
                         .worker_service_account_name
                         .clone(),
                     worker_pod_template: self.config.kubernetes.worker_pod_template.clone(),
+                    shuffle_dir: self.config.cluster.shuffle_dir.clone(),
                 };
                 let worker_manager = Arc::new(KubernetesWorkerManager::new(options));
                 let options =

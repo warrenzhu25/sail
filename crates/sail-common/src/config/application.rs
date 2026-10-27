@@ -83,6 +83,8 @@ pub enum ExecutionMode {
         alias = "kube_cluster"
     )]
     KubernetesCluster,
+    #[serde(alias = "local-process-cluster")]
+    LocalProcessCluster,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -649,10 +651,13 @@ impl ClusterConfigEnv {
         DRIVER_EXTERNAL_PORT,
         WORKER_ID,
         WORKER_LISTEN_HOST,
+        WORKER_LISTEN_PORT,
         WORKER_EXTERNAL_HOST,
+        WORKER_EXTERNAL_PORT,
         WORKER_HEARTBEAT_INTERVAL_SECS,
         TASK_STREAM_BUFFER,
         TASK_STREAM_CREATION_TIMEOUT_SECS,
         RPC_RETRY_STRATEGY,
+        SHUFFLE_DIR,
     }
 }

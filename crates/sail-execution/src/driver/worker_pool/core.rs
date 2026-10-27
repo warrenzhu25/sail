@@ -152,26 +152,38 @@ impl WorkerPool {
             }
             WorkerState::Running { .. } => {
                 info!("stopping worker {worker_id}");
-                let client = match Self::get_client_set(worker_id, worker, &self.options) {
-                    Ok(x) => x.core,
+                match Self::get_client_set(worker_id, worker, &self.options) {
+                    Ok(x) => {
+                        let client = x.core;
+                        ctx.spawn(async move {
+                            if let Err(e) = client.stop_worker().await {
+                                error!("failed to stop worker {worker_id}: {e}");
+                            }
+                        });
+                        worker.state = WorkerState::Completed;
+                        worker.messages.extend(reason);
+                    }
                     Err(e) => {
                         error!("failed to stop worker {worker_id}: {e}");
                         worker.state = WorkerState::Failed;
-                        worker.stopped_at = Some(Utc::now());
-                        return;
                     }
-                };
-                ctx.spawn(async move {
-                    if let Err(e) = client.stop_worker().await {
-                        error!("failed to stop worker {worker_id}: {e}");
-                    }
-                });
-                worker.state = WorkerState::Completed;
+                }
                 worker.stopped_at = Some(Utc::now());
-                worker.messages.extend(reason);
             }
-            WorkerState::Completed | WorkerState::Failed => {}
+            WorkerState::Completed | WorkerState::Failed => return,
         }
+        self.release_worker(ctx, worker_id);
+    }
+
+    /// Asks the worker manager to release the resources of a worker
+    /// that is no longer used by the driver.
+    fn release_worker(&self, ctx: &mut ActorContext<DriverActor>, worker_id: WorkerId) {
+        let worker_manager = Arc::clone(&self.worker_manager);
+        ctx.spawn(async move {
+            if let Err(e) = worker_manager.stop_worker(worker_id).await {
+                error!("failed to release worker {worker_id}: {e}");
+            }
+        });
     }
 
     fn list_running_workers(&self) -> Vec<WorkerLocation> {
@@ -218,7 +230,11 @@ impl WorkerPool {
         worker.peers.extend(peer_worker_ids);
     }
 
-    pub fn fail_worker_if_pending(&mut self, worker_id: WorkerId) -> bool {
+    pub fn fail_worker_if_pending(
+        &mut self,
+        ctx: &mut ActorContext<DriverActor>,
+        worker_id: WorkerId,
+    ) -> bool {
         let Some(worker) = self.workers.get_mut(&worker_id) else {
             warn!("worker {worker_id} not found");
             return false;
@@ -228,6 +244,9 @@ impl WorkerPool {
             let message = "worker registration timeout".to_string();
             worker.state = WorkerState::Failed;
             worker.messages.push(message);
+            // The worker may still be starting, so we ask the worker manager
+            // to terminate it.
+            self.release_worker(ctx, worker_id);
             true
         } else {
             false

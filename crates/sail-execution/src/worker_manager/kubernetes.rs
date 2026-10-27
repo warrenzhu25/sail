@@ -1,7 +1,5 @@
 use std::collections::BTreeMap;
-use std::env;
 
-use fastrace::collector::SpanContext;
 use k8s_openapi::api::core::v1::{
     Container, EnvVar, EnvVarSource, ObjectFieldSelector, Pod, PodSpec, PodTemplateSpec,
 };
@@ -11,12 +9,11 @@ use kube::Api;
 use rand::distr::Uniform;
 use rand::RngExt;
 use sail_common::config::ClusterConfigEnv;
-use sail_server::RetryStrategy;
-use sail_telemetry::common::ContextPropagationEnv;
 use tokio::sync::OnceCell;
 
 use crate::error::{ExecutionError, ExecutionResult};
 use crate::id::WorkerId;
+use crate::worker_manager::env::{build_worker_env, WorkerEnvOptions};
 use crate::worker_manager::{WorkerLaunchOptions, WorkerManager};
 
 #[derive(Debug, Clone)]
@@ -28,6 +25,9 @@ pub struct KubernetesWorkerManagerOptions {
     pub worker_pod_name_prefix: String,
     pub worker_service_account_name: String,
     pub worker_pod_template: String,
+    /// The shuffle directory configured for the workers.
+    /// If the value is empty, the worker uses its default shuffle directory.
+    pub shuffle_dir: String,
 }
 
 pub struct KubernetesWorkerManager {
@@ -106,114 +106,37 @@ impl KubernetesWorkerManager {
     }
 
     fn build_pod_env(&self, id: WorkerId, options: WorkerLaunchOptions) -> Vec<EnvVar> {
-        let WorkerLaunchOptions {
-            enable_tls,
-            driver_external_host,
-            driver_external_port,
-            worker_heartbeat_interval,
-            task_stream_buffer,
-            task_stream_creation_timeout,
-            rpc_retry_strategy,
-            shuffle_dir: _,
-        } = options;
-        let w3c_traceparent =
-            SpanContext::current_local_parent().map(|x| x.encode_w3c_traceparent());
-
-        // There is no guarantee that serializing a Rust data structure produces an inline table,
-        // so we have to construct the nested TOML value manually.
-        let rpc_retry_strategy = match rpc_retry_strategy {
-            RetryStrategy::ExponentialBackoff {
-                max_count,
-                initial_delay,
-                max_delay,
-                factor,
-            } => {
-                format!(
-                    "{{ exponential_backoff = {{ max_count = {}, initial_delay_secs = {}, max_delay_secs = {}, factor = {} }} }}",
-                    max_count,
-                    initial_delay.as_secs(),
-                    max_delay.as_secs(),
-                    factor,
-                )
-            }
-            RetryStrategy::Fixed { max_count, delay } => {
-                format!(
-                    "{{ fixed = {{ max_count = {}, delay_secs = {} }} }}",
-                    max_count,
-                    delay.as_secs()
-                )
-            }
-        };
-        let mut env = vec![
-            EnvVar {
-                name: "RUST_LOG".to_string(),
-                value: Some(env::var("RUST_LOG").unwrap_or("info".to_string())),
-                value_from: None,
+        let shuffle_dir =
+            (!self.options.shuffle_dir.is_empty()).then_some(self.options.shuffle_dir.as_str());
+        let mut env = build_worker_env(
+            id,
+            options,
+            WorkerEnvOptions {
+                listen_host: "0.0.0.0",
+                // The external host is set to the pod IP below.
+                external_host: None,
+                random_port: false,
+                shuffle_dir,
             },
-            EnvVar {
-                name: ClusterConfigEnv::ENABLE_TLS.to_string(),
-                value: Some(enable_tls.to_string()),
-                value_from: None,
-            },
-            EnvVar {
-                name: ClusterConfigEnv::DRIVER_EXTERNAL_HOST.to_string(),
-                value: Some(driver_external_host),
-                value_from: None,
-            },
-            EnvVar {
-                name: ClusterConfigEnv::DRIVER_EXTERNAL_PORT.to_string(),
-                value: Some(driver_external_port.to_string()),
-                value_from: None,
-            },
-            EnvVar {
-                name: ClusterConfigEnv::WORKER_ID.to_string(),
-                value: Some(u64::from(id).to_string()),
-                value_from: None,
-            },
-            EnvVar {
-                name: ClusterConfigEnv::WORKER_LISTEN_HOST.to_string(),
-                value: Some("0.0.0.0".to_string()),
-                value_from: None,
-            },
-            EnvVar {
-                name: ClusterConfigEnv::WORKER_EXTERNAL_HOST.to_string(),
-                value: None,
-                value_from: Some(EnvVarSource {
-                    field_ref: Some(ObjectFieldSelector {
-                        field_path: "status.podIP".to_string(),
-                        ..Default::default()
-                    }),
+        )
+        .into_iter()
+        .map(|(name, value)| EnvVar {
+            name,
+            value: Some(value),
+            value_from: None,
+        })
+        .collect::<Vec<_>>();
+        env.push(EnvVar {
+            name: ClusterConfigEnv::WORKER_EXTERNAL_HOST.to_string(),
+            value: None,
+            value_from: Some(EnvVarSource {
+                field_ref: Some(ObjectFieldSelector {
+                    field_path: "status.podIP".to_string(),
                     ..Default::default()
                 }),
-            },
-            EnvVar {
-                name: ClusterConfigEnv::WORKER_HEARTBEAT_INTERVAL_SECS.to_string(),
-                value: Some(worker_heartbeat_interval.as_secs().to_string()),
-                value_from: None,
-            },
-            EnvVar {
-                name: ClusterConfigEnv::TASK_STREAM_BUFFER.to_string(),
-                value: Some(task_stream_buffer.to_string()),
-                value_from: None,
-            },
-            EnvVar {
-                name: ClusterConfigEnv::TASK_STREAM_CREATION_TIMEOUT_SECS.to_string(),
-                value: Some(task_stream_creation_timeout.as_secs().to_string()),
-                value_from: None,
-            },
-            EnvVar {
-                name: ClusterConfigEnv::RPC_RETRY_STRATEGY.to_string(),
-                value: Some(rpc_retry_strategy),
-                value_from: None,
-            },
-        ];
-        if let Some(traceparent) = w3c_traceparent {
-            env.push(EnvVar {
-                name: ContextPropagationEnv::TRACEPARENT.to_string(),
-                value: Some(traceparent),
-                value_from: None,
-            });
-        }
+                ..Default::default()
+            }),
+        });
         env
     }
 }
