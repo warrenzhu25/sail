@@ -28,3 +28,9 @@ tokio = { workspace = true }
 log = { workspace = true }
 pyo3 = { workspace = true }
 rustls = { workspace = true }
+
+[dev-dependencies]
+sail-common-datafusion = { path = "../sail-common-datafusion" }
+sail-server = { path = "../sail-server" }
+datafusion = { workspace = true }
+futures = { workspace = true }
