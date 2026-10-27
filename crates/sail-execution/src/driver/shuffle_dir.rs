@@ -50,7 +50,7 @@ fn parse_driver_shuffle_dir_name(name: &str) -> Option<(&str, u32)> {
     Some((host, pid.parse().ok()?))
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn process_exists(pid: u32) -> bool {
     let Ok(pid) = libc::pid_t::try_from(pid) else {
         return true;
@@ -63,7 +63,7 @@ fn process_exists(pid: u32) -> bool {
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-#[cfg(not(unix))]
+#[cfg(not(target_os = "linux"))]
 fn process_exists(_pid: u32) -> bool {
     true
 }
