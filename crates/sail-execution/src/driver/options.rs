@@ -30,6 +30,8 @@ pub struct DriverOptions {
     /// The shuffle directory of this driver instance.
     /// Local workers use subdirectories of this directory.
     pub shuffle_dir: PathBuf,
+    /// The size of buffered shuffle output of a map task before it is spilled to disk.
+    pub shuffle_spill_threshold: usize,
     pub adaptive_shuffle_enabled: bool,
     pub adaptive_shuffle_target_partition_bytes: u64,
     pub rpc_retry_strategy: RetryStrategy,
@@ -76,6 +78,7 @@ impl DriverOptions {
                 std::process::id(),
                 rand::random::<u64>()
             )),
+            shuffle_spill_threshold: config.cluster.shuffle_spill_threshold_bytes,
             adaptive_shuffle_enabled: config.cluster.adaptive_shuffle_enabled,
             adaptive_shuffle_target_partition_bytes: config
                 .cluster

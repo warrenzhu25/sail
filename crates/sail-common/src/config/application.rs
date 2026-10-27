@@ -201,6 +201,7 @@ pub struct ClusterConfig {
     pub task_max_attempts: usize,
     pub shuffle_mode: String,
     pub shuffle_dir: String,
+    pub shuffle_spill_threshold_bytes: usize,
     pub adaptive_shuffle_enabled: bool,
     pub adaptive_shuffle_target_partition_bytes: u64,
     pub rpc_retry_strategy: RetryStrategy,
@@ -659,5 +660,6 @@ impl ClusterConfigEnv {
         TASK_STREAM_CREATION_TIMEOUT_SECS,
         RPC_RETRY_STRATEGY,
         SHUFFLE_DIR,
+        SHUFFLE_SPILL_THRESHOLD_BYTES,
     }
 }

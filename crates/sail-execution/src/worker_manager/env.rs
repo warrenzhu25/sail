@@ -46,6 +46,7 @@ pub(crate) fn build_worker_env(
         // The shuffle directory of the driver is not accessible to remote workers.
         // The worker manager decides the worker shuffle directory instead.
         shuffle_dir: _,
+        shuffle_spill_threshold,
     } = options;
     let WorkerEnvOptions {
         listen_host,
@@ -95,6 +96,10 @@ pub(crate) fn build_worker_env(
         (
             ClusterConfigEnv::RPC_RETRY_STRATEGY.to_string(),
             format_retry_strategy(&rpc_retry_strategy),
+        ),
+        (
+            ClusterConfigEnv::SHUFFLE_SPILL_THRESHOLD_BYTES.to_string(),
+            shuffle_spill_threshold.to_string(),
         ),
     ];
     if random_port {
@@ -172,6 +177,7 @@ mod tests {
                 delay: Duration::from_secs(2),
             },
             shuffle_dir: PathBuf::from("/driver/shuffle"),
+            shuffle_spill_threshold: 1024,
         }
     }
 
@@ -204,6 +210,10 @@ mod tests {
         );
         assert_eq!(get(ClusterConfigEnv::WORKER_EXTERNAL_PORT), Some("0"));
         assert_eq!(get(ClusterConfigEnv::SHUFFLE_DIR), Some("/data/shuffle"));
+        assert_eq!(
+            get(ClusterConfigEnv::SHUFFLE_SPILL_THRESHOLD_BYTES),
+            Some("1024")
+        );
         assert_eq!(
             get(ClusterConfigEnv::RPC_RETRY_STRATEGY),
             Some("{ fixed = { max_count = 3, delay_secs = 2 } }")

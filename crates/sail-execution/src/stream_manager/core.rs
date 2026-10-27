@@ -19,7 +19,7 @@ use crate::stream::writer::{LocalStreamStorage, TaskStreamSink};
 use crate::stream_manager::local::{DiskStream, LocalStream, MemoryStream};
 use crate::stream_manager::options::StreamManagerOptions;
 use crate::stream_manager::shuffle_file::{
-    run_blocking_in_background, MapOutputKey, MapOutputWriter, DEFAULT_SHUFFLE_SPILL_THRESHOLD,
+    run_blocking_in_background, MapOutputKey, MapOutputWriter,
 };
 use crate::stream_manager::{LocalStreamState, StreamManager, StreamManagerMessage};
 
@@ -270,7 +270,7 @@ impl StreamManager {
                 let writer = MapOutputWriter::try_new(
                     entry.key().data_path(&self.options.shuffle_dir),
                     channels,
-                    DEFAULT_SHUFFLE_SPILL_THRESHOLD,
+                    self.options.shuffle_write,
                 )
                 .map_err(|e| ExecutionError::InternalError(e.to_string()))?;
                 Ok(entry.insert((Arc::new(writer), 0)).0.clone())

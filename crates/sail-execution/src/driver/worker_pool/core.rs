@@ -87,6 +87,7 @@ impl WorkerPool {
             task_stream_creation_timeout: self.options.task_stream_creation_timeout,
             rpc_retry_strategy: self.options.rpc_retry_strategy.clone(),
             shuffle_dir: self.options.shuffle_dir.clone(),
+            shuffle_spill_threshold: self.options.shuffle_spill_threshold,
         };
         let worker_manager = Arc::clone(&self.worker_manager);
         let handle = ctx.handle().clone();

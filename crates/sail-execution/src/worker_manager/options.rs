@@ -16,4 +16,5 @@ pub struct WorkerLaunchOptions {
     /// in subdirectories of this directory. Remote workers use their own
     /// configured shuffle directory instead.
     pub shuffle_dir: PathBuf,
+    pub shuffle_spill_threshold: usize,
 }

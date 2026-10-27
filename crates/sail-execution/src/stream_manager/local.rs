@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use datafusion::arrow::array::RecordBatch;
 use datafusion::common::Result;
+use datafusion::execution::memory_pool::MemoryPool;
 use futures::StreamExt;
 use log::debug;
 use tokio::sync::{mpsc, watch};
@@ -329,6 +330,10 @@ impl TaskStreamSink for DiskStreamSink {
         TaskStreamSinkState::Ok
     }
 
+    async fn register_memory_pool(&mut self, pool: &Arc<dyn MemoryPool>) {
+        self.writer.register_memory_pool(pool).await;
+    }
+
     async fn close(mut self: Box<Self>) -> Result<()> {
         self.writer.close(self.channel).await?;
         // Drop senders to close channels for any pending receivers
@@ -349,7 +354,9 @@ mod tests {
     use super::*;
     use crate::id::{JobId, TaskStreamKey};
     use crate::stream::writer::LocalStreamStorage;
-    use crate::stream_manager::shuffle_file::{ShuffleIndex, DEFAULT_SHUFFLE_SPILL_THRESHOLD};
+    use crate::stream_manager::shuffle_file::{
+        ShuffleIndex, ShuffleWriteOptions, DEFAULT_SHUFFLE_SPILL_THRESHOLD,
+    };
     use crate::stream_manager::{StreamManager, StreamManagerOptions};
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -382,7 +389,12 @@ mod tests {
         spill_threshold: usize,
     ) -> Vec<DiskStream> {
         let writer = Arc::new(
-            MapOutputWriter::try_new(data_path.to_path_buf(), channels, spill_threshold).unwrap(),
+            MapOutputWriter::try_new(
+                data_path.to_path_buf(),
+                channels,
+                ShuffleWriteOptions::default().with_spill_threshold(spill_threshold),
+            )
+            .unwrap(),
         );
         (0..channels)
             .map(|c| DiskStream::new(data_path.to_path_buf(), c, writer.clone(), vec![]))
@@ -584,7 +596,7 @@ mod tests {
         let writer = Arc::new(MapOutputWriter::try_new(
             data_path.clone(),
             1,
-            DEFAULT_SHUFFLE_SPILL_THRESHOLD,
+            ShuffleWriteOptions::default(),
         )?);
         let (tx, mut rx) = mpsc::channel(16);
         let mut stream = DiskStream::new(data_path.clone(), 0, writer, vec![tx]);
@@ -691,6 +703,70 @@ mod tests {
         let mut source = streams[0].subscribe().unwrap();
         assert_eq!(source.next().await.unwrap().unwrap(), data[0][0]);
         drop(source);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// The buffered output is tracked by the memory pool, and it is spilled when the
+    /// memory pool cannot accommodate more data, even if the spill threshold is not reached.
+    #[tokio::test]
+    async fn test_disk_stream_memory_accounting() -> Result<()> {
+        use datafusion::execution::memory_pool::GreedyMemoryPool;
+
+        let dir = temp_dir("memory");
+        let data_path = dir.join("shuffle_0_0.data");
+        let channels = 3;
+        let data = (0..channels)
+            .map(|c| {
+                (0..10)
+                    .map(|i| batch(vec![c * 100 + i; 256]))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let size = data[0][0].get_array_memory_size();
+        let limit = size * 4;
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(limit));
+        let mut streams = create_streams(&data_path, channels as usize, usize::MAX);
+        let mut sinks = streams
+            .iter_mut()
+            .map(|s| s.publish().unwrap())
+            .collect::<Vec<_>>();
+        for sink in sinks.iter_mut() {
+            sink.register_memory_pool(&pool).await;
+        }
+        let mut max_reserved = 0;
+        for i in 0..10 {
+            for (c, sink) in sinks.iter_mut().enumerate() {
+                assert!(matches!(
+                    sink.write(Ok(data[c][i].clone())).await,
+                    TaskStreamSinkState::Ok
+                ));
+                max_reserved = max_reserved.max(pool.reserved());
+                assert!(pool.reserved() <= limit);
+            }
+        }
+        assert!(max_reserved > 0);
+        // The writer spills since the memory pool is full.
+        assert!(dir.join("shuffle_0_0.spill").exists());
+        for sink in sinks {
+            sink.close().await?;
+        }
+        assert_eq!(pool.reserved(), 0);
+        for (c, batches) in data.iter().enumerate() {
+            assert_eq!(&read_all(streams[c].subscribe().unwrap()).await, batches);
+        }
+
+        // The reservation is released when the writer is dropped without finalizing.
+        let data_path = dir.join("shuffle_1_0.data");
+        let mut streams = create_streams(&data_path, 2, usize::MAX);
+        let mut sink = streams[0].publish().unwrap();
+        sink.register_memory_pool(&pool).await;
+        sink.write(Ok(data[0][0].clone())).await;
+        assert_eq!(pool.reserved(), size);
+        drop(sink);
+        drop(streams);
+        assert_eq!(pool.reserved(), 0);
 
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())

@@ -31,6 +31,7 @@ use datafusion::arrow::error::ArrowError;
 use datafusion::arrow::ipc::reader::StreamReader;
 use datafusion::arrow::ipc::writer::StreamWriter;
 use datafusion::common::{DataFusionError, Result};
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use tokio::sync::watch;
 
 use crate::error::{ExecutionError, ExecutionResult};
@@ -48,6 +49,29 @@ const SHUFFLE_FILE_BUFFER_SIZE: usize = 256 * 1024;
 pub(crate) const DEFAULT_SHUFFLE_SPILL_THRESHOLD: usize = 64 * 1024 * 1024;
 
 const SHUFFLE_INDEX_MAGIC: &[u8; 8] = b"SAILSHI1";
+
+/// The options for writing the disk shuffle output of a map task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ShuffleWriteOptions {
+    /// The maximum size (in bytes) of buffered output before it is spilled to disk.
+    pub spill_threshold: usize,
+}
+
+impl Default for ShuffleWriteOptions {
+    fn default() -> Self {
+        Self {
+            spill_threshold: DEFAULT_SHUFFLE_SPILL_THRESHOLD,
+        }
+    }
+}
+
+impl ShuffleWriteOptions {
+    #[cfg(test)]
+    pub fn with_spill_threshold(mut self, spill_threshold: usize) -> Self {
+        self.spill_threshold = spill_threshold;
+        self
+    }
+}
 
 /// The key that identifies the output of a map task attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -328,6 +352,9 @@ struct MapOutputState {
     closed: Vec<bool>,
     num_closed: usize,
     finalized: bool,
+    /// The memory reservation for the buffered batches, if the writer is registered
+    /// with a memory pool.
+    reservation: Option<MemoryReservation>,
 }
 
 impl MapOutputState {
@@ -352,7 +379,14 @@ impl MapOutputState {
         .await
         .map_err(|e| DataFusionError::External(Box::new(e)))??;
         self.spill = Some(spill);
+        self.free_memory();
         Ok(())
+    }
+
+    fn free_memory(&mut self) {
+        if let Some(reservation) = self.reservation.as_mut() {
+            reservation.free();
+        }
     }
 
     async fn finalize(&mut self) -> Result<()> {
@@ -367,6 +401,7 @@ impl MapOutputState {
         .await
         .map_err(|e| DataFusionError::External(Box::new(e)))??;
         self.finalized = true;
+        self.free_memory();
         Ok(())
     }
 }
@@ -464,7 +499,11 @@ pub(crate) struct MapOutputWriter {
 }
 
 impl MapOutputWriter {
-    pub fn try_new(data_path: PathBuf, channels: usize, spill_threshold: usize) -> Result<Self> {
+    pub fn try_new(
+        data_path: PathBuf,
+        channels: usize,
+        options: ShuffleWriteOptions,
+    ) -> Result<Self> {
         if let Some(parent) = data_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -474,7 +513,7 @@ impl MapOutputWriter {
             state: tokio::sync::Mutex::new(MapOutputState {
                 data_path,
                 spill_path,
-                spill_threshold,
+                spill_threshold: options.spill_threshold,
                 buffers: vec![vec![]; channels],
                 buffered_bytes: 0,
                 records: vec![0; channels],
@@ -482,9 +521,33 @@ impl MapOutputWriter {
                 closed: vec![false; channels],
                 num_closed: 0,
                 finalized: false,
+                reservation: None,
             }),
             status,
         })
+    }
+
+    /// Tracks the buffered batches in the memory pool (e.g. the memory pool of the task
+    /// that writes the map output). The buffered batches are spilled to disk when the
+    /// memory pool cannot accommodate more data. This has no effect if the writer has
+    /// already been registered with a memory pool.
+    pub async fn register_memory_pool(&self, pool: &Arc<dyn MemoryPool>) {
+        let mut state = self.state.lock().await;
+        if state.reservation.is_some() {
+            return;
+        }
+        let name = state
+            .data_path
+            .file_name()
+            .map(|x| x.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let reservation = MemoryConsumer::new(format!("ShuffleWriter[{name}]"))
+            .with_can_spill(true)
+            .register(pool);
+        // Account for batches buffered before registration if possible. Otherwise,
+        // they are spilled together with the next batch that cannot be accommodated.
+        let _ = reservation.try_grow(state.buffered_bytes);
+        state.reservation = Some(reservation);
     }
 
     pub fn subscribe_status(&self) -> watch::Receiver<MapOutputStatus> {
@@ -504,10 +567,17 @@ impl MapOutputWriter {
                 "cannot write to closed or invalid shuffle channel {channel}"
             )));
         }
+        let size = batch.get_array_memory_size();
         state.records[channel] += batch.num_rows() as u64;
-        state.buffered_bytes += batch.get_array_memory_size();
+        state.buffered_bytes += size;
         state.buffers[channel].push(batch);
-        if state.buffered_bytes >= state.spill_threshold {
+        // The batch stays buffered even if the memory pool cannot accommodate it,
+        // but then all the buffered batches are spilled immediately.
+        let reserved = state
+            .reservation
+            .as_mut()
+            .is_none_or(|r| r.try_grow(size).is_ok());
+        if !reserved || state.buffered_bytes >= state.spill_threshold {
             state.spill().await.map_err(|e| self.fail(e))?;
         }
         Ok(())

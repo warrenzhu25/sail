@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::{exec_datafusion_err, plan_err, Result};
+use datafusion::execution::memory_pool::MemoryPool;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::expressions::UnKnownColumn;
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
@@ -140,6 +141,7 @@ impl ExecutionPlan for ShuffleWriteExec {
                 locations.len()
             );
         }
+        let memory_pool = Arc::clone(context.memory_pool());
         let stream = self.plan.execute(partition, context)?;
         // TODO: Revisit this
         let shuffle_partitioning = match &self.shuffle_partitioning {
@@ -159,7 +161,8 @@ impl ExecutionPlan for ShuffleWriteExec {
             num_input_partitions,
         )?;
         let output = futures::stream::once(async move {
-            let stats = shuffle_write(writer, stream, &locations, partitioner).await?;
+            let stats =
+                shuffle_write(writer, stream, &locations, partitioner, &memory_pool).await?;
             stats.to_record_batch()
         });
         Ok(Box::pin(RecordBatchStreamAdapter::new(
@@ -174,6 +177,7 @@ async fn shuffle_write(
     mut stream: SendableRecordBatchStream,
     locations: &[TaskWriteLocation],
     mut partitioner: BatchPartitioner,
+    memory_pool: &Arc<dyn MemoryPool>,
 ) -> Result<TaskShuffleStats> {
     let schema = stream.schema();
     let mut stats = TaskShuffleStats::new(locations.len());
@@ -187,6 +191,9 @@ async fn shuffle_write(
             .map(Some)
             .collect::<Vec<_>>()
     };
+    for sink in partition_sinks.iter_mut().flatten() {
+        sink.register_memory_pool(memory_pool).await;
+    }
     while let Some(batch) = stream.next().await {
         let batch = batch?;
         let mut partitions: Vec<Option<RecordBatch>> = vec![None; partition_sinks.len()];

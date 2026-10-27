@@ -1,9 +1,11 @@
 use std::fmt;
+use std::sync::Arc;
 
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::Result;
 use datafusion::error::DataFusionError;
+use datafusion::execution::memory_pool::MemoryPool;
 
 use crate::id::{TaskStreamKey, TaskStreamKeyDenseDisplay};
 use crate::stream::error::TaskStreamResult;
@@ -75,6 +77,11 @@ pub trait TaskStreamSink: Send {
     /// [`TaskStreamSinkState::Closed`] state from [`write`](TaskStreamSink::write).
     /// No implicit finalization will be done when the sink is dropped.
     async fn close(self: Box<Self>) -> Result<()>;
+
+    /// Registers the memory pool (e.g. of the task that writes to the sink) to track
+    /// the memory used by the sink for buffering data. The default implementation does
+    /// nothing, which is suitable for sinks that do not buffer a significant amount of data.
+    async fn register_memory_pool(&mut self, _pool: &Arc<dyn MemoryPool>) {}
 }
 
 pub enum TaskStreamSinkState {

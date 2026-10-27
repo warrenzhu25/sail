@@ -25,6 +25,8 @@ pub struct WorkerOptions {
     pub rpc_retry_strategy: RetryStrategy,
     /// The shuffle directory of this worker, which is removed when the worker stops.
     pub shuffle_dir: PathBuf,
+    /// The size of buffered shuffle output of a map task before it is spilled to disk.
+    pub shuffle_spill_threshold: usize,
     pub runtime: RuntimeHandle,
     pub session: SessionContext,
 }
@@ -60,6 +62,7 @@ impl WorkerOptions {
                     rand::random::<u64>()
                 ),
             ),
+            shuffle_spill_threshold: config.cluster.shuffle_spill_threshold_bytes,
             runtime,
             session,
         }
@@ -85,6 +88,7 @@ impl WorkerOptions {
             task_stream_creation_timeout: options.task_stream_creation_timeout,
             rpc_retry_strategy: options.rpc_retry_strategy,
             shuffle_dir: options.shuffle_dir.join(format!("worker_{id}")),
+            shuffle_spill_threshold: options.shuffle_spill_threshold,
             runtime: runtime.clone(),
             session,
         }

@@ -19,6 +19,7 @@ pub struct WorkerPoolOptions {
     pub task_stream_creation_timeout: Duration,
     pub rpc_retry_strategy: RetryStrategy,
     pub shuffle_dir: PathBuf,
+    pub shuffle_spill_threshold: usize,
 }
 
 impl From<&DriverOptions> for WorkerPoolOptions {
@@ -35,6 +36,7 @@ impl From<&DriverOptions> for WorkerPoolOptions {
             task_stream_creation_timeout: options.task_stream_creation_timeout,
             rpc_retry_strategy: options.rpc_retry_strategy.clone(),
             shuffle_dir: options.shuffle_dir.clone(),
+            shuffle_spill_threshold: options.shuffle_spill_threshold,
         }
     }
 }

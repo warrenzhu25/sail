@@ -347,6 +347,7 @@ exec sleep 1000
                 delay: Duration::from_secs(0),
             },
             shuffle_dir,
+            shuffle_spill_threshold: 1024,
         }
     }
 

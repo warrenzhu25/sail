@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::driver::DriverOptions;
+use crate::stream_manager::shuffle_file::ShuffleWriteOptions;
 use crate::worker::WorkerOptions;
 
 #[readonly::make]
@@ -10,6 +11,7 @@ pub struct StreamManagerOptions {
     pub task_stream_buffer: usize,
     pub task_stream_creation_timeout: Duration,
     pub shuffle_dir: PathBuf,
+    pub shuffle_write: ShuffleWriteOptions,
 }
 
 #[cfg_attr(not(test), expect(dead_code))]
@@ -26,6 +28,7 @@ impl Default for StreamManagerOptions {
             task_stream_buffer: 16,
             task_stream_creation_timeout: Duration::from_secs(60),
             shuffle_dir: std::env::temp_dir().join("sail").join("shuffle"),
+            shuffle_write: ShuffleWriteOptions::default(),
         }
     }
 }
@@ -36,6 +39,9 @@ impl From<&DriverOptions> for StreamManagerOptions {
             task_stream_buffer: options.task_stream_buffer,
             task_stream_creation_timeout: options.task_stream_creation_timeout,
             shuffle_dir: options.shuffle_dir.join("driver"),
+            shuffle_write: ShuffleWriteOptions {
+                spill_threshold: options.shuffle_spill_threshold,
+            },
         }
     }
 }
@@ -49,6 +55,9 @@ impl From<&WorkerOptions> for StreamManagerOptions {
             // cleaning up a stage on one worker in the local-cluster mode does not affect
             // the shuffle files of other workers.
             shuffle_dir: options.shuffle_dir.clone(),
+            shuffle_write: ShuffleWriteOptions {
+                spill_threshold: options.shuffle_spill_threshold,
+            },
         }
     }
 }
