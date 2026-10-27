@@ -321,6 +321,47 @@ impl SessionManagerActor {
         ActorAction::Continue
     }
 
+    pub(super) fn handle_stop_sessions(
+        &mut self,
+        ctx: &mut ActorContext<Self>,
+        result: oneshot::Sender<()>,
+    ) -> ActorAction {
+        let mut runners = vec![];
+        for (session_id, session) in self.sessions.iter_mut() {
+            let ServerSessionState::Running { context } = &session.state else {
+                continue;
+            };
+            info!("stopping session {session_id}");
+            match context.extension::<JobService>() {
+                Ok(service) => runners.push((session_id.clone(), service)),
+                Err(_) => warn!("job service not found for session {session_id}"),
+            }
+            session.deleted_at = Some(Utc::now());
+            session.state = ServerSessionState::Deleting;
+        }
+        let handle = ctx.handle().clone();
+        ctx.spawn(async move {
+            let stops = runners.into_iter().map(|(session_id, service)| {
+                let handle = handle.clone();
+                async move {
+                    let (tx, rx) = oneshot::channel();
+                    service.runner().stop(tx).await;
+                    let message = match rx.await {
+                        Ok(x) => SessionManagerEvent::SetSessionHistory {
+                            session_id,
+                            history: SessionHistory { job_runner: x },
+                        },
+                        Err(_) => SessionManagerEvent::SetSessionFailure { session_id },
+                    };
+                    let _ = handle.send(message).await;
+                }
+            });
+            futures::future::join_all(stops).await;
+            let _ = result.send(());
+        });
+        ActorAction::Continue
+    }
+
     fn delete_session(ctx: &mut ActorContext<Self>, session_id: String, context: &SessionContext) {
         let Ok(service) = context.extension::<JobService>() else {
             warn!("job service not found for session {session_id}");

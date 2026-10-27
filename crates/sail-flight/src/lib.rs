@@ -25,13 +25,21 @@ where
     F: Future<Output = ()>,
 {
     let session_manager = create_flight_session_manager(config, runtime)?;
-    let service = SailFlightSqlService::new(session_manager);
+    let service = SailFlightSqlService::new(session_manager.clone());
     let flight_service = FlightServiceServer::new(service);
 
     let builder = ServerBuilder::new("flight_sql", ServerBuilderOptions::default())
         .add_service(flight_service, None)
         .await;
 
-    builder.serve(listener, signal).await?;
-    Ok(())
+    let result = builder.serve(listener, signal).await;
+    // The server error is not `Send`, so it is converted to a string
+    // before awaiting below.
+    let result = result.map_err(|e| e.to_string());
+    // Stop the sessions so that running jobs are canceled and their resources
+    // (e.g. workers and shuffle files) are released before the process exits.
+    if let Err(e) = session_manager.stop_sessions().await {
+        log::warn!("failed to stop sessions: {e}");
+    }
+    result.map_err(Into::into)
 }

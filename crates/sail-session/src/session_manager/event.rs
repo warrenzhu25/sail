@@ -34,6 +34,11 @@ pub enum SessionManagerEvent {
     ObserveState {
         observer: SessionManagerObserver,
     },
+    /// Stops all running sessions (including their job runners) and reports
+    /// when they have stopped.
+    StopSessions {
+        result: oneshot::Sender<()>,
+    },
 }
 
 pub struct SessionHistory {
@@ -49,6 +54,7 @@ impl SpanAssociation for SessionManagerEvent {
             SessionManagerEvent::SetSessionHistory { .. } => "SetSessionHistory",
             SessionManagerEvent::SetSessionFailure { .. } => "SetSessionFailure",
             SessionManagerEvent::ObserveState { .. } => "ObserveState",
+            SessionManagerEvent::StopSessions { .. } => "StopSessions",
         };
         name.into()
     }
@@ -76,7 +82,8 @@ impl SpanAssociation for SessionManagerEvent {
             | SessionManagerEvent::SetSessionFailure { session_id } => {
                 p.push((SpanAttribute::SESSION_ID, session_id.to_string()));
             }
-            SessionManagerEvent::ObserveState { observer: _ } => {}
+            SessionManagerEvent::ObserveState { observer: _ }
+            | SessionManagerEvent::StopSessions { result: _ } => {}
         }
         p.into_iter().map(|(k, v)| (k.into(), v.into()))
     }

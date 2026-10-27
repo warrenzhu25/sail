@@ -14,6 +14,7 @@ pub(crate) use crate::session_manager::actor::SessionManagerActor;
 pub(crate) use crate::session_manager::event::SessionManagerEvent;
 pub use crate::session_manager::options::SessionManagerOptions;
 
+#[derive(Clone)]
 pub struct SessionManager {
     handle: ActorHandle<SessionManagerActor>,
 }
@@ -45,6 +46,18 @@ impl SessionManager {
         self.handle.send(event).await?;
         rx.await
             .map_err(|e| SessionError::internal(format!("failed to get session: {e}")))?
+    }
+
+    /// Stops all running sessions and waits for their job runners to stop,
+    /// so that the resources of the job runners (e.g. workers and shuffle files)
+    /// are released. This is called when the server shuts down.
+    pub async fn stop_sessions(&self) -> SessionResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.handle
+            .send(SessionManagerEvent::StopSessions { result: tx })
+            .await?;
+        rx.await
+            .map_err(|e| SessionError::internal(format!("failed to stop sessions: {e}")))
     }
 
     pub async fn delete_session(&self, session_id: String) -> SessionResult<()> {

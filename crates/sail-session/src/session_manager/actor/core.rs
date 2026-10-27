@@ -47,6 +47,7 @@ impl Actor for SessionManagerActor {
             SessionManagerEvent::ObserveState { observer } => {
                 self.handle_observe_state(ctx, observer)
             }
+            SessionManagerEvent::StopSessions { result } => self.handle_stop_sessions(ctx, result),
         }
     }
 }

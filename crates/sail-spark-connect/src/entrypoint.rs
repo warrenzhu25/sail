@@ -23,7 +23,7 @@ where
     F: Future<Output = ()>,
 {
     let session_manager = create_spark_session_manager(config, runtime)?;
-    let server = SparkConnectServer::new(session_manager);
+    let server = SparkConnectServer::new(session_manager.clone());
     let service = SparkConnectServiceServer::new(server)
         // The original Spark Connect server seems to have configuration for inbound (decoding) message size only.
         // .max_encoding_message_size(GRPC_MAX_MESSAGE_LENGTH_DEFAULT)
@@ -32,9 +32,18 @@ where
         .accept_compressed(CompressionEncoding::Zstd)
         .send_compressed(CompressionEncoding::Gzip)
         .send_compressed(CompressionEncoding::Zstd);
-    ServerBuilder::new("sail_spark_connect", Default::default())
+    let result = ServerBuilder::new("sail_spark_connect", Default::default())
         .add_service(service, Some(crate::spark::connect::FILE_DESCRIPTOR_SET))
         .await
         .serve(listener, signal)
-        .await
+        .await;
+    // The server error is not `Send`, so it is converted to a string
+    // before awaiting below.
+    let result = result.map_err(|e| e.to_string());
+    // Stop the sessions so that running jobs are canceled and their resources
+    // (e.g. workers and shuffle files) are released before the process exits.
+    if let Err(e) = session_manager.stop_sessions().await {
+        log::warn!("failed to stop sessions: {e}");
+    }
+    result.map_err(Into::into)
 }

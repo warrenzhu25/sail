@@ -48,3 +48,6 @@ tokio = { workspace = true }
 chrono = { workspace = true }
 indexmap = { workspace = true }
 futures = { workspace = true }
+
+[dev-dependencies]
+pyo3 = { workspace = true }
