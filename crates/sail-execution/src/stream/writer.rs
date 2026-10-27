@@ -21,8 +21,14 @@ pub enum TaskWriteLocation {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LocalStreamStorage {
-    Memory { replicas: usize },
-    Disk,
+    Memory {
+        replicas: usize,
+    },
+    /// The stream is one of the `channels` output channels of a map task,
+    /// which are stored together on disk.
+    Disk {
+        channels: usize,
+    },
 }
 
 impl fmt::Display for TaskWriteLocation {
@@ -42,7 +48,7 @@ impl fmt::Display for LocalStreamStorage {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Self::Memory { replicas } => write!(f, "Memory({replicas})"),
-            Self::Disk => write!(f, "Disk"),
+            Self::Disk { channels } => write!(f, "Disk({channels})"),
         }
     }
 }

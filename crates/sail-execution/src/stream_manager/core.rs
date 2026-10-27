@@ -1,5 +1,6 @@
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef;
@@ -15,8 +16,11 @@ use crate::id::{JobId, TaskStreamKey, TaskStreamKeyDisplay};
 use crate::stream::error::{TaskStreamError, TaskStreamResult};
 use crate::stream::reader::TaskStreamSource;
 use crate::stream::writer::{LocalStreamStorage, TaskStreamSink};
-use crate::stream_manager::local::{LocalStream, MemoryStream};
+use crate::stream_manager::local::{DiskStream, LocalStream, MemoryStream};
 use crate::stream_manager::options::StreamManagerOptions;
+use crate::stream_manager::shuffle_file::{
+    MapOutputKey, MapOutputWriter, DEFAULT_SHUFFLE_SPILL_THRESHOLD,
+};
 use crate::stream_manager::{LocalStreamState, StreamManager, StreamManagerMessage};
 
 impl StreamManager {
@@ -24,6 +28,7 @@ impl StreamManager {
         Self {
             options,
             local_streams: HashMap::new(),
+            map_outputs: HashMap::new(),
         }
     }
 
@@ -33,9 +38,27 @@ impl StreamManager {
         storage: LocalStreamStorage,
         _schema: SchemaRef,
     ) -> ExecutionResult<Box<dyn TaskStreamSink>> {
+        let map_output = match storage {
+            LocalStreamStorage::Memory { .. } => None,
+            // The stream cannot be created again, which is reported as an error below.
+            LocalStreamStorage::Disk { .. }
+                if matches!(
+                    self.local_streams.get(&key),
+                    Some(LocalStreamState::Created { .. } | LocalStreamState::Failed { .. })
+                ) =>
+            {
+                None
+            }
+            LocalStreamStorage::Disk { channels } => Some(self.get_map_output(&key, channels)?),
+        };
         let create = |senders: Vec<_>| -> ExecutionResult<_> {
-            let mut stream =
-                Self::create_local_stream_with_senders(&key, storage, senders, &self.options)?;
+            let mut stream = Self::create_local_stream_with_senders(
+                &key,
+                storage,
+                map_output.clone(),
+                senders,
+                &self.options,
+            )?;
             let sink = stream.publish()?;
             Ok((stream, sink))
         };
@@ -61,6 +84,7 @@ impl StreamManager {
                 match create(senders.clone()) {
                     Ok((stream, sink)) => {
                         *entry.into_mut() = LocalStreamState::Created { stream };
+                        self.on_map_output_channel_created(&key, storage);
                         Ok(sink)
                     }
                     Err(e) => {
@@ -74,6 +98,7 @@ impl StreamManager {
             Entry::Vacant(entry) => match create(vec![]) {
                 Ok((stream, sink)) => {
                     entry.insert(LocalStreamState::Created { stream });
+                    self.on_map_output_channel_created(&key, storage);
                     Ok(sink)
                 }
                 Err(e) => {
@@ -121,18 +146,10 @@ impl StreamManager {
                 ))),
             },
             Entry::Vacant(entry) => {
-                let file_path = self
-                    .options
-                    .shuffle_dir
-                    .join(format!("{}", key.job_id))
-                    .join(format!("{}", key.stage))
-                    .join(format!(
-                        "shuffle_{}_{}_{}.data",
-                        key.partition, key.attempt, key.channel
-                    ));
-                if file_path.exists() {
-                    let mut stream =
-                        Box::new(crate::stream_manager::local::DiskStream::new(file_path));
+                let map_output = MapOutputKey::from(key);
+                if map_output.index_path(&self.options.shuffle_dir).exists() {
+                    let data_path = map_output.data_path(&self.options.shuffle_dir);
+                    let mut stream = Box::new(DiskStream::existing(data_path, key.channel));
                     let source = stream.subscribe()?;
                     entry.insert(LocalStreamState::Created { stream });
                     return Ok(source);
@@ -168,6 +185,8 @@ impl StreamManager {
         if let Some(stage) = stage {
             self.local_streams
                 .retain(|key, _| key.job_id != job_id || key.stage != stage);
+            self.map_outputs
+                .retain(|key, _| key.job_id != job_id || key.stage != stage);
             let stage_dir = self
                 .options
                 .shuffle_dir
@@ -178,6 +197,7 @@ impl StreamManager {
             }
         } else {
             self.local_streams.retain(|key, _| key.job_id != job_id);
+            self.map_outputs.retain(|key, _| key.job_id != job_id);
             let job_dir = self.options.shuffle_dir.join(format!("{job_id}"));
             if job_dir.exists() {
                 let _ = std::fs::remove_dir_all(job_dir);
@@ -222,14 +242,55 @@ impl StreamManager {
 
     pub async fn stop(&mut self) {
         self.local_streams.clear();
+        self.map_outputs.clear();
         if self.options.shuffle_dir.exists() {
             let _ = std::fs::remove_dir_all(&self.options.shuffle_dir);
+        }
+    }
+
+    /// Returns the shared writer for the disk-backed output of the map task.
+    fn get_map_output(
+        &mut self,
+        key: &TaskStreamKey,
+        channels: usize,
+    ) -> ExecutionResult<Arc<MapOutputWriter>> {
+        if key.channel >= channels {
+            return Err(ExecutionError::InternalError(format!(
+                "invalid channel for {} with {channels} channels",
+                TaskStreamKeyDisplay(key)
+            )));
+        }
+        match self.map_outputs.entry(MapOutputKey::from(key)) {
+            Entry::Occupied(entry) => Ok(entry.get().0.clone()),
+            Entry::Vacant(entry) => {
+                let writer = MapOutputWriter::try_new(
+                    entry.key().data_path(&self.options.shuffle_dir),
+                    channels,
+                    DEFAULT_SHUFFLE_SPILL_THRESHOLD,
+                )
+                .map_err(|e| ExecutionError::InternalError(e.to_string()))?;
+                Ok(entry.insert((Arc::new(writer), 0)).0.clone())
+            }
+        }
+    }
+
+    fn on_map_output_channel_created(&mut self, key: &TaskStreamKey, storage: LocalStreamStorage) {
+        let LocalStreamStorage::Disk { channels } = storage else {
+            return;
+        };
+        let map_output = MapOutputKey::from(key);
+        if let Some((_, created)) = self.map_outputs.get_mut(&map_output) {
+            *created += 1;
+            if *created >= channels {
+                self.map_outputs.remove(&map_output);
+            }
         }
     }
 
     fn create_local_stream_with_senders(
         key: &TaskStreamKey,
         storage: LocalStreamStorage,
+        map_output: Option<Arc<MapOutputWriter>>,
         senders: Vec<mpsc::Sender<TaskStreamResult<RecordBatch>>>,
         options: &StreamManagerOptions,
     ) -> ExecutionResult<Box<dyn LocalStream>> {
@@ -239,19 +300,29 @@ impl StreamManager {
                 replicas,
                 senders,
             ))),
-            LocalStreamStorage::Disk => {
-                let file_path = options
-                    .shuffle_dir
-                    .join(format!("{}", key.job_id))
-                    .join(format!("{}", key.stage))
-                    .join(format!(
-                        "shuffle_{}_{}_{}.data",
-                        key.partition, key.attempt, key.channel
-                    ));
-                Ok(Box::new(
-                    crate::stream_manager::local::DiskStream::new_with_senders(file_path, senders),
-                ))
+            LocalStreamStorage::Disk { .. } => {
+                let writer = map_output.ok_or_else(|| {
+                    ExecutionError::InternalError("missing map output writer".to_string())
+                })?;
+                let data_path = MapOutputKey::from(key).data_path(&options.shuffle_dir);
+                Ok(Box::new(DiskStream::new(
+                    data_path,
+                    key.channel,
+                    writer,
+                    senders,
+                )))
             }
+        }
+    }
+}
+
+impl From<&TaskStreamKey> for MapOutputKey {
+    fn from(key: &TaskStreamKey) -> Self {
+        Self {
+            job_id: key.job_id,
+            stage: key.stage,
+            partition: key.partition,
+            attempt: key.attempt,
         }
     }
 }

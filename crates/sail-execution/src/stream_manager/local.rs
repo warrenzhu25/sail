@@ -1,18 +1,21 @@
 use std::collections::VecDeque;
-use std::fs::File;
-use std::io::{BufReader, BufWriter};
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use datafusion::arrow::array::RecordBatch;
-use datafusion::arrow::ipc::writer::StreamWriter;
 use datafusion::common::Result;
+use futures::StreamExt;
 use log::debug;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tonic::codegen::tokio_stream::wrappers::ReceiverStream;
 
 use crate::error::{ExecutionError, ExecutionResult};
-use crate::stream::error::TaskStreamResult;
+use crate::stream::error::{TaskStreamError, TaskStreamResult};
 use crate::stream::reader::TaskStreamSource;
 use crate::stream::writer::{TaskStreamSink, TaskStreamSinkState};
+use crate::stream_manager::shuffle_file::{
+    read_map_output_channel, MapOutputStatus, MapOutputWriter,
+};
 
 pub trait LocalStream: Send {
     fn publish(&mut self) -> ExecutionResult<Box<dyn TaskStreamSink>>;
@@ -175,131 +178,128 @@ impl TaskStreamSink for MemoryStreamReplicaSender {
     }
 }
 
-/// A disk-backed stream that persists record batches to a data file and an index file.
+/// One channel of the disk-backed output of a map task.
+/// The data of all channels of a map task is stored in a single data file
+/// managed by a shared [`MapOutputWriter`].
 pub(crate) struct DiskStream {
-    file_path: std::path::PathBuf,
-    is_written: bool,
+    data_path: PathBuf,
+    channel: usize,
+    writer: Option<Arc<MapOutputWriter>>,
+    status: Option<watch::Receiver<MapOutputStatus>>,
     senders: Vec<mpsc::Sender<TaskStreamResult<RecordBatch>>>,
 }
 
 impl DiskStream {
-    pub fn new(file_path: std::path::PathBuf) -> Self {
-        Self::new_with_senders(file_path, vec![])
-    }
-
-    pub fn new_with_senders(
-        file_path: std::path::PathBuf,
+    /// Creates a stream for a channel that will be written via the shared map output writer.
+    pub fn new(
+        data_path: PathBuf,
+        channel: usize,
+        writer: Arc<MapOutputWriter>,
         senders: Vec<mpsc::Sender<TaskStreamResult<RecordBatch>>>,
     ) -> Self {
         Self {
-            file_path,
-            is_written: false,
+            data_path,
+            channel,
+            status: Some(writer.subscribe_status()),
+            writer: Some(writer),
             senders,
         }
     }
 
-    pub fn index_path(&self) -> std::path::PathBuf {
-        self.file_path.with_extension("index")
-    }
-
-    /// Read the partition shuffle statistics (total_bytes, total_records) from the index file.
-    #[cfg(test)]
-    pub fn read_stats(&self) -> Option<(u64, usize)> {
-        let content = std::fs::read_to_string(self.index_path()).ok()?;
-        let mut lines = content.lines();
-        let bytes = lines.next()?.parse::<u64>().ok()?;
-        let records = lines.next()?.parse::<usize>().ok()?;
-        Some((bytes, records))
+    /// Creates a read-only stream for a channel of an existing map output.
+    pub fn existing(data_path: PathBuf, channel: usize) -> Self {
+        Self {
+            data_path,
+            channel,
+            writer: None,
+            status: None,
+            senders: vec![],
+        }
     }
 }
 
 impl LocalStream for DiskStream {
     fn publish(&mut self) -> ExecutionResult<Box<dyn TaskStreamSink>> {
-        if self.is_written {
-            return Err(ExecutionError::InternalError(
-                "disk stream can only be written once".to_string(),
-            ));
-        }
-        self.is_written = true;
-        if let Some(parent) = self.file_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let tmp_file_path = self.file_path.with_extension("data.tmp");
-        let tmp_index_path = self.index_path().with_extension("index.tmp");
-        // The data file is created lazily when the first batch is written,
-        // so that empty shuffle channels do not create data files.
-        Ok(Box::new(DiskStreamWriter {
-            stream_writer: None,
-            final_file_path: self.file_path.clone(),
-            tmp_file_path,
-            final_index_path: self.index_path(),
-            tmp_index_path,
-            total_records: 0,
+        let writer = self.writer.take().ok_or_else(|| {
+            ExecutionError::InternalError("disk stream can only be written once".to_string())
+        })?;
+        Ok(Box::new(DiskStreamSink {
+            writer,
+            channel: self.channel,
             senders: std::mem::take(&mut self.senders),
         }))
     }
 
     fn subscribe(&mut self) -> ExecutionResult<TaskStreamSource> {
-        if !self.file_path.exists() {
-            // The data file is not created for empty streams, but the index file is always
-            // written when the stream is closed. If neither exists, the shuffle output has
-            // been lost (e.g. cleaned up), and we must not silently return an empty stream.
-            if self.index_path().exists() {
-                return Ok(Box::pin(futures::stream::empty()));
-            }
-            return Err(ExecutionError::InternalError(format!(
-                "shuffle output not found: {}",
-                self.file_path.display()
-            )));
-        }
-        let file = std::fs::File::open(&self.file_path)?;
-        if file.metadata()?.len() == 0 {
-            return Ok(Box::pin(futures::stream::empty()));
-        }
-        let file = BufReader::with_capacity(DISK_STREAM_BUFFER_SIZE, file);
-        let reader = match datafusion::arrow::ipc::reader::StreamReader::try_new(file, None) {
-            Ok(r) => r,
-            Err(e) => {
+        let status = match &self.status {
+            // The writer has been dropped without finalizing the map output.
+            Some(status)
+                if status.has_changed().is_err()
+                    && *status.borrow() == MapOutputStatus::Writing =>
+            {
                 return Err(ExecutionError::InternalError(format!(
-                    "failed to open arrow ipc stream reader: {e}"
+                    "shuffle output was not completed: {}",
+                    self.data_path.display()
                 )));
             }
+            Some(status) => status.borrow().clone(),
+            None => MapOutputStatus::Finalized,
         };
-
-        let stream = futures::stream::unfold(reader, |mut reader| async move {
-            match reader.next() {
-                Some(Ok(batch)) => Some((Ok(batch), reader)),
-                Some(Err(e)) => Some((
-                    Err(crate::stream::error::TaskStreamError::Unknown(
-                        e.to_string(),
-                    )),
-                    reader,
-                )),
-                None => None,
+        match status {
+            MapOutputStatus::Finalized => read_map_output_channel(&self.data_path, self.channel),
+            MapOutputStatus::Failed(e) => Err(ExecutionError::InternalError(format!(
+                "shuffle output failed for {}: {e}",
+                self.data_path.display()
+            ))),
+            MapOutputStatus::Writing => {
+                // The map output is not complete yet, so we wait for it to be finalized
+                // before reading the data. We never return partial data.
+                let mut status = self.status.clone().ok_or_else(|| {
+                    ExecutionError::InternalError("missing map output status".to_string())
+                })?;
+                let data_path = self.data_path.clone();
+                let channel = self.channel;
+                let source = async move {
+                    let result = status
+                        .wait_for(|x| *x != MapOutputStatus::Writing)
+                        .await
+                        .map(|x| x.clone());
+                    let error = |m: String| -> TaskStreamSource {
+                        Box::pin(futures::stream::once(async move {
+                            Err(TaskStreamError::Unknown(m))
+                        }))
+                    };
+                    match result {
+                        Ok(MapOutputStatus::Finalized) => {
+                            match read_map_output_channel(&data_path, channel) {
+                                Ok(x) => x,
+                                Err(e) => error(e.to_string()),
+                            }
+                        }
+                        Ok(MapOutputStatus::Failed(e)) => error(format!(
+                            "shuffle output failed for {}: {e}",
+                            data_path.display()
+                        )),
+                        Ok(MapOutputStatus::Writing) | Err(_) => error(format!(
+                            "shuffle output was not completed: {}",
+                            data_path.display()
+                        )),
+                    }
+                };
+                Ok(Box::pin(futures::stream::once(source).flatten()))
             }
-        });
-
-        Ok(Box::pin(stream))
+        }
     }
 }
 
-/// The buffer size for reading and writing disk stream files.
-/// Hash-partitioned shuffle output often consists of many small batches,
-/// so buffering avoids issuing many small read/write system calls.
-const DISK_STREAM_BUFFER_SIZE: usize = 256 * 1024;
-
-struct DiskStreamWriter {
-    stream_writer: Option<StreamWriter<BufWriter<File>>>,
-    final_file_path: std::path::PathBuf,
-    tmp_file_path: std::path::PathBuf,
-    final_index_path: std::path::PathBuf,
-    tmp_index_path: std::path::PathBuf,
-    total_records: usize,
+struct DiskStreamSink {
+    writer: Arc<MapOutputWriter>,
+    channel: usize,
     senders: Vec<mpsc::Sender<TaskStreamResult<RecordBatch>>>,
 }
 
 #[tonic::async_trait]
-impl TaskStreamSink for DiskStreamWriter {
+impl TaskStreamSink for DiskStreamSink {
     async fn write(&mut self, batch: TaskStreamResult<RecordBatch>) -> TaskStreamSinkState {
         let batch = match batch {
             Ok(b) => b,
@@ -310,29 +310,8 @@ impl TaskStreamSink for DiskStreamWriter {
             }
         };
 
-        self.total_records += batch.num_rows();
-
-        if self.stream_writer.is_none() {
-            let writer = File::create(&self.tmp_file_path)
-                .map(|f| BufWriter::with_capacity(DISK_STREAM_BUFFER_SIZE, f))
-                .map_err(|e| e.to_string())
-                .and_then(|f| StreamWriter::try_new(f, &batch.schema()).map_err(|e| e.to_string()));
-            match writer {
-                Ok(sw) => self.stream_writer = Some(sw),
-                Err(e) => {
-                    return TaskStreamSinkState::Error(
-                        datafusion::error::DataFusionError::Execution(e),
-                    );
-                }
-            }
-        }
-
-        if let Some(ref mut sw) = self.stream_writer {
-            if let Err(e) = sw.write(&batch) {
-                return TaskStreamSinkState::Error(datafusion::error::DataFusionError::Execution(
-                    e.to_string(),
-                ));
-            }
+        if let Err(e) = self.writer.write(self.channel, batch.clone()).await {
+            return TaskStreamSinkState::Error(e);
         }
 
         // Forward the batch to any waiting receivers. The batch must not be dropped
@@ -351,31 +330,9 @@ impl TaskStreamSink for DiskStreamWriter {
     }
 
     async fn close(mut self: Box<Self>) -> Result<()> {
-        let mut total_bytes = 0u64;
-        if let Some(mut sw) = self.stream_writer.take() {
-            sw.finish()
-                .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
-            let file = sw
-                .into_inner()
-                .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?
-                .into_inner()
-                .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
-            total_bytes = file.metadata()?.len();
-            drop(file);
-            // Atomically move the data file to its final destination.
-            std::fs::rename(&self.tmp_file_path, &self.final_file_path)?;
-        }
-
-        // Write simple index metadata (total bytes, total records) and move it
-        // to its final destination. The index file is always written, even for
-        // empty streams, so that its presence indicates a completed stream.
-        let index_content = format!("{}\n{}\n", total_bytes, self.total_records);
-        std::fs::write(&self.tmp_index_path, index_content)?;
-        std::fs::rename(&self.tmp_index_path, &self.final_index_path)?;
-
+        self.writer.close(self.channel).await?;
         // Drop senders to close channels for any pending receivers
         self.senders.clear();
-
         Ok(())
     }
 }
@@ -384,174 +341,398 @@ impl TaskStreamSink for DiskStreamWriter {
 mod tests {
     #![expect(clippy::unwrap_used)]
 
-    use std::sync::Arc;
+    use std::path::Path;
 
     use datafusion::arrow::array::Int32Array;
-    use datafusion::arrow::datatypes::{DataType, Field, Schema};
-    use futures::StreamExt;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 
     use super::*;
+    use crate::id::{JobId, TaskStreamKey};
+    use crate::stream::writer::LocalStreamStorage;
+    use crate::stream_manager::shuffle_file::{ShuffleIndex, DEFAULT_SHUFFLE_SPILL_THRESHOLD};
+    use crate::stream_manager::{StreamManager, StreamManagerOptions};
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("sail_test_{name}_{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]))
+    }
+
+    fn batch(values: Vec<i32>) -> RecordBatch {
+        RecordBatch::try_new(schema(), vec![Arc::new(Int32Array::from(values))]).unwrap()
+    }
+
+    fn list_files(dir: &Path) -> Vec<String> {
+        let mut files = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|x| x.unwrap().file_name().to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        files.sort();
+        files
+    }
+
+    /// Creates one disk stream per channel for a map task, sharing one map output writer.
+    fn create_streams(
+        data_path: &Path,
+        channels: usize,
+        spill_threshold: usize,
+    ) -> Vec<DiskStream> {
+        let writer = Arc::new(
+            MapOutputWriter::try_new(data_path.to_path_buf(), channels, spill_threshold).unwrap(),
+        );
+        (0..channels)
+            .map(|c| DiskStream::new(data_path.to_path_buf(), c, writer.clone(), vec![]))
+            .collect()
+    }
+
+    async fn read_all(mut source: TaskStreamSource) -> Vec<RecordBatch> {
+        let mut out = vec![];
+        while let Some(x) = source.next().await {
+            out.push(x.unwrap());
+        }
+        out
+    }
+
+    /// Writes the given batches for each channel, interleaving writes across channels.
+    async fn write_channels(streams: &mut [DiskStream], data: &[Vec<RecordBatch>]) -> Result<()> {
+        let mut sinks = streams
+            .iter_mut()
+            .map(|s| s.publish().unwrap())
+            .collect::<Vec<_>>();
+        let rounds = data.iter().map(|x| x.len()).max().unwrap_or(0);
+        for i in 0..rounds {
+            for (c, sink) in sinks.iter_mut().enumerate() {
+                if let Some(b) = data[c].get(i) {
+                    assert!(matches!(
+                        sink.write(Ok(b.clone())).await,
+                        TaskStreamSinkState::Ok
+                    ));
+                }
+            }
+        }
+        for sink in sinks {
+            sink.close().await?;
+        }
+        Ok(())
+    }
+
+    fn test_data(channels: usize) -> Vec<Vec<RecordBatch>> {
+        (0..channels)
+            .map(|c| match c % 4 {
+                // empty channel
+                0 => vec![],
+                // channel with only an empty batch
+                1 => vec![RecordBatch::new_empty(schema())],
+                _ => (0..c)
+                    .map(|i| {
+                        batch(((c * 100 + i * 10) as i32..(c * 100 + i * 10 + 3) as i32).collect())
+                    })
+                    .collect(),
+            })
+            .collect()
+    }
 
     #[tokio::test]
-    async fn test_disk_stream_round_trip() -> Result<()> {
-        let temp_dir = std::env::temp_dir().join(format!("sail_test_{}", rand::random::<u64>()));
-        std::fs::create_dir_all(&temp_dir)?;
-        let file_path = temp_dir.join("test_stream.data");
-        let mut disk_stream = DiskStream::new(file_path.clone());
+    async fn test_disk_stream_round_trip_many_channels() -> Result<()> {
+        let dir = temp_dir("round_trip");
+        let data_path = dir.join("shuffle_3_1.data");
+        let channels = 17;
+        let data = test_data(channels);
+        let mut streams = create_streams(&data_path, channels, DEFAULT_SHUFFLE_SPILL_THRESHOLD);
+        write_channels(&mut streams, &data).await?;
 
-        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5]))],
-        )?;
+        // There is only one data file and one index file for all channels.
+        assert_eq!(
+            list_files(&dir),
+            vec!["shuffle_3_1.data", "shuffle_3_1.index"]
+        );
+        let index = ShuffleIndex::read(&dir.join("shuffle_3_1.index")).unwrap();
+        assert_eq!(index.channels(), channels);
+        assert_eq!(index.data_size(), std::fs::metadata(&data_path)?.len());
+        for (c, batches) in data.iter().enumerate() {
+            let rows = batches.iter().map(|b| b.num_rows() as u64).sum::<u64>();
+            assert_eq!(index.channel_records(c), Some(rows));
+            assert_eq!(index.channel_bytes(c) == Some(0), batches.is_empty());
+            assert_eq!(&read_all(streams[c].subscribe().unwrap()).await, batches);
+            // A channel can be read multiple times, also via a read-only stream.
+            let mut existing = DiskStream::existing(data_path.clone(), c);
+            assert_eq!(&read_all(existing.subscribe().unwrap()).await, batches);
+        }
+        assert!(DiskStream::existing(data_path.clone(), channels)
+            .subscribe()
+            .is_err());
 
-        let mut sink = disk_stream.publish().unwrap();
-        let state = sink.write(Ok(batch.clone())).await;
-        assert!(matches!(state, TaskStreamSinkState::Ok));
-        sink.close().await?;
-
-        assert!(file_path.exists());
-        let index_path = disk_stream.index_path();
-        assert!(index_path.exists());
-
-        // Check index file content (bytes, rows)
-        let index_str = std::fs::read_to_string(&index_path)?;
-        assert!(index_str.contains("\n5\n"));
-        let stats = disk_stream.read_stats();
-        assert!(stats.is_some());
-        let (bytes, records) = stats.unwrap();
-        assert!(bytes > 0);
-        assert_eq!(records, 5);
-
-        // Subscribe and read back
-        let mut source = disk_stream.subscribe().unwrap();
-        let read_batch = source.next().await.unwrap().unwrap();
-        assert_eq!(read_batch, batch);
-        assert!(source.next().await.is_none());
-
-        let _ = std::fs::remove_dir_all(&temp_dir);
-
+        let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_disk_stream_multi_batch_and_empty_batch() -> Result<()> {
-        let temp_dir = std::env::temp_dir().join(format!("sail_test_mb_{}", rand::random::<u64>()));
-        std::fs::create_dir_all(&temp_dir)?;
-        let file_path = temp_dir.join("test_stream_mb.data");
-        let mut disk_stream = DiskStream::new(file_path.clone());
+    async fn test_disk_stream_spill() -> Result<()> {
+        let dir = temp_dir("spill");
+        let data_path = dir.join("shuffle_0_0.data");
+        let channels = 9;
+        let data = test_data(channels);
+        let size = batch(vec![1, 2, 3]).get_array_memory_size();
+        // Spill after every few batches, and keep some batches in memory at the end.
+        let mut streams = create_streams(&data_path, channels, size * 4 + 1);
+        let mut sinks = streams
+            .iter_mut()
+            .map(|s| s.publish().unwrap())
+            .collect::<Vec<_>>();
+        let mut spilled = false;
+        for i in 0..channels {
+            for (c, sink) in sinks.iter_mut().enumerate() {
+                if let Some(b) = data[c].get(i) {
+                    assert!(matches!(
+                        sink.write(Ok(b.clone())).await,
+                        TaskStreamSinkState::Ok
+                    ));
+                }
+            }
+            spilled |= dir.join("shuffle_0_0.spill").exists();
+        }
+        assert!(spilled);
+        // Close the channels in a different order.
+        for sink in sinks.into_iter().rev() {
+            sink.close().await?;
+        }
 
-        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
-        let batch1 = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
-        )?;
-        let empty_batch = RecordBatch::new_empty(schema.clone());
-        let batch2 =
-            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![4, 5]))])?;
+        // The spill file is removed after the data file is written.
+        assert_eq!(
+            list_files(&dir),
+            vec!["shuffle_0_0.data", "shuffle_0_0.index"]
+        );
+        for (c, batches) in data.iter().enumerate() {
+            assert_eq!(&read_all(streams[c].subscribe().unwrap()).await, batches);
+        }
 
-        let mut sink = disk_stream.publish().unwrap();
-        assert!(matches!(
-            sink.write(Ok(batch1.clone())).await,
-            TaskStreamSinkState::Ok
-        ));
-        assert!(matches!(
-            sink.write(Ok(empty_batch.clone())).await,
-            TaskStreamSinkState::Ok
-        ));
-        assert!(matches!(
-            sink.write(Ok(batch2.clone())).await,
-            TaskStreamSinkState::Ok
-        ));
-        sink.close().await?;
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
 
-        let (bytes, records) = disk_stream.read_stats().unwrap();
-        assert!(bytes > 0);
-        assert_eq!(records, 5); // 3 + 0 + 2
+    #[tokio::test]
+    async fn test_disk_stream_spill_every_batch() -> Result<()> {
+        let dir = temp_dir("spill_all");
+        let data_path = dir.join("shuffle_0_0.data");
+        let channels = 6;
+        let data = test_data(channels);
+        let mut streams = create_streams(&data_path, channels, 1);
+        write_channels(&mut streams, &data).await?;
+        assert_eq!(
+            list_files(&dir),
+            vec!["shuffle_0_0.data", "shuffle_0_0.index"]
+        );
+        for (c, batches) in data.iter().enumerate() {
+            assert_eq!(&read_all(streams[c].subscribe().unwrap()).await, batches);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
 
-        let mut source = disk_stream.subscribe().unwrap();
-        let r1 = source.next().await.unwrap().unwrap();
-        assert_eq!(r1, batch1);
-        let r2 = source.next().await.unwrap().unwrap();
-        assert_eq!(r2, empty_batch);
-        let r3 = source.next().await.unwrap().unwrap();
-        assert_eq!(r3, batch2);
-        assert!(source.next().await.is_none());
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_disk_stream_concurrent_readers() -> Result<()> {
+        let dir = temp_dir("concurrent");
+        let data_path = dir.join("shuffle_0_0.data");
+        let channels = 32;
+        let data = test_data(channels);
+        let mut streams = create_streams(&data_path, channels, 1024);
+        write_channels(&mut streams, &data).await?;
 
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut handles = vec![];
+        for _ in 0..4 {
+            for (c, stream) in streams.iter_mut().enumerate() {
+                let source = stream.subscribe().unwrap();
+                let expected = data[c].clone();
+                handles.push(tokio::spawn(async move {
+                    assert_eq!(read_all(source).await, expected);
+                }));
+            }
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     }
 
     #[tokio::test]
     async fn test_disk_stream_with_pending_senders() -> Result<()> {
-        let temp_dir =
-            std::env::temp_dir().join(format!("sail_test_senders_{}", rand::random::<u64>()));
-        std::fs::create_dir_all(&temp_dir)?;
-        let file_path = temp_dir.join("test_senders.data");
+        let dir = temp_dir("senders");
+        let data_path = dir.join("shuffle_0_0.data");
+        let writer = Arc::new(MapOutputWriter::try_new(
+            data_path.clone(),
+            1,
+            DEFAULT_SHUFFLE_SPILL_THRESHOLD,
+        )?);
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut stream = DiskStream::new(data_path.clone(), 0, writer, vec![tx]);
+        let b = batch(vec![10, 20, 30]);
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
-        let mut disk_stream = DiskStream::new_with_senders(file_path.clone(), vec![tx]);
-
-        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int32Array::from(vec![10, 20, 30]))],
-        )?;
-
-        let mut sink = disk_stream.publish().unwrap();
-        sink.write(Ok(batch.clone())).await;
+        let mut sink = stream.publish().unwrap();
+        assert!(stream.publish().is_err());
+        sink.write(Ok(b.clone())).await;
         sink.close().await?;
 
         // Receiver from pending senders should get the batch and channel close
-        let received = rx.recv().await.unwrap().unwrap();
-        assert_eq!(received, batch);
+        assert_eq!(rx.recv().await.unwrap().unwrap(), b);
         assert!(rx.recv().await.is_none());
 
         // Subsequent subscribers can still read from disk
-        let mut source = disk_stream.subscribe().unwrap();
-        let from_disk = source.next().await.unwrap().unwrap();
-        assert_eq!(from_disk, batch);
-        assert!(source.next().await.is_none());
+        assert_eq!(read_all(stream.subscribe().unwrap()).await, vec![b]);
 
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_disk_stream_empty_file() -> Result<()> {
-        let temp_dir =
-            std::env::temp_dir().join(format!("sail_test_empty_{}", rand::random::<u64>()));
-        std::fs::create_dir_all(&temp_dir)?;
-        let file_path = temp_dir.join("test_empty.data");
-        let mut disk_stream = DiskStream::new(file_path.clone());
+    async fn test_disk_stream_subscribe_before_finalized() -> Result<()> {
+        let dir = temp_dir("early");
+        let data_path = dir.join("shuffle_0_0.data");
+        let mut streams = create_streams(&data_path, 2, DEFAULT_SHUFFLE_SPILL_THRESHOLD);
+        let mut sink0 = streams[0].publish().unwrap();
+        let sink1 = streams[1].publish().unwrap();
+        let b = batch(vec![1, 2]);
+        sink0.write(Ok(b.clone())).await;
+        sink0.close().await?;
 
-        let sink = disk_stream.publish().unwrap();
-        sink.close().await?;
+        // The map output is not complete until all channels are closed,
+        // so the reader must wait instead of observing partial data.
+        let source = streams[0].subscribe().unwrap();
+        let reader = tokio::spawn(read_all(source));
+        tokio::task::yield_now().await;
+        assert!(!reader.is_finished());
+        sink1.close().await?;
+        assert_eq!(reader.await.unwrap(), vec![b]);
 
-        let (bytes, records) = disk_stream.read_stats().unwrap();
-        assert_eq!(bytes, 0);
-        assert_eq!(records, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
 
-        let mut source = disk_stream.subscribe().unwrap();
-        assert!(source.next().await.is_none());
+    #[tokio::test]
+    async fn test_disk_stream_incomplete_output_is_an_error() -> Result<()> {
+        let dir = temp_dir("incomplete");
+        let data_path = dir.join("shuffle_0_0.data");
+        let mut streams = create_streams(&data_path, 2, 1);
+        let mut sink0 = streams[0].publish().unwrap();
+        let sink1 = streams[1].publish().unwrap();
+        sink0.write(Ok(batch(vec![1]))).await;
+        let mut source = streams[0].subscribe().unwrap();
+        // The map task fails and the sinks are dropped without being closed.
+        drop(sink0);
+        drop(sink1);
+        assert!(source.next().await.unwrap().is_err());
+        assert!(streams[1].subscribe().is_err());
+        // The partial output is cleaned up.
+        assert!(list_files(&dir).is_empty());
 
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     }
 
     #[tokio::test]
     async fn test_disk_stream_lost_output_is_an_error() -> Result<()> {
-        let temp_dir =
-            std::env::temp_dir().join(format!("sail_test_lost_{}", rand::random::<u64>()));
-        std::fs::create_dir_all(&temp_dir)?;
-        let file_path = temp_dir.join("test_lost.data");
-        let mut disk_stream = DiskStream::new(file_path.clone());
-
-        let sink = disk_stream.publish().unwrap();
+        let dir = temp_dir("lost");
+        let data_path = dir.join("shuffle_0_0.data");
+        let mut streams = create_streams(&data_path, 1, DEFAULT_SHUFFLE_SPILL_THRESHOLD);
+        let sink = streams[0].publish().unwrap();
         sink.close().await?;
+        assert!(read_all(streams[0].subscribe().unwrap()).await.is_empty());
+
         // Simulate the shuffle output being cleaned up.
-        std::fs::remove_dir_all(&temp_dir)?;
-        assert!(disk_stream.subscribe().is_err());
+        std::fs::remove_dir_all(&dir)?;
+        assert!(streams[0].subscribe().is_err());
+        assert!(DiskStream::existing(data_path, 0).subscribe().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_shuffle_index_encoding() {
+        let index = ShuffleIndex::try_new(vec![0, 0, 10, 25], vec![0, 3, 4]).unwrap();
+        let data = index.encode();
+        assert_eq!(data.len(), 16 + 8 * 7);
+        assert_eq!(ShuffleIndex::decode(&data).unwrap(), index);
+        assert_eq!(index.channel_range(1), Some((0, 10)));
+        assert_eq!(index.channel_bytes(2), Some(15));
+        assert_eq!(index.channel_records(2), Some(4));
+        assert_eq!(index.channel_range(3), None);
+
+        let empty = ShuffleIndex::try_new(vec![0], vec![]).unwrap();
+        assert_eq!(ShuffleIndex::decode(&empty.encode()).unwrap(), empty);
+
+        // invalid magic
+        let mut bad = data.clone();
+        bad[0] = b'X';
+        assert!(ShuffleIndex::decode(&bad).is_err());
+        // truncated or trailing data
+        assert!(ShuffleIndex::decode(&data[..data.len() - 1]).is_err());
+        assert!(ShuffleIndex::decode(&data[..data.len() - 8]).is_err());
+        assert!(ShuffleIndex::decode(&[data.clone(), vec![0; 8]].concat()).is_err());
+        assert!(ShuffleIndex::decode(&data[..12]).is_err());
+        assert!(ShuffleIndex::decode(&[]).is_err());
+        // huge channel count
+        let mut huge = data[..16].to_vec();
+        huge[8..16].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(ShuffleIndex::decode(&huge).is_err());
+        // invalid offsets
+        assert!(ShuffleIndex::try_new(vec![0, 10, 5], vec![1, 1]).is_err());
+        assert!(ShuffleIndex::try_new(vec![1, 10], vec![1]).is_err());
+        assert!(ShuffleIndex::try_new(vec![0, 10], vec![1, 1]).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_stream_manager_disk_streams() -> Result<()> {
+        let dir = temp_dir("manager");
+        let options = StreamManagerOptions::default().with_shuffle_dir(dir.clone());
+        let mut manager = StreamManager::new(options);
+        let channels = 3;
+        let key = |channel| TaskStreamKey {
+            job_id: JobId::from(1),
+            stage: 2,
+            partition: 3,
+            attempt: 4,
+            channel,
+        };
+        let mut sinks = vec![];
+        for c in 0..channels {
+            sinks.push(
+                manager
+                    .create_local_stream(key(c), LocalStreamStorage::Disk { channels }, schema())
+                    .unwrap(),
+            );
+        }
+        // The shared writer is owned by the sinks once all channels are created.
+        assert!(manager.map_outputs.is_empty());
+        assert!(manager
+            .create_local_stream(key(0), LocalStreamStorage::Disk { channels }, schema())
+            .is_err());
+        assert!(manager
+            .create_local_stream(
+                key(channels),
+                LocalStreamStorage::Disk { channels },
+                schema()
+            )
+            .is_err());
+        assert!(manager.map_outputs.is_empty());
+        for (c, sink) in sinks.iter_mut().enumerate() {
+            sink.write(Ok(batch(vec![c as i32]))).await;
+        }
+        for sink in sinks {
+            sink.close().await?;
+        }
+        let stage_dir = dir.join("1").join("2");
+        assert_eq!(
+            list_files(&stage_dir),
+            vec!["shuffle_3_4.data", "shuffle_3_4.index"]
+        );
+
+        manager.remove_local_streams(JobId::from(1), Some(2));
+        assert!(!stage_dir.exists());
+        let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     }
 }
