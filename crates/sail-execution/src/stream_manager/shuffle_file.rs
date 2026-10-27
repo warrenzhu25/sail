@@ -470,7 +470,8 @@ impl MapOutputState {
             Ok::<_, DataFusionError>(spill)
         })
         .await
-        .map_err(|e| DataFusionError::External(Box::new(e)))??;
+        .map_err(|e| DataFusionError::External(Box::new(e)))?
+        .map_err(|e| describe_storage_error(e, &self.spill_path))?;
         self.spill = Some(spill);
         self.free_memory();
         Ok(())
@@ -493,7 +494,8 @@ impl MapOutputState {
             write_map_output(&data_path, &spill_path, buffers, spill, records, fsync)
         })
         .await
-        .map_err(|e| DataFusionError::External(Box::new(e)))??;
+        .map_err(|e| DataFusionError::External(Box::new(e)))?
+        .map_err(|e| describe_storage_error(e, &self.data_path))?;
         self.finalized = true;
         self.free_memory();
         Ok(())
@@ -519,6 +521,41 @@ impl Drop for MapOutputState {
             });
         }
     }
+}
+
+/// Returns whether the error is caused by insufficient storage space.
+fn is_storage_full(error: &(dyn std::error::Error + 'static)) -> bool {
+    const ENOSPC: i32 = 28;
+    let mut current = Some(error);
+    while let Some(e) = current {
+        if let Some(e) = e.downcast_ref::<std::io::Error>() {
+            if e.kind() == std::io::ErrorKind::StorageFull || e.raw_os_error() == Some(ENOSPC) {
+                return true;
+            }
+        }
+        if let Some(ArrowError::IoError(_, e)) = e.downcast_ref::<ArrowError>() {
+            if e.kind() == std::io::ErrorKind::StorageFull || e.raw_os_error() == Some(ENOSPC) {
+                return true;
+            }
+        }
+        current = e.source();
+    }
+    // Some errors only keep the message of the underlying I/O error.
+    error.to_string().contains("No space left on device")
+}
+
+/// Reports insufficient storage space for shuffle files as a clear error.
+/// Other errors are returned unchanged.
+fn describe_storage_error(error: DataFusionError, path: &Path) -> DataFusionError {
+    if !is_storage_full(&error) {
+        return error;
+    }
+    let dir = path.parent().unwrap_or(path);
+    DataFusionError::ResourcesExhausted(format!(
+        "no space left on device for shuffle files in {}; free up disk space or set \
+         `cluster.shuffle_dir` to a volume with more space: {error}",
+        dir.display()
+    ))
 }
 
 /// Runs blocking work (e.g. file system operations) in the background,

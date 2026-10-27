@@ -988,6 +988,32 @@ mod tests {
         Ok(())
     }
 
+    /// Running out of disk space while writing shuffle output is reported as a clear
+    /// error, and the partial output is cleaned up.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_disk_stream_storage_full() -> Result<()> {
+        let dir = temp_dir("storage_full");
+        let data_path = dir.join("shuffle_0_0.data");
+        // Writing to `/dev/full` always fails with `ENOSPC`.
+        std::os::unix::fs::symlink("/dev/full", data_path.with_extension("data.tmp"))?;
+        let channels = 3;
+        let mut streams = create_streams(&data_path, channels, DEFAULT_SHUFFLE_SPILL_THRESHOLD);
+        let error = write_channels(&mut streams, &test_data(channels))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, datafusion::error::DataFusionError::ResourcesExhausted(m) if m.contains("no space left on device")),
+            "unexpected error: {error}"
+        );
+        drop(streams);
+        // The partial output (including the symlink in place of the temporary file)
+        // is removed, and no index file is written.
+        wait_until(|| list_files(&dir).is_empty()).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
     #[test]
     fn test_shuffle_index_encoding() {
         let index = ShuffleIndex::try_new(vec![0, 0, 10, 25], vec![0, 3, 4]).unwrap();
