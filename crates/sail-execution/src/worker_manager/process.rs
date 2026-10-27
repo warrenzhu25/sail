@@ -119,8 +119,9 @@ fn set_parent_death_signal(command: &mut Command) {
     // SAFETY: The closure only calls async-signal-safe functions.
     unsafe {
         command.pre_exec(move || {
-            // Note that the signal is delivered when the *thread* that spawned the child exits.
-            // Worker processes are spawned from long-lived async runtime threads.
+            // Note that the signal is delivered when the *thread* that spawned the child exits,
+            // so worker processes are spawned from a dedicated thread that lives as long as
+            // the process (see `spawn_on_launcher_thread`).
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
@@ -135,6 +136,49 @@ fn set_parent_death_signal(command: &mut Command) {
 
 #[cfg(not(target_os = "linux"))]
 fn set_parent_death_signal(_command: &mut Command) {}
+
+/// A request to spawn a worker process on the launcher thread.
+type SpawnRequest = (
+    Command,
+    tokio::runtime::Handle,
+    std::sync::mpsc::Sender<std::io::Result<Child>>,
+);
+
+/// Spawns the command on a dedicated thread that lives as long as the process.
+///
+/// The parent death signal of the child process is tied to the thread that spawned
+/// the child. Async runtime threads are not suitable since a worker thread can be
+/// converted into a blocking thread (e.g. via `block_in_place`), and blocking threads
+/// exit when they are idle, which would kill the worker processes unexpectedly.
+fn spawn_on_launcher_thread(command: Command) -> std::io::Result<Child> {
+    static LAUNCHER: std::sync::OnceLock<std::sync::Mutex<std::sync::mpsc::Sender<SpawnRequest>>> =
+        std::sync::OnceLock::new();
+    let launcher = LAUNCHER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<SpawnRequest>();
+        let spawned = std::thread::Builder::new()
+            .name("sail-worker-launcher".to_string())
+            .spawn(move || {
+                for (mut command, handle, result) in rx {
+                    // The child process must be registered with the async runtime
+                    // of the caller so that it can be awaited there.
+                    let _guard = handle.enter();
+                    let _ = result.send(command.spawn());
+                }
+            });
+        if let Err(e) = spawned {
+            error!("failed to start the worker launcher thread: {e}");
+        }
+        std::sync::Mutex::new(tx)
+    });
+    let (tx, rx) = std::sync::mpsc::channel();
+    launcher
+        .lock()
+        .map_err(|_| std::io::Error::other("worker launcher lock is poisoned"))?
+        .send((command, tokio::runtime::Handle::current(), tx))
+        .map_err(|_| std::io::Error::other("worker launcher thread is not running"))?;
+    rx.recv()
+        .map_err(|_| std::io::Error::other("worker launcher thread is not running"))?
+}
 
 /// Forwards the output of the worker process to the standard error of the driver process,
 /// with each line prefixed by the worker ID.
@@ -233,7 +277,7 @@ impl WorkerManager for ProcessWorkerManager {
         options: WorkerLaunchOptions,
     ) -> ExecutionResult<()> {
         let shuffle_dir = options.shuffle_dir.clone();
-        let mut command = self.build_command(id, options);
+        let command = self.build_command(id, options);
         let mut workers = self.workers.lock().await;
         // Forget the workers whose processes have exited.
         workers.retain(|_, w| !w.supervisor.is_finished());
@@ -242,7 +286,8 @@ impl WorkerManager for ProcessWorkerManager {
                 "worker {id} is already running"
             )));
         }
-        let mut child = command.spawn().map_err(|e| {
+        // Spawning a process is fast, so it is fine to wait for the launcher thread here.
+        let mut child = spawn_on_launcher_thread(command).map_err(|e| {
             ExecutionError::InternalError(format!(
                 "failed to launch worker {id} process using {}: {e}",
                 self.options.program.display()
@@ -508,5 +553,32 @@ exec sleep 1000
             .await;
         assert!(result.is_err());
         assert!(manager.stop().await.is_ok());
+    }
+
+    /// The worker process must survive the exit of the thread that requested the launch,
+    /// since the parent death signal is tied to the spawning thread.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[expect(clippy::unwrap_used)]
+    async fn test_worker_process_survives_exit_of_requesting_thread() {
+        let mut command = Command::new("sleep");
+        command.arg("30").kill_on_drop(true);
+        set_parent_death_signal(&mut command);
+        let handle = tokio::runtime::Handle::current();
+        // Request the launch from a short-lived thread, similar to a blocking thread
+        // that exits when it is idle.
+        let mut child = std::thread::spawn(move || {
+            let _guard = handle.enter();
+            spawn_on_launcher_thread(command)
+        })
+        .join()
+        .unwrap()
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "the worker process was killed when the requesting thread exited"
+        );
+        child.kill().await.unwrap();
     }
 }
