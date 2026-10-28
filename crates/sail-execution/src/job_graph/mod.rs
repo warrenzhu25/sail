@@ -123,6 +123,11 @@ pub struct StageInput {
     pub stage: usize,
     pub mode: InputMode,
     pub partition_ranges: Option<Vec<Range<usize>>>,
+    /// For each partition in `partition_ranges`, an optional range of upstream (map)
+    /// partitions to read. This is used to split a skewed channel across multiple tasks,
+    /// where each task reads the channel from a subset of the map partitions.
+    /// All map partitions are read if this is `None` or the entry is `None`.
+    pub map_ranges: Option<Vec<Option<Range<usize>>>>,
 }
 
 impl StageInput {
@@ -131,6 +136,7 @@ impl StageInput {
             stage,
             mode,
             partition_ranges: None,
+            map_ranges: None,
         }
     }
 }

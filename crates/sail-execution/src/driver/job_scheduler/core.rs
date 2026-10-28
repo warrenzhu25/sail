@@ -675,6 +675,7 @@ impl JobScheduler {
         }
 
         let mut combined_channel_bytes = vec![0u64; channels];
+        let mut input_channel_bytes = HashMap::new();
         for &i in &shuffle_inputs {
             let u = stage.inputs[i].stage;
             let upstream_partitions = job.stages[u].tasks.len();
@@ -722,9 +723,13 @@ impl JobScheduler {
             if !skewed.is_empty() {
                 debug!("job {job_id} stage {s} upstream stage {u} detected skewed channels: {skewed:?}");
             }
-            for (acc, b) in combined_channel_bytes.iter_mut().zip(stats.channel_bytes) {
+            for (acc, b) in combined_channel_bytes
+                .iter_mut()
+                .zip(stats.channel_bytes.iter())
+            {
                 *acc += b;
             }
+            input_channel_bytes.insert(i, stats.channel_bytes);
         }
 
         let target_partition_size = effective_target_partition_size(
@@ -733,13 +738,34 @@ impl JobScheduler {
             options.min_partition_size,
             options.min_parallelism,
         );
-        let ranges = crate::driver::job_scheduler::adaptive::coalesce_shuffle_partitions(
-            &combined_channel_bytes,
-            target_partition_size,
-        );
+        let skew_join = if options.skew_join_enabled && shuffle_inputs.len() == 2 {
+            find_skew_join(&stage.plan)
+        } else {
+            None
+        };
+        let (ranges, map_ranges) = match skew_join {
+            Some(join) => plan_skew_join_partitions(
+                &join,
+                &input_channel_bytes,
+                &combined_channel_bytes,
+                |i| job.stages[stage.inputs[i].stage].tasks.len(),
+                target_partition_size,
+                options,
+            ),
+            None => (
+                crate::driver::job_scheduler::adaptive::coalesce_shuffle_partitions(
+                    &combined_channel_bytes,
+                    target_partition_size,
+                ),
+                HashMap::new(),
+            ),
+        };
         let n = ranges.len();
-        if n == 0 || n >= channels {
+        if n == 0 || (n >= channels && map_ranges.is_empty()) {
             return None;
+        }
+        if !map_ranges.is_empty() {
+            debug!("job {job_id} stage {s}: splitting skewed join partitions into {n} tasks");
         }
 
         // Rewrite the plan of this stage (shuffle inputs only)
@@ -783,6 +809,7 @@ impl JobScheduler {
         let stages = job.graph.stages_mut();
         for &i in &shuffle_inputs {
             stages[s].inputs[i].partition_ranges = Some(ranges.clone());
+            stages[s].inputs[i].map_ranges = map_ranges.get(&i).cloned();
         }
         stages[s].plan = new_plan;
         for (c, p) in new_consumer_plans {
@@ -1096,10 +1123,16 @@ impl JobScheduler {
                 if let Some(ranges) = &input.partition_ranges {
                     ranges
                         .iter()
-                        .map(|range| {
+                        .enumerate()
+                        .map(|(i, range)| {
+                            let maps = input
+                                .map_ranges
+                                .as_ref()
+                                .and_then(|x| x.get(i).cloned().flatten())
+                                .unwrap_or(0..partitions);
                             let mut keys = Vec::new();
                             for channel in range.clone() {
-                                for partition in 0..partitions {
+                                for partition in maps.clone() {
                                     keys.push(TaskInputKey {
                                         partition,
                                         attempt: latest_attempt(input.stage, partition)?,
@@ -1260,6 +1293,209 @@ struct StageGroup {
 ///
 /// The partitioning becomes [`Partitioning::UnknownPartitioning`] since a coalesced
 /// partition contains a range of the original hash or round-robin partitions.
+/// A partitioned join in a stage that reads two shuffle inputs,
+/// whose skewed partitions can be split across multiple tasks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SkewJoin {
+    /// The stage input index of the left side of the join.
+    left: usize,
+    /// The stage input index of the right side of the join.
+    right: usize,
+    /// Whether the left side can be split (each left row is processed by one task,
+    /// while the right side is read in full by each task).
+    split_left: bool,
+    /// Whether the right side can be split.
+    split_right: bool,
+}
+
+/// Returns the single stage input read by the subtree, if the subtree only contains
+/// operators that process each row independently of the other rows of the partition.
+fn row_wise_stage_input(plan: &Arc<dyn ExecutionPlan>) -> Option<usize> {
+    if let Some(placeholder) = plan.as_any().downcast_ref::<StageInputExec<usize>>() {
+        return Some(*placeholder.input());
+    }
+    if !matches!(
+        plan.name(),
+        "ProjectionExec" | "FilterExec" | "CoalesceBatchesExec"
+    ) {
+        return None;
+    }
+    match plan.children().as_slice() {
+        [child] => row_wise_stage_input(child),
+        _ => None,
+    }
+}
+
+/// Finds a partitioned join whose skewed partitions can be split.
+/// The operators above the join must not depend on seeing all the rows of a partition
+/// (e.g. only projections, filters, and partial aggregations are allowed).
+fn find_skew_join(plan: &Arc<dyn ExecutionPlan>) -> Option<SkewJoin> {
+    use datafusion::common::JoinType;
+    use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
+    use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode, SortMergeJoinExec};
+
+    let any = plan.as_any();
+    let join = if let Some(join) = any.downcast_ref::<HashJoinExec>() {
+        if !matches!(join.partition_mode(), PartitionMode::Partitioned) {
+            return None;
+        }
+        Some((join.left(), join.right(), *join.join_type()))
+    } else {
+        any.downcast_ref::<SortMergeJoinExec>()
+            .map(|join| (join.left(), join.right(), join.join_type()))
+    };
+    if let Some((left, right, join_type)) = join {
+        let left = row_wise_stage_input(left)?;
+        let right = row_wise_stage_input(right)?;
+        if left == right {
+            return None;
+        }
+        let split_left = matches!(
+            join_type,
+            JoinType::Inner
+                | JoinType::Left
+                | JoinType::LeftSemi
+                | JoinType::LeftAnti
+                | JoinType::LeftMark
+        );
+        let split_right = matches!(
+            join_type,
+            JoinType::Inner | JoinType::Right | JoinType::RightSemi | JoinType::RightAnti
+        );
+        return (split_left || split_right).then_some(SkewJoin {
+            left,
+            right,
+            split_left,
+            split_right,
+        });
+    }
+    let allowed = matches!(
+        plan.name(),
+        "ProjectionExec" | "FilterExec" | "CoalesceBatchesExec"
+    ) || any
+        .downcast_ref::<AggregateExec>()
+        .is_some_and(|x| matches!(x.mode(), AggregateMode::Partial));
+    if !allowed {
+        return None;
+    }
+    match plan.children().as_slice() {
+        [child] => find_skew_join(child),
+        _ => None,
+    }
+}
+
+/// Plans the partitions of a stage with a partitioned join, coalescing small channels
+/// and splitting skewed channels of a splittable side by ranges of map partitions.
+/// Returns the channel range of each partition and, for each input that is split,
+/// the map range of each partition.
+#[expect(clippy::type_complexity)]
+fn plan_skew_join_partitions(
+    join: &SkewJoin,
+    input_channel_bytes: &HashMap<usize, Vec<u64>>,
+    combined_channel_bytes: &[u64],
+    map_partitions: impl Fn(usize) -> usize,
+    target_partition_size: u64,
+    options: &JobSchedulerOptions,
+) -> (
+    Vec<std::ops::Range<usize>>,
+    HashMap<usize, Vec<Option<std::ops::Range<usize>>>>,
+) {
+    use crate::driver::job_scheduler::adaptive::split_skew_partition;
+
+    let empty = vec![];
+    let skewed = |input: usize| -> HashSet<usize> {
+        let bytes = input_channel_bytes.get(&input).unwrap_or(&empty);
+        let mut stats = StageShuffleStats::new(bytes.len());
+        stats.channel_bytes = bytes.clone();
+        stats
+            .detect_skew_partitions(options.skew_factor, options.min_skew_threshold)
+            .into_iter()
+            .collect()
+    };
+    let left_skewed = if join.split_left {
+        skewed(join.left)
+    } else {
+        HashSet::new()
+    };
+    let right_skewed = if join.split_right {
+        skewed(join.right)
+    } else {
+        HashSet::new()
+    };
+
+    let mut ranges = vec![];
+    let mut left_maps = vec![];
+    let mut right_maps = vec![];
+    let mut start = 0;
+    let mut size = 0u64;
+    let flush = |ranges: &mut Vec<_>,
+                 left_maps: &mut Vec<_>,
+                 right_maps: &mut Vec<_>,
+                 start: usize,
+                 end: usize| {
+        if start < end {
+            ranges.push(start..end);
+            left_maps.push(None);
+            right_maps.push(None);
+        }
+    };
+    for (c, &bytes) in combined_channel_bytes.iter().enumerate() {
+        // Split the larger skewed side if both sides are skewed.
+        let side = match (left_skewed.contains(&c), right_skewed.contains(&c)) {
+            (true, true) => {
+                let l = input_channel_bytes.get(&join.left).map_or(0, |x| x[c]);
+                let r = input_channel_bytes.get(&join.right).map_or(0, |x| x[c]);
+                Some(if l >= r { join.left } else { join.right })
+            }
+            (true, false) => Some(join.left),
+            (false, true) => Some(join.right),
+            (false, false) => None,
+        };
+        if let Some(side) = side {
+            flush(&mut ranges, &mut left_maps, &mut right_maps, start, c);
+            let side_bytes = input_channel_bytes.get(&side).map_or(0, |x| x[c]);
+            let splits = side_bytes
+                .div_ceil(target_partition_size.max(1))
+                .try_into()
+                .unwrap_or(usize::MAX);
+            for maps in split_skew_partition(map_partitions(side), splits) {
+                ranges.push(c..c + 1);
+                if side == join.left {
+                    left_maps.push(Some(maps));
+                    right_maps.push(None);
+                } else {
+                    left_maps.push(None);
+                    right_maps.push(Some(maps));
+                }
+            }
+            start = c + 1;
+            size = 0;
+            continue;
+        }
+        if size > 0 && size + bytes > target_partition_size {
+            flush(&mut ranges, &mut left_maps, &mut right_maps, start, c);
+            start = c;
+            size = 0;
+        }
+        size += bytes;
+    }
+    flush(
+        &mut ranges,
+        &mut left_maps,
+        &mut right_maps,
+        start,
+        combined_channel_bytes.len(),
+    );
+    let mut map_ranges = HashMap::new();
+    if left_maps.iter().any(Option::is_some) {
+        map_ranges.insert(join.left, left_maps);
+    }
+    if right_maps.iter().any(Option::is_some) {
+        map_ranges.insert(join.right, right_maps);
+    }
+    (ranges, map_ranges)
+}
+
 fn rewrite_stage_input_partitioning(
     plan: Arc<dyn ExecutionPlan>,
     inputs: &HashSet<usize>,
@@ -2209,6 +2445,91 @@ mod tests {
         job.stages[1].tasks[0].attempts[1].job_output_fetched = true;
         JobScheduler::roll_back_consumers(&mut job, 0, "output lost");
         assert!(job.failure.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn test_plan_skew_join_partitions() {
+        let join = SkewJoin {
+            left: 0,
+            right: 1,
+            split_left: true,
+            split_right: false,
+        };
+        let options = JobSchedulerOptions::default().with_min_skew_threshold(100);
+        let left = vec![10, 10, 1000, 10];
+        let right = vec![10, 10, 10, 10];
+        let combined = left
+            .iter()
+            .zip(&right)
+            .map(|(a, b)| a + b)
+            .collect::<Vec<_>>();
+        let bytes = HashMap::from([(0, left), (1, right)]);
+        let (ranges, maps) =
+            plan_skew_join_partitions(&join, &bytes, &combined, |_| 4, 100, &options);
+        // Channels 0 and 1 are coalesced, the skewed channel 2 is split by the 4 map
+        // partitions of the left side, and channel 3 is a separate partition.
+        assert_eq!(ranges, vec![0..2, 2..3, 2..3, 2..3, 2..3, 3..4]);
+        assert_eq!(
+            maps.get(&0).unwrap(),
+            &vec![None, Some(0..1), Some(1..2), Some(2..3), Some(3..4), None]
+        );
+        // The right side is read in full by each task of the skewed channel.
+        assert!(!maps.contains_key(&1));
+
+        // The skewed side cannot be split (e.g. a right outer join skewed on the left).
+        let join = SkewJoin {
+            split_left: false,
+            split_right: true,
+            ..join
+        };
+        let (ranges, maps) =
+            plan_skew_join_partitions(&join, &bytes, &combined, |_| 4, 100, &options);
+        assert!(maps.is_empty());
+        assert_eq!(ranges, vec![0..2, 2..3, 3..4]);
+    }
+
+    #[test]
+    fn test_find_skew_join() -> Result<(), Box<dyn std::error::Error>> {
+        use datafusion::common::{JoinType, NullEquality};
+        use datafusion::physical_expr::expressions::Column;
+        use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+        let side = || -> Result<Arc<dyn ExecutionPlan>, Box<dyn std::error::Error>> {
+            Ok(Arc::new(RepartitionExec::try_new(
+                Arc::new(EmptyExec::new(schema.clone())),
+                Partitioning::Hash(vec![Arc::new(Column::new("x", 0))], 4),
+            )?))
+        };
+        let join = |join_type: JoinType| -> Result<_, Box<dyn std::error::Error>> {
+            let plan: Arc<dyn ExecutionPlan> = Arc::new(HashJoinExec::try_new(
+                side()?,
+                side()?,
+                vec![(
+                    Arc::new(Column::new("x", 0)) as _,
+                    Arc::new(Column::new("x", 0)) as _,
+                )],
+                None,
+                &join_type,
+                None,
+                PartitionMode::Partitioned,
+                NullEquality::NullEqualsNothing,
+                false,
+            )?);
+            let graph = graph_for(plan)?;
+            Ok(graph
+                .stages()
+                .iter()
+                .find_map(|stage| find_skew_join(&stage.plan)))
+        };
+        let inner = join(JoinType::Inner)?.ok_or("join not found")?;
+        assert!(inner.split_left && inner.split_right);
+        assert_ne!(inner.left, inner.right);
+        let left = join(JoinType::Left)?.ok_or("join not found")?;
+        assert!(left.split_left && !left.split_right);
+        // Neither side of a full outer join can be split.
+        assert!(join(JoinType::Full)?.is_none());
         Ok(())
     }
 }

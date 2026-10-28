@@ -205,6 +205,7 @@ pub struct ClusterConfig {
     pub shuffle_fsync: bool,
     pub shuffle_compression: String,
     pub adaptive_shuffle_enabled: bool,
+    pub adaptive_skew_join_enabled: bool,
     pub adaptive_shuffle_target_partition_bytes: u64,
     pub rpc_retry_strategy: RetryStrategy,
 }

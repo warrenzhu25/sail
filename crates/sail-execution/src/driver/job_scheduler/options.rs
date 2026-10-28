@@ -22,6 +22,8 @@ pub struct JobSchedulerOptions {
     /// coalescing does not reduce the parallelism of CPU-heavy stages.
     pub min_parallelism: usize,
     pub skew_factor: f64,
+    /// Whether to split skewed partitions of partitioned joins across multiple tasks.
+    pub skew_join_enabled: bool,
     pub min_skew_threshold: u64,
 }
 
@@ -37,6 +39,7 @@ impl Default for JobSchedulerOptions {
             min_partition_size: 1024 * 1024,
             min_parallelism: 1,
             skew_factor: 5.0,
+            skew_join_enabled: true,
             min_skew_threshold: 128 * 1024 * 1024,
         }
     }
@@ -79,6 +82,11 @@ impl JobSchedulerOptions {
         self
     }
 
+    pub fn with_skew_join_enabled(mut self, skew_join_enabled: bool) -> Self {
+        self.skew_join_enabled = skew_join_enabled;
+        self
+    }
+
     pub fn with_skew_factor(mut self, skew_factor: f64) -> Self {
         self.skew_factor = skew_factor;
         self
@@ -108,6 +116,7 @@ impl From<&DriverOptions> for JobSchedulerOptions {
                 * options.worker_task_slots)
                 .max(1),
             skew_factor: 5.0,
+            skew_join_enabled: options.adaptive_skew_join_enabled,
             min_skew_threshold: 128 * 1024 * 1024,
         }
     }

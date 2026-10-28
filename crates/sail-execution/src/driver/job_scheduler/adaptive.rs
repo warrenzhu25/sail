@@ -205,7 +205,6 @@ pub fn effective_target_partition_size(
 }
 
 /// Splits map partitions into sub-ranges for reading a skewed channel across multiple tasks.
-#[cfg(test)]
 #[expect(clippy::single_range_in_vec_init)]
 pub fn split_skew_partition(num_map_partitions: usize, num_splits: usize) -> Vec<Range<usize>> {
     if num_map_partitions == 0 || num_splits <= 1 {
