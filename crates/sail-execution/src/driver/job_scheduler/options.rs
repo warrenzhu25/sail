@@ -43,7 +43,7 @@ impl Default for JobSchedulerOptions {
             min_parallelism: 1,
             skew_factor: 5.0,
             skew_join_enabled: true,
-            broadcast_join_threshold: 32 * 1024 * 1024,
+            broadcast_join_threshold: 0,
             min_skew_threshold: 128 * 1024 * 1024,
         }
     }
