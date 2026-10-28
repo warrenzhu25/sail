@@ -53,6 +53,7 @@ fn rand_suffix() -> u64 {
 fn worker_manager() -> Arc<ProcessWorkerManager> {
     Arc::new(ProcessWorkerManager::new(ProcessWorkerManagerOptions {
         program: PathBuf::from(env!("CARGO_BIN_EXE_sail")),
+        program_args: vec![],
         stop_grace_period: Duration::from_secs(10),
     }))
 }
