@@ -5,6 +5,7 @@ use std::time::Duration;
 use sail_server::RetryStrategy;
 
 use crate::driver::DriverOptions;
+use crate::stream_manager::shuffle_file::ShuffleCompression;
 
 #[readonly::make]
 pub struct WorkerPoolOptions {
@@ -21,6 +22,7 @@ pub struct WorkerPoolOptions {
     pub shuffle_dir: PathBuf,
     pub shuffle_spill_threshold: usize,
     pub shuffle_fsync: bool,
+    pub shuffle_compression: ShuffleCompression,
 }
 
 impl From<&DriverOptions> for WorkerPoolOptions {
@@ -39,6 +41,7 @@ impl From<&DriverOptions> for WorkerPoolOptions {
             shuffle_dir: options.shuffle_dir.clone(),
             shuffle_spill_threshold: options.shuffle_spill_threshold,
             shuffle_fsync: options.shuffle_fsync,
+            shuffle_compression: options.shuffle_compression,
         }
     }
 }

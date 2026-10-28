@@ -7,6 +7,7 @@ use sail_common::runtime::RuntimeHandle;
 use sail_server::RetryStrategy;
 
 use crate::id::WorkerId;
+use crate::stream_manager::shuffle_file::ShuffleCompression;
 use crate::worker_manager::WorkerLaunchOptions;
 
 #[readonly::make]
@@ -29,6 +30,7 @@ pub struct WorkerOptions {
     pub shuffle_spill_threshold: usize,
     /// Whether to sync the shuffle files to stable storage.
     pub shuffle_fsync: bool,
+    pub shuffle_compression: ShuffleCompression,
     pub runtime: RuntimeHandle,
     pub session: SessionContext,
 }
@@ -66,6 +68,9 @@ impl WorkerOptions {
             ),
             shuffle_spill_threshold: config.cluster.shuffle_spill_threshold_bytes,
             shuffle_fsync: config.cluster.shuffle_fsync,
+            shuffle_compression: ShuffleCompression::from_config(
+                &config.cluster.shuffle_compression,
+            ),
             runtime,
             session,
         }
@@ -93,6 +98,7 @@ impl WorkerOptions {
             shuffle_dir: options.shuffle_dir.join(format!("worker_{id}")),
             shuffle_spill_threshold: options.shuffle_spill_threshold,
             shuffle_fsync: options.shuffle_fsync,
+            shuffle_compression: options.shuffle_compression,
             runtime: runtime.clone(),
             session,
         }

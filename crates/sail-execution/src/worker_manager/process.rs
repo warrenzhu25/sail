@@ -381,6 +381,7 @@ mod tests {
     use sail_server::RetryStrategy;
 
     use super::*;
+    use crate::stream_manager::shuffle_file::ShuffleCompression;
 
     /// A fake worker program that creates a worker shuffle directory in the same way as
     /// the real worker, records its environment, and then waits until it is killed.
@@ -409,6 +410,7 @@ exec sleep 1000
             shuffle_dir,
             shuffle_spill_threshold: 1024,
             shuffle_fsync: false,
+            shuffle_compression: ShuffleCompression::Lz4,
         }
     }
 

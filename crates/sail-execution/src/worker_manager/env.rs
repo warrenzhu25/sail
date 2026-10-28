@@ -48,6 +48,7 @@ pub(crate) fn build_worker_env(
         shuffle_dir: _,
         shuffle_spill_threshold,
         shuffle_fsync,
+        shuffle_compression,
     } = options;
     let WorkerEnvOptions {
         listen_host,
@@ -105,6 +106,10 @@ pub(crate) fn build_worker_env(
         (
             ClusterConfigEnv::SHUFFLE_FSYNC.to_string(),
             shuffle_fsync.to_string(),
+        ),
+        (
+            ClusterConfigEnv::SHUFFLE_COMPRESSION.to_string(),
+            shuffle_compression.to_string(),
         ),
     ];
     if random_port {
@@ -168,6 +173,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::stream_manager::shuffle_file::ShuffleCompression;
 
     fn launch_options() -> WorkerLaunchOptions {
         WorkerLaunchOptions {
@@ -184,6 +190,7 @@ mod tests {
             shuffle_dir: PathBuf::from("/driver/shuffle"),
             shuffle_spill_threshold: 1024,
             shuffle_fsync: true,
+            shuffle_compression: ShuffleCompression::Zstd,
         }
     }
 

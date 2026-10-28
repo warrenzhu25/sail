@@ -6,6 +6,7 @@ use sail_common::config::AppConfig;
 use sail_common::runtime::RuntimeHandle;
 use sail_server::RetryStrategy;
 
+use crate::stream_manager::shuffle_file::ShuffleCompression;
 use crate::worker_manager::WorkerManager;
 
 #[readonly::make]
@@ -34,6 +35,7 @@ pub struct DriverOptions {
     pub shuffle_spill_threshold: usize,
     /// Whether to sync the shuffle files to stable storage.
     pub shuffle_fsync: bool,
+    pub shuffle_compression: ShuffleCompression,
     pub adaptive_shuffle_enabled: bool,
     pub adaptive_shuffle_target_partition_bytes: u64,
     pub rpc_retry_strategy: RetryStrategy,
@@ -79,6 +81,9 @@ impl DriverOptions {
                 .join(crate::driver::shuffle_dir::driver_shuffle_dir_name()),
             shuffle_spill_threshold: config.cluster.shuffle_spill_threshold_bytes,
             shuffle_fsync: config.cluster.shuffle_fsync,
+            shuffle_compression: ShuffleCompression::from_config(
+                &config.cluster.shuffle_compression,
+            ),
             adaptive_shuffle_enabled: config.cluster.adaptive_shuffle_enabled,
             adaptive_shuffle_target_partition_bytes: config
                 .cluster

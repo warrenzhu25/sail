@@ -30,7 +30,8 @@ use std::sync::{Arc, Mutex};
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::error::ArrowError;
 use datafusion::arrow::ipc::reader::StreamReader;
-use datafusion::arrow::ipc::writer::StreamWriter;
+use datafusion::arrow::ipc::writer::{IpcWriteOptions, StreamWriter};
+use datafusion::arrow::ipc::CompressionType;
 use datafusion::common::{DataFusionError, Result};
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use tokio::sync::watch;
@@ -61,6 +62,52 @@ pub(crate) struct ShuffleWriteOptions {
     pub spill_threshold: usize,
     /// Whether to sync the data and index files (and their directory) to stable storage.
     pub fsync: bool,
+    /// The compression of the Arrow IPC data in the shuffle files.
+    pub compression: ShuffleCompression,
+}
+
+/// The compression of the Arrow IPC data in the shuffle files.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ShuffleCompression {
+    None,
+    #[default]
+    Lz4,
+    Zstd,
+}
+
+impl ShuffleCompression {
+    /// Parses the configuration value. Invalid values fall back to the default
+    /// with a warning, so that a typo does not prevent the cluster from starting.
+    pub fn from_config(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "none" | "" => Self::None,
+            "lz4" => Self::Lz4,
+            "zstd" => Self::Zstd,
+            other => {
+                log::warn!("invalid shuffle compression `{other}`, using the default");
+                Self::default()
+            }
+        }
+    }
+
+    fn ipc_write_options(&self) -> Result<IpcWriteOptions, ArrowError> {
+        let compression = match self {
+            Self::None => None,
+            Self::Lz4 => Some(CompressionType::LZ4_FRAME),
+            Self::Zstd => Some(CompressionType::ZSTD),
+        };
+        IpcWriteOptions::default().try_with_compression(compression)
+    }
+}
+
+impl std::fmt::Display for ShuffleCompression {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::None => write!(f, "none"),
+            Self::Lz4 => write!(f, "lz4"),
+            Self::Zstd => write!(f, "zstd"),
+        }
+    }
 }
 
 impl Default for ShuffleWriteOptions {
@@ -68,6 +115,7 @@ impl Default for ShuffleWriteOptions {
         Self {
             spill_threshold: DEFAULT_SHUFFLE_SPILL_THRESHOLD,
             fsync: false,
+            compression: ShuffleCompression::default(),
         }
     }
 }
@@ -82,6 +130,12 @@ impl ShuffleWriteOptions {
     #[cfg(test)]
     pub fn with_fsync(mut self, fsync: bool) -> Self {
         self.fsync = fsync;
+        self
+    }
+
+    #[cfg(test)]
+    pub fn with_compression(mut self, compression: ShuffleCompression) -> Self {
+        self.compression = compression;
         self
     }
 }
@@ -349,11 +403,19 @@ impl<W: Write> Write for CountingWriter<W> {
 }
 
 /// Encodes the batches as one Arrow IPC stream.
-fn encode_batches<W: Write>(writer: &mut W, batches: &[RecordBatch]) -> Result<(), ArrowError> {
+fn encode_batches<W: Write>(
+    writer: &mut W,
+    batches: &[RecordBatch],
+    compression: ShuffleCompression,
+) -> Result<(), ArrowError> {
     let Some(first) = batches.first() else {
         return Ok(());
     };
-    let mut writer = StreamWriter::try_new(writer, &first.schema())?;
+    let mut writer = StreamWriter::try_new_with_options(
+        writer,
+        &first.schema(),
+        compression.ipc_write_options()?,
+    )?;
     for batch in batches {
         writer.write(batch)?;
     }
@@ -401,13 +463,17 @@ impl SpillFile {
         })
     }
 
-    fn spill(&mut self, buffers: &[Vec<RecordBatch>]) -> Result<()> {
+    fn spill(
+        &mut self,
+        buffers: &[Vec<RecordBatch>],
+        compression: ShuffleCompression,
+    ) -> Result<()> {
         for (c, batches) in buffers.iter().enumerate() {
             if batches.is_empty() {
                 continue;
             }
             let start = self.writer.position;
-            encode_batches(&mut self.writer, batches)?;
+            encode_batches(&mut self.writer, batches, compression)?;
             self.ranges[c].push((start, self.writer.position - start));
         }
         self.writer.flush()?;
@@ -438,6 +504,7 @@ struct MapOutputState {
     spill_path: PathBuf,
     spill_threshold: usize,
     fsync: bool,
+    compression: ShuffleCompression,
     buffers: Vec<Vec<RecordBatch>>,
     buffered_bytes: usize,
     records: Vec<u64>,
@@ -461,12 +528,13 @@ impl MapOutputState {
         let spill_path = self.spill_path.clone();
         let channels = self.closed.len();
         let buffers = self.take_buffers();
+        let compression = self.compression;
         let spill = tokio::task::spawn_blocking(move || {
             let mut spill = match spill {
                 Some(x) => x,
                 None => SpillFile::create(&spill_path, channels)?,
             };
-            spill.spill(&buffers)?;
+            spill.spill(&buffers, compression)?;
             Ok::<_, DataFusionError>(spill)
         })
         .await
@@ -490,8 +558,17 @@ impl MapOutputState {
         let data_path = self.data_path.clone();
         let spill_path = self.spill_path.clone();
         let fsync = self.fsync;
+        let compression = self.compression;
         tokio::task::spawn_blocking(move || {
-            write_map_output(&data_path, &spill_path, buffers, spill, records, fsync)
+            write_map_output(
+                &data_path,
+                &spill_path,
+                buffers,
+                spill,
+                records,
+                fsync,
+                compression,
+            )
         })
         .await
         .map_err(|e| DataFusionError::External(Box::new(e)))?
@@ -590,6 +667,7 @@ fn write_map_output(
     spill: Option<SpillFile>,
     records: Vec<u64>,
     fsync: bool,
+    compression: ShuffleCompression,
 ) -> Result<()> {
     let tmp_data_path = data_path.with_extension("data.tmp");
     let file = File::create(&tmp_data_path)?;
@@ -609,7 +687,7 @@ fn write_map_output(
                 copy_range(file, *offset, *length, &mut out, &mut copy_buffer)?;
             }
         }
-        encode_batches(&mut out, batches)?;
+        encode_batches(&mut out, batches, compression)?;
         offsets.push(out.position);
         checksums.push(out.take_checksum());
     }
@@ -664,6 +742,7 @@ impl MapOutputWriter {
                 spill_path,
                 spill_threshold: options.spill_threshold,
                 fsync: options.fsync,
+                compression: options.compression,
                 buffers: vec![vec![]; channels],
                 buffered_bytes: 0,
                 records: vec![0; channels],

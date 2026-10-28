@@ -203,6 +203,7 @@ pub struct ClusterConfig {
     pub shuffle_dir: String,
     pub shuffle_spill_threshold_bytes: usize,
     pub shuffle_fsync: bool,
+    pub shuffle_compression: String,
     pub adaptive_shuffle_enabled: bool,
     pub adaptive_shuffle_target_partition_bytes: u64,
     pub rpc_retry_strategy: RetryStrategy,
@@ -663,5 +664,6 @@ impl ClusterConfigEnv {
         SHUFFLE_DIR,
         SHUFFLE_SPILL_THRESHOLD_BYTES,
         SHUFFLE_FSYNC,
+        SHUFFLE_COMPRESSION,
     }
 }

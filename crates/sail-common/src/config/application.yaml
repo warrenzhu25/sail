@@ -220,6 +220,14 @@
     when the memory pool cannot accommodate more data.
   experimental: true
 
+- key: cluster.shuffle_compression
+  type: string
+  default: "lz4"
+  description: |
+    The compression of the shuffle data written to disk when `cluster.shuffle_mode` is `blocking`.
+    Valid values are `none`, `lz4`, and `zstd`.
+  experimental: true
+
 - key: cluster.shuffle_fsync
   type: boolean
   default: "false"

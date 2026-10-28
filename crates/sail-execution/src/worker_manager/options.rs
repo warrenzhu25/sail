@@ -3,6 +3,8 @@ use std::time::Duration;
 
 use sail_server::RetryStrategy;
 
+use crate::stream_manager::shuffle_file::ShuffleCompression;
+
 #[derive(Debug, Clone)]
 pub struct WorkerLaunchOptions {
     pub enable_tls: bool,
@@ -18,4 +20,5 @@ pub struct WorkerLaunchOptions {
     pub shuffle_dir: PathBuf,
     pub shuffle_spill_threshold: usize,
     pub shuffle_fsync: bool,
+    pub shuffle_compression: ShuffleCompression,
 }

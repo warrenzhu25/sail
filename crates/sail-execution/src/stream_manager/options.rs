@@ -42,6 +42,7 @@ impl From<&DriverOptions> for StreamManagerOptions {
             shuffle_write: ShuffleWriteOptions {
                 spill_threshold: options.shuffle_spill_threshold,
                 fsync: options.shuffle_fsync,
+                compression: options.shuffle_compression,
             },
         }
     }
@@ -59,6 +60,7 @@ impl From<&WorkerOptions> for StreamManagerOptions {
             shuffle_write: ShuffleWriteOptions {
                 spill_threshold: options.shuffle_spill_threshold,
                 fsync: options.shuffle_fsync,
+                compression: options.shuffle_compression,
             },
         }
     }

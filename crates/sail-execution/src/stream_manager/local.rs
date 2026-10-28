@@ -397,7 +397,7 @@ mod tests {
     use crate::id::{JobId, TaskStreamKey};
     use crate::stream::writer::LocalStreamStorage;
     use crate::stream_manager::shuffle_file::{
-        ShuffleIndex, ShuffleWriteOptions, DEFAULT_SHUFFLE_SPILL_THRESHOLD,
+        ShuffleCompression, ShuffleIndex, ShuffleWriteOptions, DEFAULT_SHUFFLE_SPILL_THRESHOLD,
     };
     use crate::stream_manager::{LocalStreamState, StreamManager, StreamManagerOptions};
 
@@ -538,6 +538,55 @@ mod tests {
         assert!(read_error(DiskStream::existing(data_path.clone(), channels).subscribe()).await);
 
         let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// Shuffle data can be written and read with each compression,
+    /// including spilled data, and compression reduces the data size.
+    #[tokio::test]
+    async fn test_disk_stream_compression() -> Result<()> {
+        let channels = 3;
+        // Highly compressible data.
+        let data = (0..channels)
+            .map(|c| {
+                (0..4)
+                    .map(|_| batch(vec![c as i32; 4096]))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let mut sizes = vec![];
+        for compression in [
+            ShuffleCompression::None,
+            ShuffleCompression::Lz4,
+            ShuffleCompression::Zstd,
+        ] {
+            let dir = temp_dir("compression");
+            let data_path = dir.join("shuffle_0_0.data");
+            let writer = Arc::new(
+                MapOutputWriter::try_new(
+                    data_path.clone(),
+                    channels,
+                    ShuffleWriteOptions::default()
+                        .with_spill_threshold(1)
+                        .with_compression(compression),
+                )
+                .unwrap(),
+            );
+            let mut streams = (0..channels)
+                .map(|c| DiskStream::new(data_path.clone(), c, writer.clone(), vec![]))
+                .collect::<Vec<_>>();
+            write_channels(&mut streams, &data).await?;
+            for (c, batches) in data.iter().enumerate() {
+                let mut existing = DiskStream::existing(data_path.clone(), c);
+                assert_eq!(&read_all(existing.subscribe().unwrap()).await, batches);
+            }
+            sizes.push(std::fs::metadata(&data_path)?.len());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        assert!(
+            sizes[1] < sizes[0] && sizes[2] < sizes[0],
+            "sizes: {sizes:?}"
+        );
         Ok(())
     }
 

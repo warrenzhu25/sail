@@ -94,6 +94,7 @@ impl WorkerPool {
             shuffle_dir: self.options.shuffle_dir.clone(),
             shuffle_spill_threshold: self.options.shuffle_spill_threshold,
             shuffle_fsync: self.options.shuffle_fsync,
+            shuffle_compression: self.options.shuffle_compression,
         };
         let worker_manager = Arc::clone(&self.worker_manager);
         let handle = ctx.handle().clone();
