@@ -508,6 +508,8 @@ pub struct CatalogConfig {
 pub struct OptimizerConfig {
     pub enable_join_reorder: bool,
     pub expand_views_at_output: bool,
+    pub broadcast_join_threshold_bytes: usize,
+    pub broadcast_join_threshold_rows: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

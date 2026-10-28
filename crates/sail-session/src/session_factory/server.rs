@@ -232,6 +232,10 @@ impl ServerSessionFactory {
     fn apply_optimizer_config(&mut self, config: &mut SessionConfig) {
         let optimizer = &mut config.options_mut().optimizer;
         optimizer.expand_views_at_output = self.config.optimizer.expand_views_at_output;
+        optimizer.hash_join_single_partition_threshold =
+            self.config.optimizer.broadcast_join_threshold_bytes;
+        optimizer.hash_join_single_partition_threshold_rows =
+            self.config.optimizer.broadcast_join_threshold_rows;
     }
 
     fn apply_execution_parquet_config(&mut self, config: &mut SessionConfig) {
