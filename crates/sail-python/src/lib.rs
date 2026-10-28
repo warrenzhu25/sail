@@ -14,6 +14,16 @@ use pyo3::prelude::*;
 /// and various submodules.
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // Worker processes (in the `local-process-cluster` mode) must run the Sail CLI via
+    // the Python interpreter, since the current executable is the Python interpreter.
+    let executable: String = m.py().import("sys")?.getattr("executable")?.extract()?;
+    if !executable.is_empty() {
+        sail_common::config::set_cli_command(vec![
+            executable,
+            "-m".to_string(),
+            "pysail".to_string(),
+        ]);
+    }
     flight::register_module(m)?;
     spark::register_module(m)?;
     m.add_function(wrap_pyfunction!(cli::main, m)?)?;

@@ -19,19 +19,33 @@ use crate::worker_manager::{WorkerLaunchOptions, WorkerManager};
 pub struct ProcessWorkerManagerOptions {
     /// The path of the `sail` executable used to launch the workers.
     pub program: PathBuf,
+    /// The arguments passed to the program before the `worker` command
+    /// (e.g. `["-m", "pysail"]` when the program is a Python interpreter).
+    pub program_args: Vec<String>,
     /// The time to wait for a worker process to exit on its own after the worker
     /// has been asked to stop, before the process is killed.
     pub stop_grace_period: Duration,
 }
 
 impl ProcessWorkerManagerOptions {
-    /// Creates options that launch workers using the current executable.
+    /// Creates options that launch workers using the Sail CLI command if it has been set
+    /// (e.g. when Sail runs inside a Python interpreter via PySail),
+    /// or the current executable otherwise.
     pub fn from_current_exe() -> ExecutionResult<Self> {
-        let program = std::env::current_exe().map_err(|e| {
-            ExecutionError::InternalError(format!("failed to get the current executable: {e}"))
-        })?;
+        let (program, program_args) = match sail_common::config::cli_command() {
+            Some([program, args @ ..]) => (PathBuf::from(program), args.to_vec()),
+            _ => {
+                let program = std::env::current_exe().map_err(|e| {
+                    ExecutionError::InternalError(format!(
+                        "failed to get the current executable: {e}"
+                    ))
+                })?;
+                (program, vec![])
+            }
+        };
         Ok(Self {
             program,
+            program_args,
             stop_grace_period: Duration::from_secs(10),
         })
     }
@@ -99,6 +113,7 @@ impl ProcessWorkerManager {
         );
         let mut command = Command::new(&self.options.program);
         command
+            .args(&self.options.program_args)
             .arg("worker")
             // The Sail CLI sets this variable for its own child processes to behave as
             // Python interpreters, which must not apply to the worker processes.
@@ -449,6 +464,7 @@ exec sleep 1000
 
         let manager = ProcessWorkerManager::new(ProcessWorkerManagerOptions {
             program,
+            program_args: vec![],
             stop_grace_period: Duration::from_millis(100),
         });
         for id in [1u64, 2] {
@@ -546,6 +562,7 @@ exec sleep 1000
     async fn test_process_worker_launch_failure() {
         let manager = ProcessWorkerManager::new(ProcessWorkerManagerOptions {
             program: PathBuf::from("/nonexistent/sail"),
+            program_args: vec![],
             stop_grace_period: Duration::from_millis(100),
         });
         let result = manager
@@ -580,5 +597,40 @@ exec sleep 1000
             "the worker process was killed when the requesting thread exited"
         );
         child.kill().await.unwrap();
+    }
+
+    /// Workers can be launched via an interpreter with leading arguments
+    /// (e.g. `python -m pysail worker`).
+    #[tokio::test]
+    #[expect(clippy::unwrap_used)]
+    async fn test_process_worker_with_program_args() {
+        let root = std::env::temp_dir().join(format!(
+            "sail-process-worker-args-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let shuffle_dir = root.join("shuffle");
+        std::fs::create_dir_all(&shuffle_dir).unwrap();
+        let script = root.join("fake-worker.sh");
+        // The script is run by the interpreter, so it does not need to be executable.
+        std::fs::write(&script, FAKE_WORKER).unwrap();
+
+        let manager = ProcessWorkerManager::new(ProcessWorkerManagerOptions {
+            program: PathBuf::from("/bin/sh"),
+            program_args: vec![script.to_string_lossy().to_string()],
+            stop_grace_period: Duration::from_millis(100),
+        });
+        manager
+            .launch_worker(1.into(), launch_options(shuffle_dir.clone()))
+            .await
+            .unwrap();
+        let env_file = shuffle_dir.join("env_1");
+        assert!(wait_for(|| env_file.exists()).await, "worker not started");
+        let dirs = worker_dirs(&shuffle_dir, 1);
+        assert_eq!(dirs.len(), 1);
+        let args = std::fs::read_to_string(dirs[0].join("args")).unwrap();
+        assert_eq!(args.trim(), "worker");
+        manager.stop().await.unwrap();
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
