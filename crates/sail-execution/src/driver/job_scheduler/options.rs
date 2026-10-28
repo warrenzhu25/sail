@@ -24,6 +24,9 @@ pub struct JobSchedulerOptions {
     pub skew_factor: f64,
     /// Whether to split skewed partitions of partitioned joins across multiple tasks.
     pub skew_join_enabled: bool,
+    /// The maximum total shuffle output size (in bytes) of a join side for converting a
+    /// partitioned hash join into a broadcast hash join (0 disables the conversion).
+    pub broadcast_join_threshold: u64,
     pub min_skew_threshold: u64,
 }
 
@@ -40,6 +43,7 @@ impl Default for JobSchedulerOptions {
             min_parallelism: 1,
             skew_factor: 5.0,
             skew_join_enabled: true,
+            broadcast_join_threshold: 32 * 1024 * 1024,
             min_skew_threshold: 128 * 1024 * 1024,
         }
     }
@@ -87,6 +91,11 @@ impl JobSchedulerOptions {
         self
     }
 
+    pub fn with_broadcast_join_threshold(mut self, broadcast_join_threshold: u64) -> Self {
+        self.broadcast_join_threshold = broadcast_join_threshold;
+        self
+    }
+
     pub fn with_skew_factor(mut self, skew_factor: f64) -> Self {
         self.skew_factor = skew_factor;
         self
@@ -117,6 +126,7 @@ impl From<&DriverOptions> for JobSchedulerOptions {
                 .max(1),
             skew_factor: 5.0,
             skew_join_enabled: options.adaptive_skew_join_enabled,
+            broadcast_join_threshold: options.adaptive_broadcast_join_threshold_bytes,
             min_skew_threshold: 128 * 1024 * 1024,
         }
     }

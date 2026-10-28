@@ -738,11 +738,25 @@ impl JobScheduler {
             options.min_partition_size,
             options.min_parallelism,
         );
-        let skew_join = if options.skew_join_enabled && shuffle_inputs.len() == 2 {
+        let join = if shuffle_inputs.len() == 2 {
             find_skew_join(&stage.plan)
         } else {
             None
         };
+        if let Some(join) = join.as_ref().filter(|x| x.hash_join) {
+            if let Some(small) = choose_broadcast_side(join, &input_channel_bytes, options) {
+                return Self::convert_to_broadcast_join(
+                    job_id,
+                    job,
+                    s,
+                    join,
+                    small,
+                    &input_channel_bytes,
+                    target_partition_size,
+                );
+            }
+        }
+        let skew_join = join.filter(|_| options.skew_join_enabled);
         let (ranges, map_ranges) = match skew_join {
             Some(join) => plan_skew_join_partitions(
                 &join,
@@ -781,27 +795,7 @@ impl JobScheduler {
                 return None;
             }
         };
-        let mut new_consumer_plans = vec![];
-        for &c in &consumers {
-            let indices = job.graph.stages()[c]
-                .inputs
-                .iter()
-                .enumerate()
-                .filter(|(_, input)| input.stage == s && matches!(input.mode, InputMode::Merge))
-                .map(|(i, _)| i)
-                .collect::<HashSet<_>>();
-            if indices.is_empty() {
-                continue;
-            }
-            match rewrite_stage_input_partitioning(job.graph.stages()[c].plan.clone(), &indices, n)
-            {
-                Ok(p) => new_consumer_plans.push((c, p)),
-                Err(e) => {
-                    warn!("job {job_id} stage {c}: failed to rewrite plan for adaptive coalescing: {e}");
-                    return None;
-                }
-            }
-        }
+        let new_consumer_plans = Self::rewrite_merge_consumers(job_id, job, s, n)?;
 
         debug!(
             "job {job_id} stage {s}: coalescing {channels} channels into {n} partitions (ranges: {ranges:?})"
@@ -819,6 +813,133 @@ impl JobScheduler {
             .map(|_| TaskDescriptor { attempts: vec![] })
             .collect();
         Some(n)
+    }
+
+    /// Converts a partitioned hash join into a broadcast hash join, since the shuffle
+    /// output of one side (`small`) turns out to be small. Each task reads the small side
+    /// in full and builds the hash table from it, while the other side is coalesced.
+    /// Returns the new partition count if the job graph was changed.
+    fn convert_to_broadcast_join(
+        job_id: JobId,
+        job: &mut JobDescriptor,
+        s: usize,
+        join: &SkewJoin,
+        small: usize,
+        input_channel_bytes: &HashMap<usize, Vec<u64>>,
+        target_partition_size: u64,
+    ) -> Option<usize> {
+        use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
+        use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
+        use datafusion::physical_plan::{Partitioning, PlanProperties};
+
+        let large = if small == join.left {
+            join.right
+        } else {
+            join.left
+        };
+        let large_bytes = input_channel_bytes.get(&large)?;
+        let ranges = crate::driver::job_scheduler::adaptive::coalesce_shuffle_partitions(
+            large_bytes,
+            target_partition_size,
+        );
+        let n = ranges.len();
+        if n == 0 {
+            return None;
+        }
+        let stage = &job.graph.stages()[s];
+        let result = stage.plan.clone().transform_up(|node| {
+            if let Some(placeholder) = node.as_any().downcast_ref::<StageInputExec<usize>>() {
+                let partitions = match *placeholder.input() {
+                    i if i == small => 1,
+                    i if i == large => n,
+                    _ => return Ok(Transformed::no(node)),
+                };
+                let old = placeholder.properties();
+                let properties = Arc::new(PlanProperties::new(
+                    old.equivalence_properties().clone(),
+                    Partitioning::UnknownPartitioning(partitions),
+                    old.emission_type,
+                    old.boundedness,
+                ));
+                let node = StageInputExec::new(*placeholder.input(), properties);
+                return Ok(Transformed::yes(Arc::new(node) as Arc<dyn ExecutionPlan>));
+            }
+            if let Some(hash_join) = node.as_any().downcast_ref::<HashJoinExec>() {
+                if matches!(hash_join.partition_mode(), PartitionMode::Partitioned) {
+                    // The build side of a broadcast hash join is the left side.
+                    let new = if small == join.left {
+                        Arc::new(
+                            hash_join
+                                .builder()
+                                .with_partition_mode(PartitionMode::CollectLeft)
+                                .build()?,
+                        ) as Arc<dyn ExecutionPlan>
+                    } else {
+                        hash_join.swap_inputs(PartitionMode::CollectLeft)?
+                    };
+                    return Ok(Transformed::yes(new));
+                }
+            }
+            Ok(Transformed::no(node))
+        });
+        let new_plan = match result.data() {
+            Ok(p) if p.output_partitioning().partition_count() == n => p,
+            Ok(_) => return None,
+            Err(e) => {
+                warn!("job {job_id} stage {s}: failed to rewrite plan for broadcast join: {e}");
+                return None;
+            }
+        };
+        let new_consumer_plans = Self::rewrite_merge_consumers(job_id, job, s, n)?;
+        debug!(
+            "job {job_id} stage {s}: converted to broadcast join reading stage input {small} in full and {n} partitions of stage input {large}"
+        );
+        let stages = job.graph.stages_mut();
+        stages[s].inputs[small].mode = InputMode::Broadcast;
+        stages[s].inputs[small].partition_ranges = None;
+        stages[s].inputs[small].map_ranges = None;
+        stages[s].inputs[large].partition_ranges = Some(ranges);
+        stages[s].inputs[large].map_ranges = None;
+        stages[s].plan = new_plan;
+        for (c, p) in new_consumer_plans {
+            stages[c].plan = p;
+        }
+        job.stages[s].tasks = (0..n)
+            .map(|_| TaskDescriptor { attempts: vec![] })
+            .collect();
+        Some(n)
+    }
+
+    /// Rewrites the merge inputs of the downstream stages that read from stage `s`
+    /// for the new partition count of stage `s`.
+    fn rewrite_merge_consumers(
+        job_id: JobId,
+        job: &JobDescriptor,
+        s: usize,
+        n: usize,
+    ) -> Option<Vec<(usize, Arc<dyn ExecutionPlan>)>> {
+        let mut plans = vec![];
+        for &c in &job.topology.stages[s].consumers {
+            let indices = job.graph.stages()[c]
+                .inputs
+                .iter()
+                .enumerate()
+                .filter(|(_, input)| input.stage == s && matches!(input.mode, InputMode::Merge))
+                .map(|(i, _)| i)
+                .collect::<HashSet<_>>();
+            if indices.is_empty() {
+                continue;
+            }
+            match rewrite_stage_input_partitioning(job.graph.stages()[c].plan.clone(), &indices, n)
+            {
+                Ok(p) => plans.push((c, p)),
+                Err(e) => {
+                    warn!("job {job_id} stage {c}: failed to rewrite plan for adaptive execution: {e}");
+                    return None;
+                }
+            }
+        }
+        Some(plans)
     }
 
     fn build_task_region(
@@ -1306,6 +1427,10 @@ struct SkewJoin {
     split_left: bool,
     /// Whether the right side can be split.
     split_right: bool,
+    /// The join type.
+    join_type: datafusion::common::JoinType,
+    /// Whether the join is a partitioned hash join (otherwise a sort-merge join).
+    hash_join: bool,
 }
 
 /// Returns the single stage input read by the subtree, if the subtree only contains
@@ -1339,12 +1464,12 @@ fn find_skew_join(plan: &Arc<dyn ExecutionPlan>) -> Option<SkewJoin> {
         if !matches!(join.partition_mode(), PartitionMode::Partitioned) {
             return None;
         }
-        Some((join.left(), join.right(), *join.join_type()))
+        Some((join.left(), join.right(), *join.join_type(), true))
     } else {
         any.downcast_ref::<SortMergeJoinExec>()
-            .map(|join| (join.left(), join.right(), join.join_type()))
+            .map(|join| (join.left(), join.right(), join.join_type(), false))
     };
-    if let Some((left, right, join_type)) = join {
+    if let Some((left, right, join_type, hash_join)) = join {
         let left = row_wise_stage_input(left)?;
         let right = row_wise_stage_input(right)?;
         if left == right {
@@ -1362,11 +1487,13 @@ fn find_skew_join(plan: &Arc<dyn ExecutionPlan>) -> Option<SkewJoin> {
             join_type,
             JoinType::Inner | JoinType::Right | JoinType::RightSemi | JoinType::RightAnti
         );
-        return (split_left || split_right).then_some(SkewJoin {
+        return Some(SkewJoin {
             left,
             right,
             split_left,
             split_right,
+            join_type,
+            hash_join,
         });
     }
     let allowed = matches!(
@@ -1494,6 +1621,40 @@ fn plan_skew_join_partitions(
         map_ranges.insert(join.right, right_maps);
     }
     (ranges, map_ranges)
+}
+
+/// Chooses the side of a partitioned hash join to broadcast, if the total shuffle output
+/// of the side is below the broadcast threshold and the join type allows building the
+/// hash table from that side in every task. Since every task has its own copy of the
+/// build side, the join must not output unmatched build-side rows.
+fn choose_broadcast_side(
+    join: &SkewJoin,
+    input_channel_bytes: &HashMap<usize, Vec<u64>>,
+    options: &JobSchedulerOptions,
+) -> Option<usize> {
+    use datafusion::common::JoinType;
+
+    if options.broadcast_join_threshold == 0 {
+        return None;
+    }
+    let total = |i: usize| input_channel_bytes.get(&i).map(|x| x.iter().sum::<u64>());
+    let (left, right) = (total(join.left)?, total(join.right)?);
+    let left_ok = left <= options.broadcast_join_threshold
+        && matches!(
+            join.join_type,
+            JoinType::Inner | JoinType::Right | JoinType::RightSemi | JoinType::RightAnti
+        );
+    let right_ok = right <= options.broadcast_join_threshold
+        && matches!(
+            join.join_type,
+            JoinType::Inner | JoinType::Left | JoinType::LeftSemi | JoinType::LeftAnti
+        );
+    match (left_ok, right_ok) {
+        (true, true) if right < left => Some(join.right),
+        (true, _) => Some(join.left),
+        (false, true) => Some(join.right),
+        (false, false) => None,
+    }
 }
 
 fn rewrite_stage_input_partitioning(
@@ -1966,6 +2127,8 @@ mod tests {
             .with_shuffle_mode(OutputMode::Blocking)
             .with_shuffle_dir(temp_dir.clone())
             .with_adaptive_enabled(true)
+            // This test is about coalescing, so the join is not converted to a broadcast join.
+            .with_broadcast_join_threshold(0)
             .with_target_partition_size(250); // Combined channel sizes: 50+50=100. Target 250 -> [0..2, 2..4]
 
         JobScheduler::update_task_regions(&mut job, &options);
@@ -2455,6 +2618,8 @@ mod tests {
             right: 1,
             split_left: true,
             split_right: false,
+            join_type: datafusion::common::JoinType::Inner,
+            hash_join: true,
         };
         let options = JobSchedulerOptions::default().with_min_skew_threshold(100);
         let left = vec![10, 10, 1000, 10];
@@ -2529,7 +2694,85 @@ mod tests {
         let left = join(JoinType::Left)?.ok_or("join not found")?;
         assert!(left.split_left && !left.split_right);
         // Neither side of a full outer join can be split.
-        assert!(join(JoinType::Full)?.is_none());
+        let full = join(JoinType::Full)?.ok_or("join not found")?;
+        assert!(!full.split_left && !full.split_right);
+        Ok(())
+    }
+
+    /// A partitioned hash join is converted into a broadcast hash join when the shuffle
+    /// output of one side is small, for either side of an inner join.
+    #[test]
+    fn test_adaptive_broadcast_join_conversion() -> Result<(), Box<dyn std::error::Error>> {
+        use datafusion::common::{JoinType, NullEquality};
+        use datafusion::physical_expr::expressions::Column;
+        use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
+
+        for small in [0usize, 1] {
+            let temp_dir =
+                std::env::temp_dir().join(format!("sail_test_broadcast_{}", rand::random::<u64>()));
+            let job_id = JobId::from(78);
+            for stage in [0usize, 1] {
+                let dir = temp_dir.join(format!("{job_id}")).join(format!("{stage}"));
+                std::fs::create_dir_all(&dir)?;
+                let bytes = if stage == small { 10 } else { 1000 };
+                write_test_shuffle_index(&dir, 0, 0, &[(bytes, 1); 4])?;
+            }
+            let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+            let side = || -> Result<Arc<dyn ExecutionPlan>, Box<dyn std::error::Error>> {
+                Ok(Arc::new(RepartitionExec::try_new(
+                    Arc::new(EmptyExec::new(schema.clone())),
+                    Partitioning::Hash(vec![Arc::new(Column::new("x", 0))], 4),
+                )?))
+            };
+            let join = Arc::new(HashJoinExec::try_new(
+                side()?,
+                side()?,
+                vec![(Arc::new(Column::new("x", 0)), Arc::new(Column::new("x", 0)))],
+                None,
+                &JoinType::Inner,
+                None,
+                PartitionMode::Partitioned,
+                NullEquality::NullEqualsNothing,
+                false,
+            )?);
+            let graph = JobGraph::try_new_with_mode(join, OutputMode::Blocking)?;
+            let mut job = JobDescriptor::try_new(graph, JobState::Draining)?;
+            succeed_all(&mut job, 0);
+            succeed_all(&mut job, 1);
+            let options = JobSchedulerOptions::default()
+                .with_shuffle_mode(OutputMode::Blocking)
+                .with_shuffle_dir(temp_dir.clone())
+                .with_adaptive_enabled(true)
+                .with_broadcast_join_threshold(100)
+                .with_target_partition_size(500);
+            JobScheduler::update_task_regions(&mut job, &options);
+            let _ = JobScheduler::schedule_task_regions(&options, job_id, &mut job);
+
+            let stage = &job.graph.stages()[2];
+            let input = stage
+                .inputs
+                .iter()
+                .position(|x| x.stage == small)
+                .ok_or("input not found")?;
+            assert!(matches!(stage.inputs[input].mode, InputMode::Broadcast));
+            assert!(stage.inputs[input].partition_ranges.is_none());
+            // The large side is not coalesced since each channel exceeds the target size.
+            assert_eq!(job.stages[2].tasks.len(), 4);
+            let mut collect_left = false;
+            stage.plan.apply(|node| {
+                if let Some(join) = node.as_any().downcast_ref::<HashJoinExec>() {
+                    collect_left = matches!(join.partition_mode(), PartitionMode::CollectLeft);
+                    // The build (left) side reads the broadcast input with one partition.
+                    assert_eq!(join.left().output_partitioning().partition_count(), 1);
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })?;
+            assert!(
+                collect_left,
+                "the join was not converted (small side {small})"
+            );
+            let _ = std::fs::remove_dir_all(temp_dir);
+        }
         Ok(())
     }
 }

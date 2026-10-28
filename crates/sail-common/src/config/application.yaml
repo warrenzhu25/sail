@@ -255,6 +255,16 @@
     This only takes effect when `cluster.adaptive_shuffle_enabled` is `true`.
   experimental: true
 
+- key: cluster.adaptive_broadcast_join_threshold_bytes
+  type: number
+  default: "33554432"
+  description: |
+    The maximum total (in-memory) size of the shuffle output of one side of a partitioned hash join,
+    for converting the join into a broadcast hash join at runtime. Each task then reads that side in full
+    and builds the hash table from it. Set to 0 to disable the conversion.
+    This only takes effect when `cluster.adaptive_shuffle_enabled` is `true`.
+  experimental: true
+
 - key: cluster.adaptive_shuffle_target_partition_bytes
   type: number
   default: "67108864"

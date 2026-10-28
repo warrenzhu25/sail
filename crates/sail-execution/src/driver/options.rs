@@ -38,6 +38,7 @@ pub struct DriverOptions {
     pub shuffle_compression: ShuffleCompression,
     pub adaptive_shuffle_enabled: bool,
     pub adaptive_skew_join_enabled: bool,
+    pub adaptive_broadcast_join_threshold_bytes: u64,
     pub adaptive_shuffle_target_partition_bytes: u64,
     pub rpc_retry_strategy: RetryStrategy,
     pub runtime: RuntimeHandle,
@@ -87,6 +88,9 @@ impl DriverOptions {
             ),
             adaptive_shuffle_enabled: config.cluster.adaptive_shuffle_enabled,
             adaptive_skew_join_enabled: config.cluster.adaptive_skew_join_enabled,
+            adaptive_broadcast_join_threshold_bytes: config
+                .cluster
+                .adaptive_broadcast_join_threshold_bytes,
             adaptive_shuffle_target_partition_bytes: config
                 .cluster
                 .adaptive_shuffle_target_partition_bytes,
