@@ -20,6 +20,16 @@ static GLOBAL: sail_mimalloc::MiMalloc = sail_mimalloc::MiMalloc;
 /// and various submodules.
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // Worker processes in the `local-process-cluster` mode must run the Sail CLI via
+    // the Python interpreter, since the current executable is the Python interpreter.
+    let executable: String = m.py().import("sys")?.getattr("executable")?.extract()?;
+    if !executable.is_empty() {
+        sail_common::config::set_cli_command(vec![
+            executable,
+            "-m".to_string(),
+            "pysail".to_string(),
+        ]);
+    }
     celeborn::register_module(m)?;
     catalog::register_module(m)?;
     flight::register_module(m)?;

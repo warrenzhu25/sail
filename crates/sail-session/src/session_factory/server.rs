@@ -197,7 +197,9 @@ impl ServerSessionFactory {
         // join filters disabled while allowing task-local TopK and aggregate filters.
         if matches!(
             self.config.mode,
-            ExecutionMode::LocalCluster | ExecutionMode::KubernetesCluster
+            ExecutionMode::LocalCluster
+                | ExecutionMode::LocalProcessCluster
+                | ExecutionMode::KubernetesCluster
         ) {
             optimizer.enable_join_dynamic_filter_pushdown = false;
         }

@@ -9,6 +9,7 @@ use sail_execution::driver::{DriverComponents, DriverHandle, DriverOptions};
 use sail_execution::job_runner::{ClusterJobRunner, LocalJobRunner};
 use sail_execution::worker_manager::{
     KubernetesWorkerManager, KubernetesWorkerManagerOptions, LocalWorkerManager,
+    ProcessWorkerManager, ProcessWorkerManagerOptions,
 };
 use sail_telemetry::events::SystemEventReporter;
 
@@ -113,6 +114,15 @@ impl SessionJobRunnerFactory for ServerSessionJobRunnerFactory {
                         self.runtime.clone(),
                         worker_session,
                     )),
+                )
+            }
+            ExecutionMode::LocalProcessCluster => {
+                let options = ProcessWorkerManagerOptions::from_current_exe()
+                    .map_err(|e| SessionError::internal(e.to_string()))?;
+                self.create_cluster_runner(
+                    system,
+                    info,
+                    Box::new(ProcessWorkerManager::new(options)),
                 )
             }
             ExecutionMode::KubernetesCluster => {

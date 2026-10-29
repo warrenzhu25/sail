@@ -26,3 +26,18 @@ impl CliConfigEnv {
     /// This allows the embedded Python interpreter to fork child Python processes.
     pub const RUN_PYTHON: &'static str = "SAIL_INTERNAL__RUN_PYTHON";
 }
+
+static CLI_COMMAND: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+/// Sets the command (program and leading arguments) that runs the Sail CLI in a new
+/// process, when the current executable is not the Sail CLI itself. For example,
+/// when Sail runs inside a Python interpreter via PySail, the command is
+/// `[<python>, "-m", "pysail"]`. The command can only be set once.
+pub fn set_cli_command(command: Vec<String>) {
+    let _ = CLI_COMMAND.set(command);
+}
+
+/// Returns the command that runs the Sail CLI in a new process, if it has been set.
+pub fn cli_command() -> Option<&'static [String]> {
+    CLI_COMMAND.get().map(|x| x.as_slice())
+}

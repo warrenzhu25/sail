@@ -1,8 +1,6 @@
 use std::collections::BTreeMap;
-use std::env;
 use std::sync::Arc;
 
-use fastrace::collector::SpanContext;
 use futures::future::BoxFuture;
 use k8s_openapi::api::core::v1::{
     Container, EnvVar, EnvVarSource, ObjectFieldSelector, Pod, PodSpec, PodTemplateSpec,
@@ -14,14 +12,12 @@ use kube::api::{DeleteParams, ListParams};
 use rand::RngExt;
 use rand::distr::Uniform;
 use sail_common::actor::ActorSystem;
-use sail_common::config::{ClusterConfigEnv, ExecutionConfigEnv};
-use sail_common::telemetry::ContextPropagationEnv;
-use sail_common::utils::retry::RetryStrategy;
+use sail_common::config::ClusterConfigEnv;
 use tokio::sync::OnceCell;
 
 use crate::error::{ExecutionError, ExecutionResult};
 use crate::id::WorkerId;
-use crate::shuffle::ShuffleBackendKind;
+use crate::worker_manager::env::{WorkerEnvOptions, build_worker_env};
 use crate::worker_manager::{WorkerLaunchOptions, WorkerManager};
 
 #[derive(Debug, Clone)]
@@ -127,245 +123,34 @@ impl KubernetesWorkerService {
     }
 
     fn build_pod_env(&self, id: WorkerId, options: WorkerLaunchOptions) -> Vec<EnvVar> {
-        let WorkerLaunchOptions {
-            enable_tls,
-            batch_size,
-            driver_id,
-            session_id,
-            driver_external_host,
-            driver_external_port,
-            worker_heartbeat_interval,
-            task_stream_buffer,
-            task_stream_creation_timeout,
-            rpc_retry_strategy,
-            shuffle_backend,
-        } = options;
-        let w3c_traceparent =
-            SpanContext::current_local_parent().map(|x| x.encode_w3c_traceparent());
-
-        // There is no guarantee that serializing a Rust data structure produces an inline table,
-        // so we have to construct the nested TOML value manually.
-        let rpc_retry_strategy = match rpc_retry_strategy {
-            RetryStrategy::ExponentialBackoff {
-                max_count,
-                initial_delay,
-                max_delay,
-                factor,
-            } => {
-                format!(
-                    "{{ exponential_backoff = {{ max_count = {}, initial_delay_secs = {}, max_delay_secs = {}, factor = {} }} }}",
-                    max_count,
-                    initial_delay.as_secs(),
-                    max_delay.as_secs(),
-                    factor,
-                )
-            }
-            RetryStrategy::Fixed { max_count, delay } => {
-                format!(
-                    "{{ fixed = {{ max_count = {}, delay_secs = {} }} }}",
-                    max_count,
-                    delay.as_secs()
-                )
-            }
-        };
-        let mut env = vec![
-            EnvVar {
-                name: "RUST_LOG".to_string(),
-                value: Some(env::var("RUST_LOG").unwrap_or("info".to_string())),
-                value_from: None,
+        let mut env = build_worker_env(
+            id,
+            options,
+            WorkerEnvOptions {
+                listen_host: "0.0.0.0",
+                // The external host is the pod IP, which is set below.
+                external_host: None,
+                random_port: false,
             },
-            EnvVar {
-                name: ClusterConfigEnv::ENABLE_TLS.to_string(),
-                value: Some(enable_tls.to_string()),
-                value_from: None,
-            },
-            EnvVar {
-                name: ExecutionConfigEnv::BATCH_SIZE.to_string(),
-                value: Some(batch_size.to_string()),
-                value_from: None,
-            },
-            EnvVar {
-                name: ClusterConfigEnv::DRIVER_EXTERNAL_HOST.to_string(),
-                value: Some(driver_external_host),
-                value_from: None,
-            },
-            EnvVar {
-                name: ClusterConfigEnv::DRIVER_EXTERNAL_PORT.to_string(),
-                value: Some(driver_external_port.to_string()),
-                value_from: None,
-            },
-            EnvVar {
-                name: ClusterConfigEnv::DRIVER_ID.to_string(),
-                value: Some(u64::from(driver_id).to_string()),
-                value_from: None,
-            },
-            EnvVar {
-                name: ClusterConfigEnv::SESSION_ID.to_string(),
-                value: Some(session_id),
-                value_from: None,
-            },
-            EnvVar {
-                name: ClusterConfigEnv::WORKER_ID.to_string(),
-                value: Some(u64::from(id).to_string()),
-                value_from: None,
-            },
-            EnvVar {
-                name: ClusterConfigEnv::WORKER_LISTEN_HOST.to_string(),
-                value: Some("0.0.0.0".to_string()),
-                value_from: None,
-            },
-            EnvVar {
-                name: ClusterConfigEnv::WORKER_EXTERNAL_HOST.to_string(),
-                value: None,
-                value_from: Some(EnvVarSource {
-                    field_ref: Some(ObjectFieldSelector {
-                        field_path: "status.podIP".to_string(),
-                        ..Default::default()
-                    }),
+        )
+        .into_iter()
+        .map(|(name, value)| EnvVar {
+            name,
+            value: Some(value),
+            value_from: None,
+        })
+        .collect::<Vec<_>>();
+        env.push(EnvVar {
+            name: ClusterConfigEnv::WORKER_EXTERNAL_HOST.to_string(),
+            value: None,
+            value_from: Some(EnvVarSource {
+                field_ref: Some(ObjectFieldSelector {
+                    field_path: "status.podIP".to_string(),
                     ..Default::default()
                 }),
-            },
-            EnvVar {
-                name: ClusterConfigEnv::WORKER_HEARTBEAT_INTERVAL_SECS.to_string(),
-                value: Some(worker_heartbeat_interval.as_secs().to_string()),
-                value_from: None,
-            },
-            EnvVar {
-                name: ClusterConfigEnv::TASK_STREAM_BUFFER.to_string(),
-                value: Some(task_stream_buffer.to_string()),
-                value_from: None,
-            },
-            EnvVar {
-                name: ClusterConfigEnv::TASK_STREAM_CREATION_TIMEOUT_SECS.to_string(),
-                value: Some(task_stream_creation_timeout.as_secs().to_string()),
-                value_from: None,
-            },
-            EnvVar {
-                name: ClusterConfigEnv::RPC_RETRY_STRATEGY.to_string(),
-                value: Some(rpc_retry_strategy),
-                value_from: None,
-            },
-            EnvVar {
-                name: ClusterConfigEnv::SHUFFLE_BACKEND__TYPE.to_string(),
-                value: Some(
-                    match &shuffle_backend {
-                        ShuffleBackendKind::Flight { .. } => "flight",
-                        ShuffleBackendKind::Storage { .. } => "storage",
-                        ShuffleBackendKind::Celeborn { .. } => "celeborn",
-                    }
-                    .to_string(),
-                ),
-                value_from: None,
-            },
-        ];
-        if let ShuffleBackendKind::Flight {
-            compression,
-            connection_count,
-            initial_stream_window_size,
-            initial_connection_window_size,
-        } = &shuffle_backend
-        {
-            env.push(EnvVar {
-                name: ClusterConfigEnv::SHUFFLE_BACKEND__FLIGHT__COMPRESSION.to_string(),
-                value: Some(compression.to_string()),
-                value_from: None,
-            });
-            env.push(EnvVar {
-                name: ClusterConfigEnv::SHUFFLE_BACKEND__FLIGHT__CONNECTION_COUNT.to_string(),
-                value: Some(connection_count.to_string()),
-                value_from: None,
-            });
-            env.push(EnvVar {
-                name: ClusterConfigEnv::SHUFFLE_BACKEND__FLIGHT__INITIAL_STREAM_WINDOW_SIZE
-                    .to_string(),
-                value: Some(initial_stream_window_size.unwrap_or(0).to_string()),
-                value_from: None,
-            });
-            env.push(EnvVar {
-                name: ClusterConfigEnv::SHUFFLE_BACKEND__FLIGHT__INITIAL_CONNECTION_WINDOW_SIZE
-                    .to_string(),
-                value: Some(initial_connection_window_size.unwrap_or(0).to_string()),
-                value_from: None,
-            });
-        }
-        if let ShuffleBackendKind::Storage {
-            path,
-            max_file_size,
-            compression,
-        } = &shuffle_backend
-        {
-            if let Some(path) = path {
-                env.push(EnvVar {
-                    name: ClusterConfigEnv::SHUFFLE_BACKEND__STORAGE__PATH.to_string(),
-                    value: Some(path.clone()),
-                    value_from: None,
-                });
-            }
-            env.extend([
-                EnvVar {
-                    name: ClusterConfigEnv::SHUFFLE_BACKEND__STORAGE__MAX_FILE_SIZE.to_string(),
-                    value: Some(max_file_size.to_string()),
-                    value_from: None,
-                },
-                EnvVar {
-                    name: ClusterConfigEnv::SHUFFLE_BACKEND__STORAGE__COMPRESSION.to_string(),
-                    value: Some(compression.to_string()),
-                    value_from: None,
-                },
-            ]);
-        }
-        if let ShuffleBackendKind::Celeborn {
-            compression,
-            heartbeat_interval_secs,
-            partition_split_threshold,
-            partition_split_mode,
-            ..
-        } = &shuffle_backend
-        {
-            env.extend([
-                EnvVar {
-                    name: ClusterConfigEnv::SHUFFLE_BACKEND__CELEBORN__MASTER_ENDPOINTS.to_string(),
-                    value: Some(shuffle_backend.celeborn_master_endpoints_string()),
-                    value_from: None,
-                },
-                EnvVar {
-                    name: ClusterConfigEnv::SHUFFLE_BACKEND__CELEBORN__COMPRESSION.to_string(),
-                    value: Some(compression.to_string()),
-                    value_from: None,
-                },
-                EnvVar {
-                    name: ClusterConfigEnv::SHUFFLE_BACKEND__CELEBORN__HEARTBEAT_INTERVAL_SECS
-                        .to_string(),
-                    value: Some(heartbeat_interval_secs.to_string()),
-                    value_from: None,
-                },
-                EnvVar {
-                    name: ClusterConfigEnv::SHUFFLE_BACKEND__CELEBORN__ENDPOINT_OVERRIDES
-                        .to_string(),
-                    value: Some(shuffle_backend.celeborn_endpoint_overrides_string()),
-                    value_from: None,
-                },
-                EnvVar {
-                    name: ClusterConfigEnv::SHUFFLE_BACKEND__CELEBORN__PARTITION_SPLIT_THRESHOLD
-                        .to_string(),
-                    value: Some(partition_split_threshold.to_string()),
-                    value_from: None,
-                },
-                EnvVar {
-                    name: ClusterConfigEnv::SHUFFLE_BACKEND__CELEBORN__PARTITION_SPLIT_MODE
-                        .to_string(),
-                    value: Some(partition_split_mode.to_string()),
-                    value_from: None,
-                },
-            ]);
-        }
-        if let Some(traceparent) = w3c_traceparent {
-            env.push(EnvVar {
-                name: ContextPropagationEnv::TRACEPARENT.to_string(),
-                value: Some(traceparent),
-                value_from: None,
-            });
-        }
+                ..Default::default()
+            }),
+        });
         env
     }
 }
@@ -462,7 +247,10 @@ impl KubernetesWorkerService {
 
 #[cfg(test)]
 mod tests {
+    use sail_common::utils::retry::RetryStrategy;
+
     use super::*;
+    use crate::shuffle::ShuffleBackendKind;
 
     #[tokio::test]
     #[expect(clippy::unwrap_used)]

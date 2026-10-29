@@ -89,6 +89,8 @@ pub enum ExecutionMode {
     Local,
     #[serde(alias = "local-cluster")]
     LocalCluster,
+    #[serde(alias = "local-process-cluster")]
+    LocalProcessCluster,
     #[serde(
         alias = "kubernetes-cluster",
         alias = "k8s-cluster",
@@ -1042,7 +1044,9 @@ impl ClusterConfigEnv {
         DRIVER_ID,
         WORKER_ID,
         WORKER_LISTEN_HOST,
+        WORKER_LISTEN_PORT,
         WORKER_EXTERNAL_HOST,
+        WORKER_EXTERNAL_PORT,
         WORKER_HEARTBEAT_INTERVAL_SECS,
         TASK_STREAM_BUFFER,
         TASK_STREAM_CREATION_TIMEOUT_SECS,

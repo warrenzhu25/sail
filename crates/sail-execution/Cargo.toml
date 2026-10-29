@@ -62,5 +62,8 @@ bytes = { workspace = true }
 prost-build = { workspace = true }
 tonic-prost-build = { workspace = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }
+
 [dev-dependencies]
 h2 = { workspace = true }

@@ -1,6 +1,8 @@
+mod env;
 mod kubernetes;
 mod local;
 mod options;
+mod process;
 
 use futures::future::BoxFuture;
 pub(crate) use options::WorkerLaunchOptions;
@@ -35,3 +37,4 @@ pub trait WorkerManager: Send + Sync + 'static {
 
 pub use kubernetes::{KubernetesWorkerManager, KubernetesWorkerManagerOptions};
 pub use local::LocalWorkerManager;
+pub use process::{ProcessWorkerManager, ProcessWorkerManagerOptions};
