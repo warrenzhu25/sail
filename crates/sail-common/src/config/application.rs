@@ -840,6 +840,8 @@ pub struct OptimizerConfig {
     pub prefer_hash_join: bool,
     pub enable_window_topn: bool,
     pub expand_views_at_output: bool,
+    pub broadcast_join_threshold_bytes: usize,
+    pub broadcast_join_threshold_rows: usize,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

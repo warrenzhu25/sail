@@ -192,6 +192,10 @@ impl ServerSessionFactory {
         optimizer.prefer_hash_join = self.config.optimizer.prefer_hash_join;
         optimizer.enable_window_topn = self.config.optimizer.enable_window_topn;
         optimizer.expand_views_at_output = self.config.optimizer.expand_views_at_output;
+        optimizer.hash_join_single_partition_threshold =
+            self.config.optimizer.broadcast_join_threshold_bytes;
+        optimizer.hash_join_single_partition_threshold_rows =
+            self.config.optimizer.broadcast_join_threshold_rows;
         // DataFusion 55's hash-join dynamic filter assumes every plan partition reports to
         // process-local state. Cluster execution uses independently decoded task plans, so keep
         // join filters disabled while allowing task-local TopK and aggregate filters.

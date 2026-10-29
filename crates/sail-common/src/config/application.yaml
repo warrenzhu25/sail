@@ -959,6 +959,24 @@
     Hash join is generally faster but can require substantially more memory.
   experimental: true
 
+- key: optimizer.broadcast_join_threshold_bytes
+  type: number
+  default: "10485760"
+  description: |
+    The maximum estimated size in bytes of one side of a hash join for the side to be
+    collected (broadcast) to every partition of the other side, instead of repartitioning
+    both sides. This avoids shuffling the larger side, similar to
+    `spark.sql.autoBroadcastJoinThreshold`.
+  experimental: true
+
+- key: optimizer.broadcast_join_threshold_rows
+  type: number
+  default: "524288"
+  description: |
+    The maximum estimated number of rows of one side of a hash join for the side to be
+    collected (broadcast) to every partition of the other side, when its size in bytes is unknown.
+  experimental: true
+
 - key: optimizer.enable_window_topn
   type: boolean
   default: "false"
