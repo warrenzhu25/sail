@@ -183,27 +183,62 @@ impl DriverActor {
                 worker_id,
                 Some("worker heartbeat timeout".to_string()),
             );
-
-            let message = "task failed for lost worker".to_string();
-            let keys = self.task_assigner.find_worker_tasks(worker_id);
-            self.task_assigner.deactivate_worker(worker_id);
-            for key in keys.iter() {
-                self.job_scheduler.update_task(
-                    key,
-                    TaskState::Failed,
-                    Some(message.clone()),
-                    Some(CommonErrorCause::Execution(message.clone())),
-                );
-            }
-
-            let job_ids = keys.iter().map(|k| k.job_id).collect::<HashSet<_>>();
-            for job_id in job_ids {
-                self.refresh_job(ctx, job_id);
-                self.run_tasks(ctx);
-                self.reconcile_worker_demands(ctx);
-            }
+            self.fail_lost_worker_tasks(ctx, worker_id, "task failed for lost worker");
         }
         ActorAction::Continue
+    }
+
+    pub(super) fn handle_worker_exited(
+        &mut self,
+        ctx: &mut ActorContext<Self>,
+        worker_id: WorkerId,
+        description: String,
+    ) -> ActorAction {
+        if self.worker_pool.is_worker_pending(worker_id) {
+            // The worker exited before registering with the driver.
+            self.fail_worker_launch_if_pending(
+                ctx,
+                worker_id,
+                format!("worker exited before registration: {description}"),
+            );
+        } else if self
+            .worker_pool
+            .mark_worker_exited(worker_id, description.clone())
+        {
+            warn!("worker {worker_id} exited: {description}");
+            self.fail_lost_worker_tasks(
+                ctx,
+                worker_id,
+                &format!("task failed for exited worker: {description}"),
+            );
+        }
+        ActorAction::Continue
+    }
+
+    /// Fails the tasks running on a worker that is lost, and reschedules the affected jobs.
+    fn fail_lost_worker_tasks(
+        &mut self,
+        ctx: &mut ActorContext<Self>,
+        worker_id: WorkerId,
+        message: &str,
+    ) {
+        let keys = self.task_assigner.find_worker_tasks(worker_id);
+        self.task_assigner.deactivate_worker(worker_id);
+        for key in keys.iter() {
+            self.job_scheduler.update_task(
+                key,
+                TaskState::Failed,
+                Some(message.to_string()),
+                Some(CommonErrorCause::Execution(message.to_string())),
+            );
+        }
+
+        let job_ids = keys.iter().map(|k| k.job_id).collect::<HashSet<_>>();
+        for job_id in job_ids {
+            self.refresh_job(ctx, job_id);
+            self.run_tasks(ctx);
+            self.reconcile_worker_demands(ctx);
+        }
     }
 
     pub(super) fn handle_execute_job(

@@ -55,6 +55,11 @@ pub enum DriverMessage {
         worker_id: WorkerId,
         instant: Instant,
     },
+    /// The worker manager observed that the worker exited.
+    WorkerExited {
+        worker_id: WorkerId,
+        description: String,
+    },
     ExecuteJob {
         plan: Arc<dyn ExecutionPlan>,
         context: Arc<TaskContext>,
@@ -148,6 +153,7 @@ impl SpanAssociation for DriverMessage {
             DriverMessage::RetryWorkerDemand { .. } => "RetryWorkerDemand",
             DriverMessage::ProbeIdleWorker { .. } => "ProbeIdleWorker",
             DriverMessage::ProbeLostWorker { .. } => "ProbeLostWorker",
+            DriverMessage::WorkerExited { .. } => "WorkerExited",
             DriverMessage::ExecuteJob { .. } => "ExecuteJob",
             DriverMessage::CleanUpJob { .. } => "CleanUpJob",
             DriverMessage::UpdateTask { .. } => "UpdateTask",
@@ -191,6 +197,10 @@ impl SpanAssociation for DriverMessage {
             | DriverMessage::ProbeLostWorker {
                 worker_id,
                 instant: _,
+            }
+            | DriverMessage::WorkerExited {
+                worker_id,
+                description: _,
             } => {
                 p.push((SpanAttribute::CLUSTER_WORKER_ID, worker_id.to_string()));
             }

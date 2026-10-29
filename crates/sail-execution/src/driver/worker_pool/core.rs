@@ -94,6 +94,7 @@ impl WorkerPool {
         let task = self
             .worker_manager
             .launch_worker(ctx.children_mut(), worker_id, options);
+        let exit = self.worker_manager.wait_for_worker_exit(worker_id);
         let driver = ctx.handle().clone();
         ctx.spawn(async move {
             if let Err(e) = task.await {
@@ -102,6 +103,17 @@ impl WorkerPool {
                     .send(DriverMessage::WorkerFailedToStart {
                         worker_id,
                         message: e.to_string(),
+                    })
+                    .await;
+                return;
+            }
+            // Report the worker exit if the worker manager can observe it,
+            // so that the driver does not need to wait for the heartbeat timeout.
+            if let Some(description) = exit.await {
+                let _ = driver
+                    .send(DriverMessage::WorkerExited {
+                        worker_id,
+                        description,
                     })
                     .await;
             }
@@ -307,6 +319,36 @@ impl WorkerPool {
             WorkerState::Running { updated_at, .. } => Some(*updated_at),
             _ => None,
         }
+    }
+
+    /// Marks a worker as failed after the worker manager observed that the worker exited.
+    /// Unlike [`Self::stop_worker`], no request is sent to the worker since it is gone.
+    /// Returns `true` if the worker was running.
+    pub fn mark_worker_exited(&mut self, worker_id: WorkerId, description: String) -> bool {
+        let Some(worker) = self.workers.get_mut(&worker_id) else {
+            return false;
+        };
+        if !matches!(worker.state, WorkerState::Running { .. }) {
+            return false;
+        }
+        worker.state = WorkerState::Failed;
+        worker.messages.push(description);
+        self.event_reporter.report(SystemEvent::WorkerUpdated {
+            session_id: self.options.session_id.clone(),
+            worker_id: u64::from(worker_id),
+            host: None,
+            port: None,
+            status: worker.state.status().to_string(),
+            updated_at: Utc::now(),
+        });
+        true
+    }
+
+    /// Returns whether the worker is pending (launched but not registered yet).
+    pub fn is_worker_pending(&self, worker_id: WorkerId) -> bool {
+        self.workers
+            .get(&worker_id)
+            .is_some_and(|w| matches!(w.state, WorkerState::Pending))
     }
 
     pub fn get_worker_last_heartbeat(&mut self, worker_id: WorkerId) -> Option<Instant> {

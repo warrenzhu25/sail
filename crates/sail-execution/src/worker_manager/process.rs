@@ -102,20 +102,6 @@ impl ProcessWorkerManager {
             .collect()
     }
 
-    /// Waits for a launched worker process to exit, and returns a description of how
-    /// the process exited. Returns `None` if the worker is unknown.
-    pub async fn wait_for_worker_exit(&self, id: WorkerId) -> Option<String> {
-        let mut exit = {
-            let workers = self.workers.lock().await;
-            workers.get(&id)?.exit.clone()
-        };
-        match exit.wait_for(|x| x.is_some()).await {
-            Ok(x) => x.clone(),
-            // The supervisor is gone without reporting the exit (e.g. it was aborted).
-            Err(_) => Some("the worker process supervisor has stopped".to_string()),
-        }
-    }
-
     /// Stops a single worker process. The process is given a grace period to exit
     /// on its own (e.g. after the driver has asked the worker to shut down),
     /// before it is killed.
@@ -281,8 +267,26 @@ async fn supervise(
     let _ = exit.send(Some(description));
 }
 
+/// Waits for a launched worker process to exit, and returns a description of how
+/// the process exited. Returns `None` if the worker is unknown.
+async fn wait_for_exit(workers: ProcessWorkers, id: WorkerId) -> Option<String> {
+    let mut exit = {
+        let workers = workers.lock().await;
+        workers.get(&id)?.exit.clone()
+    };
+    match exit.wait_for(|x| x.is_some()).await {
+        Ok(x) => x.clone(),
+        // The supervisor is gone without reporting the exit (e.g. it was aborted).
+        Err(_) => Some("the worker process supervisor has stopped".to_string()),
+    }
+}
+
 #[tonic::async_trait]
 impl WorkerManager for ProcessWorkerManager {
+    fn wait_for_worker_exit(&self, id: WorkerId) -> BoxFuture<'static, Option<String>> {
+        Box::pin(wait_for_exit(Arc::clone(&self.workers), id))
+    }
+
     fn launch_worker(
         &self,
         _system: &mut ActorSystem,

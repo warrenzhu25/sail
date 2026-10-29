@@ -162,6 +162,10 @@ impl Actor for DriverActor {
             DriverMessage::ProbeLostWorker { worker_id, instant } => {
                 self.handle_probe_lost_worker(ctx, worker_id, instant)
             }
+            DriverMessage::WorkerExited {
+                worker_id,
+                description,
+            } => self.handle_worker_exited(ctx, worker_id, description),
             DriverMessage::ExecuteJob {
                 plan,
                 context,
