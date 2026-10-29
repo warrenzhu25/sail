@@ -32,8 +32,16 @@ pub struct DriverOptions {
     pub task_stream_creation_timeout: Duration,
     pub task_max_attempts: usize,
     pub shuffle_backend: ShuffleBackendKind,
+    pub adaptive_coalesce: Option<AdaptiveCoalesceOptions>,
     pub rpc_retry_strategy: RetryStrategy,
     pub runtime: RuntimeHandle,
+}
+
+/// Options for coalescing shuffle partitions at runtime.
+#[derive(Debug, Clone, Copy)]
+pub struct AdaptiveCoalesceOptions {
+    pub target_partition_bytes: u64,
+    pub min_partitions: usize,
 }
 
 pub struct DriverComponents {
@@ -82,6 +90,22 @@ impl DriverOptions {
             ),
             task_max_attempts: config.cluster.task_max_attempts,
             shuffle_backend: (&config.cluster.shuffle_backend).into(),
+            adaptive_coalesce: config.cluster.adaptive_coalesce_enabled.then(|| {
+                AdaptiveCoalesceOptions {
+                    target_partition_bytes: config.cluster.adaptive_coalesce_target_partition_bytes,
+                    min_partitions: match config.cluster.adaptive_coalesce_min_partitions {
+                        0 => {
+                            config
+                                .cluster
+                                .worker_max_count
+                                .max(config.cluster.worker_initial_count)
+                                .max(1)
+                                * config.cluster.worker_task_slots
+                        }
+                        n => n,
+                    },
+                }
+            }),
             runtime,
         })
     }

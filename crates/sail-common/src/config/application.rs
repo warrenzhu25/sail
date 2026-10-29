@@ -228,6 +228,9 @@ pub struct ClusterConfig {
     pub task_max_attempts: usize,
     pub rpc_retry_strategy: RetryStrategy,
     pub shuffle_backend: ShuffleBackend,
+    pub adaptive_coalesce_enabled: bool,
+    pub adaptive_coalesce_target_partition_bytes: u64,
+    pub adaptive_coalesce_min_partitions: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

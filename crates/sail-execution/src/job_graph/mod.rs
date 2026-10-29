@@ -40,6 +40,14 @@ impl JobGraph {
         &self.schema
     }
 
+    /// Replaces the plan of a stage, e.g. when the stage is adaptively rewritten
+    /// at runtime. The caller must ensure the plan has the same inputs.
+    pub(crate) fn set_stage_plan(&mut self, stage: usize, plan: Arc<dyn ExecutionPlan>) {
+        if let Some(s) = self.stages.get_mut(stage) {
+            s.plan = plan;
+        }
+    }
+
     pub(crate) fn shuffle_backend(&self) -> &ShuffleBackendKind {
         &self.options.shuffle_backend
     }

@@ -254,6 +254,32 @@
   default: "3"
   description: The maximum number of attempts for a task.
 
+- key: cluster.adaptive_coalesce_enabled
+  type: boolean
+  default: "false"
+  description: |
+    Whether to coalesce adjacent shuffle partitions at runtime based on the shuffle output
+    statistics reported by the tasks. This only applies to stages that read materialized
+    shuffle partitions, which is the case when `cluster.shuffle_backend.type` is `storage`.
+  experimental: true
+
+- key: cluster.adaptive_coalesce_target_partition_bytes
+  type: number
+  default: "67108864"
+  description: |
+    The target (in-memory) size in bytes of each coalesced shuffle partition.
+  experimental: true
+
+- key: cluster.adaptive_coalesce_min_partitions
+  type: number
+  default: "0"
+  description: |
+    The minimum number of partitions to keep after coalescing shuffle partitions,
+    unless the partitions are smaller than 1 MiB each.
+    Set to `0` to use the total number of task slots of `cluster.worker_max_count` workers,
+    or `cluster.worker_initial_count` workers if that is larger.
+  experimental: true
+
 - key: cluster.rpc_retry_strategy.type
   type: string
   default: "fixed"

@@ -20,7 +20,7 @@ use crate::driver::job_scheduler::state::{
     JobDescriptor, StageState, TaskAttemptDescriptor, TaskRegionState, TaskState,
 };
 use crate::driver::job_scheduler::topology::TaskRegionTopology;
-use crate::driver::job_scheduler::{JobAction, JobScheduler, JobState};
+use crate::driver::job_scheduler::{JobAction, JobScheduler, JobState, adaptive};
 use crate::driver::output::{JobOutputOutcome, build_job_output};
 use crate::error::{ExecutionError, ExecutionResult};
 use crate::id::{JobId, TaskKey, TaskKeyDisplay, TaskStreamKey};
@@ -219,6 +219,9 @@ impl JobScheduler {
         ));
 
         Self::update_task_regions(job, self.options.task_max_attempts);
+        if let Some(options) = &self.options.adaptive_coalesce {
+            adaptive::coalesce_job_stages(job_id, job, options);
+        }
 
         if job
             .regions
@@ -918,6 +921,32 @@ impl<'a> TaskInputBuilder<'a> {
     fn build_task_input_keys(&self) -> ExecutionResult<Vec<Vec<TaskInputKey>>> {
         let input_partitions = self.producer.plan.output_partitioning().partition_count();
         let input_channels = self.producer.distribution.channels();
+
+        if let Some(coalesced) = &self.job.stages[self.key.stage].coalesced
+            && matches!(self.input.mode, InputMode::Forward)
+            && coalesced.producers.contains(&self.input.stage)
+        {
+            // Each partition of the coalesced stage reads a contiguous range of partitions
+            // from the input stage.
+            return coalesced
+                .ranges
+                .iter()
+                .map(|range| {
+                    let mut group = Vec::with_capacity(range.len() * input_channels);
+                    for partition in range.clone() {
+                        let attempt = self.latest_attempt(partition)?;
+                        for channel in 0..input_channels {
+                            group.push(TaskInputKey {
+                                partition,
+                                attempt,
+                                channel,
+                            });
+                        }
+                    }
+                    Ok(group)
+                })
+                .collect();
+        }
 
         match self.input.mode {
             InputMode::Forward | InputMode::Merge => {

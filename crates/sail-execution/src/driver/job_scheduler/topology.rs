@@ -37,6 +37,14 @@ pub struct StageTopology {
 }
 
 impl JobTopology {
+    /// Removes the tasks of the stage with partition index `n` or greater from all regions,
+    /// after the stage partitions are coalesced at runtime.
+    pub fn truncate_stage_partitions(&mut self, stage: usize, n: usize) {
+        for region in &mut self.regions {
+            region.tasks.retain(|t| t.stage != stage || t.partition < n);
+        }
+    }
+
     /// Groups pipelined stages into components and builds the topology of task regions and stages.
     pub fn try_new(graph: &JobGraph) -> ExecutionResult<Self> {
         let mut stages = (0..graph.stages().len())

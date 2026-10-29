@@ -64,6 +64,7 @@ impl JobDescriptor {
             let mut descriptor = StageDescriptor {
                 tasks: vec![],
                 state: StageState::Active,
+                coalesced: None,
             };
             for _ in 0..stage.plan.output_partitioning().partition_count() {
                 descriptor.tasks.push(TaskDescriptor { attempts: vec![] });
@@ -92,6 +93,18 @@ pub struct StageDescriptor {
     /// A list of tasks for each partition of the stage.
     pub tasks: Vec<TaskDescriptor>,
     pub state: StageState,
+    /// The runtime coalescing of the stage partitions, if any.
+    pub coalesced: Option<StageCoalesce>,
+}
+
+/// Describes how the partitions of a stage are coalesced at runtime.
+#[derive(Debug, Clone)]
+pub struct StageCoalesce {
+    /// For each partition of the stage, the range of partitions read from each
+    /// coalesced input stage.
+    pub ranges: Vec<std::ops::Range<usize>>,
+    /// The input stages whose partitions are coalesced.
+    pub producers: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Copy)]
