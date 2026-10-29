@@ -884,8 +884,26 @@ impl<'a> TaskInputBuilder<'a> {
     }
 
     fn build_storage_locator(&self) -> ExecutionResult<TaskInputLocator> {
+        let slices = match &self.job.stages[self.key.stage].coalesced {
+            Some(coalesced)
+                if matches!(self.input.mode, InputMode::Forward)
+                    && coalesced.producers.contains(&self.input.stage) =>
+            {
+                coalesced
+                    .partitions
+                    .iter()
+                    .map(|spec| {
+                        spec.slice
+                            .filter(|(stage, _)| *stage == self.input.stage)
+                            .map(|(_, slice)| slice)
+                    })
+                    .collect()
+            }
+            _ => vec![],
+        };
         Ok(TaskInputLocator::Storage {
             keys: self.build_task_input_keys()?,
+            slices,
         })
     }
 
@@ -929,11 +947,11 @@ impl<'a> TaskInputBuilder<'a> {
             // Each partition of the coalesced stage reads a contiguous range of partitions
             // from the input stage.
             return coalesced
-                .ranges
+                .partitions
                 .iter()
-                .map(|range| {
-                    let mut group = Vec::with_capacity(range.len() * input_channels);
-                    for partition in range.clone() {
+                .map(|spec| {
+                    let mut group = Vec::with_capacity(spec.range.len() * input_channels);
+                    for partition in spec.range.clone() {
                         let attempt = self.latest_attempt(partition)?;
                         for channel in 0..input_channels {
                             group.push(TaskInputKey {

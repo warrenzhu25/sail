@@ -231,6 +231,9 @@ pub struct ClusterConfig {
     pub adaptive_coalesce_enabled: bool,
     pub adaptive_coalesce_target_partition_bytes: u64,
     pub adaptive_coalesce_min_partitions: usize,
+    pub adaptive_skew_join_enabled: bool,
+    pub adaptive_skew_join_factor: f64,
+    pub adaptive_skew_join_threshold_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

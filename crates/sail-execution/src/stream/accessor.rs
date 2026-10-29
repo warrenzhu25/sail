@@ -15,7 +15,9 @@ use crate::stream::reader::{TaskStreamReader, TaskStreamSource};
 use crate::stream::writer::{
     MultiChannelTaskStreamSink, TaskStreamChannelSink, TaskStreamSink, TaskStreamWriter,
 };
-use crate::task::definition::{TaskInput, TaskInputLocator, TaskOutput, TaskOutputLocator};
+use crate::task::definition::{
+    FileSlice, TaskInput, TaskInputLocator, TaskOutput, TaskOutputLocator,
+};
 use crate::task_runner::{TaskRunnerActor, TaskRunnerMessage};
 
 pub struct TaskStreamFactory {
@@ -213,12 +215,14 @@ impl TaskStreamAccessor {
     async fn fetch_storage_stream(
         &self,
         key: TaskStreamKey,
+        slice: Option<FileSlice>,
         schema: SchemaRef,
     ) -> Result<TaskStreamSource> {
         let (result, rx) = oneshot::channel();
         self.receive(
             TaskRunnerMessage::FetchStorageStream {
                 key,
+                slice,
                 schema,
                 context: self.context.clone(),
                 result,
@@ -309,13 +313,15 @@ impl TaskStreamReader for MultiChannelTaskStreamReader {
                 }))
                 .await?
             }
-            TaskInputLocator::Storage { keys } => {
+            TaskInputLocator::Storage { keys, slices } => {
                 let keys = keys.get(partition).ok_or_else(|| {
                     DataFusionError::Execution(format!("input partition {partition} not found"))
                 })?;
+                let slice = slices.get(partition).copied().flatten();
                 try_join_all(keys.iter().map(|key| {
                     self.streams.fetch_storage_stream(
                         key.task_stream_key(self.key.job_id, self.input.stage),
+                        slice,
                         self.schema.clone(),
                     )
                 }))

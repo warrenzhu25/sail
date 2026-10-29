@@ -53,6 +53,16 @@ message TaskInputWorkerKeyList {
 
 message TaskInputStorageLocator {
   repeated TaskInputRemoteKeyList keys = 1;
+  // An optional file slice for each partition. This is either empty or has the same
+  // length as `keys`.
+  repeated TaskInputFileSlice slices = 2;
+}
+
+// A contiguous subset of the files of each stream, where the sorted files are split
+// into `count` slices and slice `index` is read. A `count` of zero means all files.
+message TaskInputFileSlice {
+  uint64 index = 1;
+  uint64 count = 2;
 }
 
 message TaskInputShuffleServiceLocator {

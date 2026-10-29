@@ -8,6 +8,7 @@ use crate::driver::job_scheduler::topology::JobTopology;
 use crate::driver::output::{JobOutputManager, JobOutputOutcome};
 use crate::error::ExecutionResult;
 use crate::job_graph::JobGraph;
+use crate::task::definition::FileSlice;
 use crate::task::stats::TaskShuffleStats;
 
 /// Tracks graph/topology and runtime state for a single job.
@@ -100,11 +101,20 @@ pub struct StageDescriptor {
 /// Describes how the partitions of a stage are coalesced at runtime.
 #[derive(Debug, Clone)]
 pub struct StageCoalesce {
-    /// For each partition of the stage, the range of partitions read from each
-    /// coalesced input stage.
-    pub ranges: Vec<std::ops::Range<usize>>,
+    /// The input specification of each partition of the stage.
+    pub partitions: Vec<CoalescedPartition>,
     /// The input stages whose partitions are coalesced.
     pub producers: Vec<usize>,
+}
+
+/// The input specification of a partition of a coalesced stage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoalescedPartition {
+    /// The range of partitions read from each coalesced input stage.
+    pub range: std::ops::Range<usize>,
+    /// The input stage and the file slice to read from it, if the partition reads
+    /// a slice of a skewed partition. Other input stages are read in full.
+    pub slice: Option<(usize, FileSlice)>,
 }
 
 #[derive(Debug, Clone, Copy)]

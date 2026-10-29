@@ -42,6 +42,14 @@ pub struct DriverOptions {
 pub struct AdaptiveCoalesceOptions {
     pub target_partition_bytes: u64,
     pub min_partitions: usize,
+    pub skew_join: Option<SkewJoinOptions>,
+}
+
+/// Options for splitting skewed partitions of partitioned hash joins at runtime.
+#[derive(Debug, Clone, Copy)]
+pub struct SkewJoinOptions {
+    pub factor: f64,
+    pub threshold_bytes: u64,
 }
 
 pub struct DriverComponents {
@@ -104,6 +112,12 @@ impl DriverOptions {
                         }
                         n => n,
                     },
+                    skew_join: config.cluster.adaptive_skew_join_enabled.then_some(
+                        SkewJoinOptions {
+                            factor: config.cluster.adaptive_skew_join_factor,
+                            threshold_bytes: config.cluster.adaptive_skew_join_threshold_bytes,
+                        },
+                    ),
                 }
             }),
             runtime,

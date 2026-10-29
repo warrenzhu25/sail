@@ -19,6 +19,7 @@ use crate::shuffle::ShuffleCompression;
 use crate::stream::error::TaskStreamError;
 use crate::stream::reader::TaskStreamSource;
 use crate::stream::writer::{TaskStreamChannelSink, TaskStreamWriteState};
+use crate::task::definition::FileSlice;
 
 /// Object-storage implementation for a blocking shuffle stream. Every task attempt owns a
 /// directory, allowing retries to be selected by the task scheduler without overwriting an
@@ -75,6 +76,7 @@ impl StorageStreamManager {
     pub(crate) fn fetch_stream(
         &self,
         key: TaskStreamKey,
+        slice: Option<FileSlice>,
         _schema: SchemaRef,
         context: &TaskContext,
     ) -> ExecutionResult<TaskStreamSource> {
@@ -90,6 +92,10 @@ impl StorageStreamManager {
                 .map(|meta| meta.location)
                 .collect::<Vec<_>>();
             locations.sort();
+            if let Some(slice) = slice {
+                let range = slice.range(locations.len());
+                locations = locations.drain(range).collect();
+            }
             Ok::<_, TaskStreamError>(locations)
         })
         .flat_map(move |result| -> TaskStreamSource {

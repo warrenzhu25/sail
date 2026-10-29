@@ -12,7 +12,7 @@ use crate::error::ExecutionResult;
 use crate::id::{JobId, TaskAttempt, TaskKey, TaskStreamKey, WorkerId};
 use crate::stream::reader::TaskStreamSource;
 use crate::stream::writer::{TaskStreamChannelSink, TaskStreamSink};
-use crate::task::definition::TaskDefinition;
+use crate::task::definition::{FileSlice, TaskDefinition};
 use crate::task::stats::TaskShuffleStats;
 use crate::worker::WorkerLocation;
 
@@ -76,6 +76,7 @@ pub enum TaskRunnerMessage {
     },
     FetchStorageStream {
         key: TaskStreamKey,
+        slice: Option<FileSlice>,
         schema: SchemaRef,
         context: Arc<TaskContext>,
         result: oneshot::Sender<ExecutionResult<TaskStreamSource>>,

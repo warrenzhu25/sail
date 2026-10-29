@@ -37,11 +37,18 @@ pub struct StageTopology {
 }
 
 impl JobTopology {
-    /// Removes the tasks of the stage with partition index `n` or greater from all regions,
-    /// after the stage partitions are coalesced at runtime.
-    pub fn truncate_stage_partitions(&mut self, stage: usize, n: usize) {
+    /// Changes the number of tasks of the stage to `n` after the stage partitions are
+    /// adaptively changed at runtime. All tasks of the stage must belong to a single region.
+    pub fn resize_stage_partitions(&mut self, stage: usize, n: usize) {
         for region in &mut self.regions {
+            let count = region.tasks.iter().filter(|t| t.stage == stage).count();
+            if count == 0 {
+                continue;
+            }
             region.tasks.retain(|t| t.stage != stage || t.partition < n);
+            for partition in count..n {
+                region.tasks.push(TaskTopology { stage, partition });
+            }
         }
     }
 

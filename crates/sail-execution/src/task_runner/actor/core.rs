@@ -91,10 +91,11 @@ impl Actor for TaskRunnerActor {
             }
             TaskRunnerMessage::FetchStorageStream {
                 key,
+                slice,
                 schema,
                 context,
                 result,
-            } => self.handle_fetch_storage_stream(key, schema, context, result),
+            } => self.handle_fetch_storage_stream(key, slice, schema, context, result),
             TaskRunnerMessage::FetchCelebornStream {
                 job_id,
                 stage,

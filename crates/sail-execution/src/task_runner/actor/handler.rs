@@ -15,7 +15,7 @@ use crate::error::{ExecutionError, ExecutionResult};
 use crate::id::{JobId, TaskAttempt, TaskKey, TaskStreamKey, WorkerId};
 use crate::stream::reader::TaskStreamSource;
 use crate::stream::writer::{TaskStreamChannelSink, TaskStreamSink};
-use crate::task::definition::TaskDefinition;
+use crate::task::definition::{FileSlice, TaskDefinition};
 use crate::task::stats::TaskShuffleStats;
 use crate::task_runner::monitor::TaskMonitor;
 use crate::task_runner::preparation::TaskPreparation;
@@ -354,6 +354,7 @@ impl TaskRunnerActor {
     pub(super) fn handle_fetch_storage_stream(
         &mut self,
         key: TaskStreamKey,
+        slice: Option<FileSlice>,
         schema: Arc<Schema>,
         context: Arc<TaskContext>,
         result: oneshot::Sender<ExecutionResult<TaskStreamSource>>,
@@ -367,7 +368,7 @@ impl TaskRunnerActor {
         let output = self
             .extensions
             .storage_streams()
-            .and_then(|streams| streams.fetch_stream(key, schema, &context));
+            .and_then(|streams| streams.fetch_stream(key, slice, schema, &context));
         let _ = result.send(output);
         ActorAction::Continue
     }

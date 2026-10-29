@@ -34,10 +34,32 @@ pub enum TaskInputLocator {
     },
     Storage {
         keys: Vec<Vec<TaskInputKey>>,
+        /// An optional file slice to read for each partition.
+        /// This is either empty or has the same length as `keys`.
+        slices: Vec<Option<FileSlice>>,
     },
     ShuffleService {
         channels: Vec<Vec<usize>>,
     },
+}
+
+/// A contiguous subset of the files of a storage stream. The sorted files are split
+/// into `count` slices, and slice `index` is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileSlice {
+    pub index: usize,
+    pub count: usize,
+}
+
+impl FileSlice {
+    /// Returns the range of items in this slice for `n` items in total.
+    pub fn range(&self, n: usize) -> std::ops::Range<usize> {
+        if self.count == 0 {
+            return 0..n;
+        }
+        let index = self.index.min(self.count);
+        (index * n / self.count)..((index + 1).min(self.count) * n / self.count)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -171,9 +193,19 @@ impl From<TaskInputLocator> for r#gen::TaskInputLocator {
                     keys: keys.into_iter().map(|x| x.into()).collect(),
                 })
             }
-            TaskInputLocator::Storage { keys } => {
+            TaskInputLocator::Storage { keys, slices } => {
                 r#gen::task_input_locator::Kind::Storage(r#gen::TaskInputStorageLocator {
                     keys: keys.into_iter().map(|x| x.into()).collect(),
+                    slices: slices
+                        .into_iter()
+                        .map(|x| {
+                            let x = x.unwrap_or(FileSlice { index: 0, count: 0 });
+                            r#gen::TaskInputFileSlice {
+                                index: x.index as u64,
+                                count: x.count as u64,
+                            }
+                        })
+                        .collect(),
                 })
             }
             TaskInputLocator::ShuffleService { channels } => {
@@ -218,12 +250,22 @@ impl TryFrom<r#gen::TaskInputLocator> for TaskInputLocator {
             }
             Some(r#gen::task_input_locator::Kind::Storage(r#gen::TaskInputStorageLocator {
                 keys,
+                slices,
             })) => {
                 let keys = keys
                     .into_iter()
                     .map(|x| x.try_into())
                     .collect::<ExecutionResult<Vec<_>>>()?;
-                Ok(TaskInputLocator::Storage { keys })
+                let slices = slices
+                    .into_iter()
+                    .map(|x| {
+                        (x.count > 0).then_some(FileSlice {
+                            index: x.index as usize,
+                            count: x.count as usize,
+                        })
+                    })
+                    .collect();
+                Ok(TaskInputLocator::Storage { keys, slices })
             }
             Some(r#gen::task_input_locator::Kind::ShuffleService(
                 r#gen::TaskInputShuffleServiceLocator { channels },
@@ -591,5 +633,24 @@ impl TaskOutput {
                 Ok(ShufflePartitioning::RoundRobinRow(*channels))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FileSlice;
+
+    #[test]
+    fn test_file_slice_range() {
+        let slice = |index, count| FileSlice { index, count };
+        assert_eq!(slice(0, 0).range(5), 0..5);
+        assert_eq!(slice(0, 2).range(5), 0..2);
+        assert_eq!(slice(1, 2).range(5), 2..5);
+        assert_eq!(slice(0, 3).range(1), 0..0);
+        assert_eq!(slice(2, 3).range(1), 0..1);
+        let covered = (0..4)
+            .flat_map(|i| slice(i, 4).range(10))
+            .collect::<Vec<_>>();
+        assert_eq!(covered, (0..10).collect::<Vec<_>>());
     }
 }

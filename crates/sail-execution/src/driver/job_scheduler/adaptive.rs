@@ -12,23 +12,32 @@
 use std::ops::Range;
 use std::sync::Arc;
 
+use datafusion::common::JoinType;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::physical_expr::Partitioning;
+use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
+use datafusion::physical_plan::filter::FilterExec;
+use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
+use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties, PlanProperties};
 use log::{debug, warn};
 
-use crate::driver::actor::AdaptiveCoalesceOptions;
+use crate::driver::actor::{AdaptiveCoalesceOptions, SkewJoinOptions};
 use crate::driver::job_scheduler::state::{
-    JobDescriptor, StageCoalesce, TaskRegionState, TaskState,
+    CoalescedPartition, JobDescriptor, StageCoalesce, TaskDescriptor, TaskRegionState, TaskState,
 };
 use crate::id::JobId;
 use crate::job_graph::{InputMode, OutputMode};
 use crate::plan::StageInputExec;
 use crate::shuffle::ShuffleBackendKind;
+use crate::task::definition::FileSlice;
 
 /// Coalesced partitions are never made smaller than this size
 /// for the sake of the minimum parallelism.
 const MIN_PARTITION_BYTES: u64 = 1024 * 1024;
+
+/// The maximum number of tasks that a skewed partition is split into.
+const MAX_SKEW_SPLITS: usize = 64;
 
 /// Combines adjacent partitions into ranges whose total size is at most `target` bytes,
 /// unless a single partition is already larger than `target`.
@@ -184,10 +193,10 @@ fn coalesce_stage(
     {
         return false;
     }
-    // Find the shuffle inputs and add up the partition sizes.
+    // Find the shuffle inputs and their partition sizes.
     let mut inputs = vec![];
     let mut producers = vec![];
-    let mut bytes = vec![0u64; partitions];
+    let mut sizes = vec![];
     for (i, input) in consumer.inputs.iter().enumerate() {
         let producer = &job.graph.stages()[input.stage];
         if !matches!(producer.mode, OutputMode::Blocking) {
@@ -200,43 +209,218 @@ fn coalesce_stage(
         {
             continue;
         }
-        let Some(sizes) = partition_bytes(job, input.stage) else {
+        let Some(bytes) = partition_bytes(job, input.stage) else {
             return false;
         };
-        for (acc, b) in bytes.iter_mut().zip(sizes) {
-            *acc = acc.saturating_add(b);
-        }
         inputs.push(i);
         producers.push(input.stage);
+        sizes.push(bytes);
     }
     if inputs.is_empty() {
         return false;
     }
-    let total = bytes.iter().sum::<u64>();
+    let skew = options.skew_join.as_ref().and_then(|skew| {
+        find_skewed_partitions(
+            &consumer.plan,
+            &inputs,
+            &producers,
+            &sizes,
+            skew,
+            options.target_partition_bytes,
+        )
+    });
+    let bytes = (0..partitions)
+        .map(|p| sizes.iter().map(|x| x[p]).fold(0u64, u64::saturating_add))
+        .collect::<Vec<_>>();
+    let total = bytes.iter().fold(0u64, |acc, x| acc.saturating_add(*x));
     let target = effective_target_partition_bytes(
         total,
         options.target_partition_bytes,
         options.min_partitions,
     );
-    let ranges = coalesce_partitions(&bytes, target);
-    if ranges.len() >= partitions {
+    let specs = build_partition_specs(&bytes, target, skew.as_deref().unwrap_or(&[]));
+    let n = specs.len();
+    let skewed = specs.iter().filter(|x| x.slice.is_some()).count();
+    if skewed == 0 && n >= partitions {
         return false;
     }
-    let Some(plan) = rewrite_stage_plan(&consumer.plan, &inputs, partitions, ranges.len()) else {
+    let Some(plan) = rewrite_stage_plan(&consumer.plan, &inputs, partitions, n) else {
         debug!("job {job_id} stage {stage} cannot be coalesced");
         return false;
     };
     debug!(
-        "job {job_id} stage {stage} coalesced from {partitions} to {} partitions \
-        ({total} bytes, target {target} bytes)",
-        ranges.len()
+        "job {job_id} stage {stage} coalesced from {partitions} to {n} partitions \
+        ({total} bytes, target {target} bytes, {skewed} skewed partition splits)"
     );
-    let n = ranges.len();
     job.graph.set_stage_plan(stage, plan);
-    job.stages[stage].tasks.truncate(n);
-    job.stages[stage].coalesced = Some(StageCoalesce { ranges, producers });
-    job.topology.truncate_stage_partitions(stage, n);
+    job.stages[stage]
+        .tasks
+        .resize_with(n, || TaskDescriptor { attempts: vec![] });
+    job.stages[stage].coalesced = Some(StageCoalesce {
+        partitions: specs,
+        producers,
+    });
+    job.topology.resize_stage_partitions(stage, n);
     true
+}
+
+/// Builds the partition specifications of a coalesced stage. Adjacent partitions are
+/// coalesced, except skewed partitions, which are split into multiple partitions that
+/// each read a slice of the skewed input.
+fn build_partition_specs(
+    bytes: &[u64],
+    target: u64,
+    skew: &[Option<(usize, usize)>],
+) -> Vec<CoalescedPartition> {
+    let mut specs = vec![];
+    let mut start = 0;
+    let flush = |specs: &mut Vec<CoalescedPartition>, start: usize, end: usize| {
+        for range in coalesce_partitions(&bytes[start..end], target) {
+            specs.push(CoalescedPartition {
+                range: (range.start + start)..(range.end + start),
+                slice: None,
+            });
+        }
+    };
+    for p in 0..bytes.len() {
+        if let Some(Some((producer, count))) = skew.get(p) {
+            flush(&mut specs, start, p);
+            for index in 0..*count {
+                specs.push(CoalescedPartition {
+                    range: p..p + 1,
+                    slice: Some((
+                        *producer,
+                        FileSlice {
+                            index,
+                            count: *count,
+                        },
+                    )),
+                });
+            }
+            start = p + 1;
+        }
+    }
+    flush(&mut specs, start, bytes.len());
+    specs
+}
+
+/// Returns the plan input index and the join side of the shuffle inputs of a partitioned
+/// hash join that can be split for skewed partitions.
+///
+/// The stage plan must consist of a single partitioned hash join whose children read
+/// two different shuffle inputs, optionally through projections or filters, and only
+/// such operators or partial aggregates can appear above the join.
+/// A side can be split when each task reading a slice of that side and the full other
+/// side produces disjoint output, which depends on the join type.
+fn find_skew_join_inputs(
+    plan: &Arc<dyn ExecutionPlan>,
+    inputs: &[usize],
+) -> Option<[Option<usize>; 2]> {
+    fn is_transparent(node: &Arc<dyn ExecutionPlan>) -> bool {
+        node.downcast_ref::<ProjectionExec>().is_some()
+            || node.downcast_ref::<FilterExec>().is_some()
+    }
+    fn find_input(node: &Arc<dyn ExecutionPlan>, inputs: &[usize]) -> Option<usize> {
+        let mut node = Arc::clone(node);
+        loop {
+            if let Some(input) = node.downcast_ref::<StageInputExec<usize>>() {
+                return inputs.iter().position(|x| x == input.input());
+            }
+            if !is_transparent(&node) {
+                return None;
+            }
+            let child = match node.children().as_slice() {
+                [child] => Arc::clone(child),
+                _ => return None,
+            };
+            node = child;
+        }
+    }
+    let mut node = Arc::clone(plan);
+    let join = loop {
+        if let Some(join) = node.downcast_ref::<HashJoinExec>() {
+            break join;
+        }
+        let partial = node
+            .downcast_ref::<AggregateExec>()
+            .is_some_and(|x| matches!(x.mode(), AggregateMode::Partial));
+        if !partial && !is_transparent(&node) {
+            return None;
+        }
+        let child = match node.children().as_slice() {
+            [child] => Arc::clone(child),
+            _ => return None,
+        };
+        node = child;
+    };
+    if !matches!(join.partition_mode(), PartitionMode::Partitioned) || join.null_aware {
+        return None;
+    }
+    let left = find_input(join.left(), inputs)?;
+    let right = find_input(join.right(), inputs)?;
+    if left == right {
+        return None;
+    }
+    let left_ok = matches!(
+        join.join_type(),
+        JoinType::Inner
+            | JoinType::Left
+            | JoinType::LeftSemi
+            | JoinType::LeftAnti
+            | JoinType::LeftMark
+    );
+    let right_ok = matches!(
+        join.join_type(),
+        JoinType::Inner
+            | JoinType::Right
+            | JoinType::RightSemi
+            | JoinType::RightAnti
+            | JoinType::RightMark
+    );
+    Some([left_ok.then_some(left), right_ok.then_some(right)])
+}
+
+/// Returns, for each partition, the producer stage to slice and the number of slices
+/// if the partition is skewed, or [None] if no partition is skewed.
+fn find_skewed_partitions(
+    plan: &Arc<dyn ExecutionPlan>,
+    inputs: &[usize],
+    producers: &[usize],
+    sizes: &[Vec<u64>],
+    options: &SkewJoinOptions,
+    target: u64,
+) -> Option<Vec<Option<(usize, usize)>>> {
+    let sides = find_skew_join_inputs(plan, inputs)?;
+    let partitions = sizes.first()?.len();
+    let mut output = vec![None; partitions];
+    let mut found = false;
+    for side in sides.into_iter().flatten() {
+        // A producer stage read by both sides cannot be sliced for one side only.
+        if producers.iter().filter(|x| **x == producers[side]).count() > 1 {
+            continue;
+        }
+        let mut nonzero = sizes[side]
+            .iter()
+            .copied()
+            .filter(|x| *x > 0)
+            .collect::<Vec<_>>();
+        if nonzero.is_empty() {
+            continue;
+        }
+        nonzero.sort_unstable();
+        let median = nonzero[nonzero.len() / 2];
+        let threshold = ((median as f64 * options.factor) as u64).max(options.threshold_bytes);
+        for (p, &size) in sizes[side].iter().enumerate() {
+            if size > threshold && output[p].is_none() {
+                let count = size
+                    .div_ceil(target.max(1))
+                    .clamp(2, MAX_SKEW_SPLITS as u64) as usize;
+                output[p] = Some((producers[side], count));
+                found = true;
+            }
+        }
+    }
+    found.then_some(output)
 }
 
 /// Coalesces the partitions of stages in task regions that are about to be scheduled
@@ -356,13 +540,21 @@ mod tests {
         let options = AdaptiveCoalesceOptions {
             target_partition_bytes: 12,
             min_partitions: 0,
+            skew_join: None,
         };
         coalesce_job_stages(JobId::from(1), &mut job, &options);
         let coalesced = job.stages[consumer]
             .coalesced
             .clone()
             .ok_or_else(|| crate::error::ExecutionError::InternalError("not coalesced".into()))?;
-        assert_eq!(coalesced.ranges, vec![0..1, 1..4]);
+        assert_eq!(
+            coalesced
+                .partitions
+                .iter()
+                .map(|x| x.range.clone())
+                .collect::<Vec<_>>(),
+            vec![0..1, 1..4]
+        );
         assert_eq!(coalesced.producers, vec![1]);
         assert_eq!(job.stages[consumer].tasks.len(), 2);
         assert_eq!(
@@ -383,6 +575,106 @@ mod tests {
         // The decision is never revisited.
         coalesce_job_stages(JobId::from(1), &mut job, &options);
         assert_eq!(job.stages[consumer].tasks.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_build_partition_specs_with_skew() {
+        let slice = |index| Some((7, FileSlice { index, count: 2 }));
+        let specs = build_partition_specs(&[1, 1, 100, 1, 1], 10, &[None, None, Some((7, 2))]);
+        assert_eq!(
+            specs,
+            vec![
+                CoalescedPartition {
+                    range: 0..2,
+                    slice: None
+                },
+                CoalescedPartition {
+                    range: 2..3,
+                    slice: slice(0)
+                },
+                CoalescedPartition {
+                    range: 2..3,
+                    slice: slice(1)
+                },
+                CoalescedPartition {
+                    range: 3..5,
+                    slice: None
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_find_skew_join_inputs() -> datafusion::common::Result<()> {
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::common::NullEquality;
+        use datafusion::physical_expr::EquivalenceProperties;
+        use datafusion::physical_expr::expressions::Column;
+        use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let input = |i: usize| -> Arc<dyn ExecutionPlan> {
+            Arc::new(StageInputExec::new(
+                i,
+                Arc::new(PlanProperties::new(
+                    EquivalenceProperties::new(schema.clone()),
+                    Partitioning::UnknownPartitioning(4),
+                    EmissionType::Incremental,
+                    Boundedness::Bounded,
+                )),
+            ))
+        };
+        let join = |join_type, mode| -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+            Ok(Arc::new(HashJoinExec::try_new(
+                input(0),
+                input(1),
+                vec![(
+                    Arc::new(Column::new("a", 0)) as _,
+                    Arc::new(Column::new("a", 0)) as _,
+                )],
+                None,
+                &join_type,
+                None,
+                mode,
+                NullEquality::NullEqualsNothing,
+                false,
+            )?))
+        };
+        let inputs = [0, 1];
+        assert_eq!(
+            find_skew_join_inputs(&join(JoinType::Inner, PartitionMode::Partitioned)?, &inputs),
+            Some([Some(0), Some(1)])
+        );
+        assert_eq!(
+            find_skew_join_inputs(&join(JoinType::Left, PartitionMode::Partitioned)?, &inputs),
+            Some([Some(0), None])
+        );
+        assert_eq!(
+            find_skew_join_inputs(
+                &join(JoinType::RightAnti, PartitionMode::Partitioned)?,
+                &inputs
+            ),
+            Some([None, Some(1)])
+        );
+        assert_eq!(
+            find_skew_join_inputs(&join(JoinType::Full, PartitionMode::Partitioned)?, &inputs),
+            Some([None, None])
+        );
+        assert_eq!(
+            find_skew_join_inputs(&join(JoinType::Inner, PartitionMode::CollectLeft)?, &inputs),
+            None
+        );
+        let filtered: Arc<dyn ExecutionPlan> = Arc::new(FilterExec::try_new(
+            Arc::new(datafusion::physical_expr::expressions::Literal::new(
+                datafusion::common::ScalarValue::Boolean(Some(true)),
+            )),
+            join(JoinType::Inner, PartitionMode::Partitioned)?,
+        )?);
+        assert_eq!(
+            find_skew_join_inputs(&filtered, &inputs),
+            Some([Some(0), Some(1)])
+        );
         Ok(())
     }
 
