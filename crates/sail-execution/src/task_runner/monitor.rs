@@ -13,6 +13,7 @@ use tokio_util::task::AbortOnDropHandle;
 
 use crate::driver::TaskStatus;
 use crate::id::{TaskKey, TaskKeyDisplay};
+use crate::task::stats::TaskShuffleStats;
 use crate::task_runner::{TaskRunnerActor, TaskRunnerMessage};
 
 pub struct TaskMonitor {
@@ -118,6 +119,7 @@ impl TaskMonitor {
             status,
             message,
             cause,
+            shuffle_stats: None,
         }
     }
 
@@ -143,18 +145,31 @@ impl TaskMonitor {
     }
 
     async fn execute(key: TaskKey, mut stream: SendableRecordBatchStream) -> TaskRunnerMessage {
+        let mut shuffle_stats: Option<TaskShuffleStats> = None;
         loop {
             let Some(batch) = stream.next().await else {
-                break Self::status(key, TaskStatus::Succeeded, None, None);
-            };
-            if let Err(error) = batch {
-                break Self::status(
+                break TaskRunnerMessage::ReportTaskStatus {
                     key,
-                    TaskStatus::Failed,
-                    Some(format!("task error: {error}")),
-                    Some(CommonErrorCause::new::<PyErrExtractor>(&error)),
-                );
-            }
+                    status: TaskStatus::Succeeded,
+                    message: None,
+                    cause: None,
+                    shuffle_stats,
+                };
+            };
+            let error = match batch.map(|b| TaskShuffleStats::try_from_record_batch(&b)) {
+                Ok(Ok(Some(stats))) => {
+                    shuffle_stats.get_or_insert_default().merge(&stats);
+                    continue;
+                }
+                Ok(Ok(None)) => continue,
+                Ok(Err(error)) | Err(error) => error,
+            };
+            break Self::status(
+                key,
+                TaskStatus::Failed,
+                Some(format!("task error: {error}")),
+                Some(CommonErrorCause::new::<PyErrExtractor>(&error)),
+            );
         }
     }
 }
@@ -209,6 +224,33 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn reports_merged_shuffle_stats_on_success() -> Result<(), Box<dyn std::error::Error>> {
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+
+        let stats = TaskShuffleStats {
+            channel_bytes: vec![100, 0],
+            channel_records: vec![10, 0],
+        };
+        let batches = vec![Ok(stats.to_record_batch()?), Ok(stats.to_record_batch()?)];
+        let stream = RecordBatchStreamAdapter::new(
+            TaskShuffleStats::schema(),
+            futures::stream::iter(batches),
+        );
+        let message = TaskMonitor::execute(task_key(), Box::pin(stream)).await;
+        let TaskRunnerMessage::ReportTaskStatus {
+            status: TaskStatus::Succeeded,
+            shuffle_stats: Some(merged),
+            ..
+        } = message
+        else {
+            return Err("expected task success with shuffle stats".into());
+        };
+        assert_eq!(merged.channel_bytes, vec![200, 0]);
+        assert_eq!(merged.channel_records, vec![20, 0]);
+        Ok(())
+    }
+
     fn task_key() -> TaskKey {
         TaskKey {
             job_id: JobId::from(1),
@@ -252,6 +294,7 @@ mod tests {
             status: TaskStatus::Failed,
             message: Some(message),
             cause: Some(CommonErrorCause::Internal(cause)),
+            ..
         } = message
         else {
             return Err("expected a failed task status".to_string());

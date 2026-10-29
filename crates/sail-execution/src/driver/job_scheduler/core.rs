@@ -38,6 +38,7 @@ use crate::task::definition::{
 use crate::task::scheduling::{
     TaskAssignment, TaskAssignmentGetter, TaskOutputKind, TaskRegion, TaskSet, TaskSetEntry,
 };
+use crate::task::stats::TaskShuffleStats;
 
 impl JobScheduler {
     fn next_job_id(&mut self) -> ExecutionResult<JobId> {
@@ -137,6 +138,28 @@ impl JobScheduler {
             status: attempt.state.status().to_string(),
             updated_at: Utc::now(),
         });
+    }
+
+    /// Records the shuffle output statistics reported by a succeeded task attempt.
+    pub fn update_task_shuffle_stats(&mut self, key: &TaskKey, stats: TaskShuffleStats) {
+        let Some(attempt) = self
+            .jobs
+            .get_mut(&key.job_id)
+            .and_then(|job| job.stages.get_mut(key.stage))
+            .and_then(|stage| stage.tasks.get_mut(key.partition))
+            .and_then(|task| task.attempts.get_mut(key.attempt))
+        else {
+            warn!("{} not found", TaskKeyDisplay(key));
+            return;
+        };
+        attempt.shuffle_stats = Some(stats);
+    }
+
+    /// Returns the aggregated shuffle output statistics of a stage, summed over
+    /// the latest succeeded attempt of each task, or [None] if any task of the stage
+    /// has not succeeded with statistics.
+    pub fn get_stage_shuffle_stats(&self, job_id: JobId, stage: usize) -> Option<TaskShuffleStats> {
+        self.jobs.get(&job_id)?.stages.get(stage)?.shuffle_stats()
     }
 
     pub fn get_task_state(&self, key: &TaskKey) -> Option<TaskState> {
@@ -424,6 +447,7 @@ impl JobScheduler {
                     messages: vec![],
                     cause: None,
                     job_output_fetched: false,
+                    shuffle_stats: None,
                 });
                 event_reporter.report(SystemEvent::TaskCreated {
                     session_id: session_id.to_string(),
@@ -1312,6 +1336,7 @@ mod tests {
             messages: vec![],
             cause,
             job_output_fetched: false,
+            shuffle_stats: None,
         };
         for _ in 0..2 {
             job.stages[0].tasks[0].attempts.push(attempt(
@@ -1397,6 +1422,7 @@ mod tests {
             messages: vec![],
             cause: None,
             job_output_fetched: false,
+            shuffle_stats: None,
         };
         for stage in &mut job.stages {
             for task in &mut stage.tasks {
@@ -1532,5 +1558,72 @@ mod tests {
                 1
             );
         }
+    }
+
+    #[test]
+    fn aggregates_stage_shuffle_stats_from_latest_succeeded_attempts()
+    -> crate::error::ExecutionResult<()> {
+        use std::sync::Arc;
+
+        use datafusion::arrow::datatypes::Schema;
+        use datafusion::datasource::memory::MemorySourceConfig;
+        use datafusion::execution::TaskContext;
+        use datafusion::physical_expr::Partitioning;
+        use datafusion::physical_plan::repartition::RepartitionExec;
+
+        use super::{JobDescriptor, JobState, TaskAttemptDescriptor, TaskState};
+        use crate::job_graph::{JobGraph, JobGraphOptions};
+        use crate::shuffle::{ShuffleBackendKind, ShuffleCompression};
+        use crate::task::stats::TaskShuffleStats;
+
+        let input =
+            MemorySourceConfig::try_new_exec(&vec![vec![]; 2], Arc::new(Schema::empty()), None)?;
+        let graph = JobGraph::try_new(
+            Arc::new(RepartitionExec::try_new(
+                input,
+                Partitioning::RoundRobinBatch(2),
+            )?),
+            JobGraphOptions {
+                shuffle_backend: ShuffleBackendKind::Flight {
+                    compression: ShuffleCompression::None,
+                    connection_count: std::num::NonZeroUsize::MIN,
+                    initial_stream_window_size: None,
+                    initial_connection_window_size: None,
+                },
+            },
+        )?;
+        let mut job =
+            JobDescriptor::try_new(graph, JobState::Draining, Arc::new(TaskContext::default()))?;
+        let attempt = |state, bytes: u64| TaskAttemptDescriptor {
+            state,
+            messages: vec![],
+            cause: None,
+            job_output_fetched: false,
+            shuffle_stats: Some(TaskShuffleStats {
+                channel_bytes: vec![bytes, 2 * bytes],
+                channel_records: vec![1, 2],
+            }),
+        };
+        let stage = &mut job.stages[0];
+        assert_eq!(stage.tasks.len(), 2);
+        stage.tasks[0]
+            .attempts
+            .push(attempt(TaskState::Succeeded, 10));
+        assert_eq!(stage.shuffle_stats(), None);
+        // The failed retry after the succeeded attempt must be ignored.
+        stage.tasks[1]
+            .attempts
+            .push(attempt(TaskState::Succeeded, 100));
+        stage.tasks[1]
+            .attempts
+            .push(attempt(TaskState::Failed, 1000));
+        assert_eq!(
+            stage.shuffle_stats(),
+            Some(TaskShuffleStats {
+                channel_bytes: vec![110, 220],
+                channel_records: vec![2, 4],
+            })
+        );
+        Ok(())
     }
 }

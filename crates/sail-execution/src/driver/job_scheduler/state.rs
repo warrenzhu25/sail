@@ -8,6 +8,7 @@ use crate::driver::job_scheduler::topology::JobTopology;
 use crate::driver::output::{JobOutputManager, JobOutputOutcome};
 use crate::error::ExecutionResult;
 use crate::job_graph::JobGraph;
+use crate::task::stats::TaskShuffleStats;
 
 /// Tracks graph/topology and runtime state for a single job.
 pub struct JobDescriptor {
@@ -112,6 +113,24 @@ impl StageState {
     }
 }
 
+impl StageDescriptor {
+    /// Returns the shuffle output statistics of the stage, summed over the latest
+    /// succeeded attempt of each task, or [None] if any task has not succeeded
+    /// with statistics.
+    pub fn shuffle_stats(&self) -> Option<TaskShuffleStats> {
+        let mut output = TaskShuffleStats::default();
+        for task in &self.tasks {
+            let attempt = task
+                .attempts
+                .iter()
+                .rev()
+                .find(|x| matches!(x.state, TaskState::Succeeded))?;
+            output.merge(attempt.shuffle_stats.as_ref()?);
+        }
+        Some(output)
+    }
+}
+
 #[derive(Debug)]
 pub struct TaskRegionDescriptor {
     pub state: TaskRegionState,
@@ -138,6 +157,8 @@ pub struct TaskAttemptDescriptor {
     /// This will always be false if the task does not belong to
     /// the final stages of the job.
     pub job_output_fetched: bool,
+    /// The shuffle output statistics reported by the task attempt when it succeeded.
+    pub shuffle_stats: Option<TaskShuffleStats>,
 }
 
 #[derive(Debug, Clone, Copy)]

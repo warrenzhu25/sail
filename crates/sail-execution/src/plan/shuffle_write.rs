@@ -1,7 +1,6 @@
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 
-use datafusion::arrow::datatypes::Schema;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::{Result, plan_err};
@@ -21,6 +20,7 @@ use futures::StreamExt;
 use sail_physical_plan::repartition::RowRoundRobinPartitioner;
 
 use crate::stream::writer::{TaskStreamWriteState, TaskStreamWriter};
+use crate::task::stats::TaskShuffleStats;
 
 enum ShufflePartitioner {
     Batch(BatchPartitioner),
@@ -120,12 +120,13 @@ impl ShuffleWriteExec {
     ) -> Self {
         let partitioning = partitioning.normalize();
         let properties = Arc::new(PlanProperties::new(
-            EquivalenceProperties::new(Arc::new(Schema::empty())),
+            EquivalenceProperties::new(TaskShuffleStats::schema()),
             // The shuffle write plan has the same number of partitions as the input plan.
             // For each partition that are executed, the data is further partitioned according to
             // the shuffle partitioning, resulting in multiple output streams.
             // These output streams are written to locations managed by the worker,
-            // while the return value of `.execute()` is always an empty stream.
+            // while the return value of `.execute()` is a single batch containing
+            // the per-channel shuffle statistics (see [`TaskShuffleStats`]).
             Partitioning::UnknownPartitioning(plan.output_partitioning().partition_count()),
             EmissionType::Final,
             Boundedness::Unbounded {
@@ -249,11 +250,10 @@ impl ExecutionPlan for ShuffleWriteExec {
                 RowRoundRobinPartitioner::new(*partitions, partition, num_input_partitions)?,
             ),
         };
-        let empty = RecordBatch::new_empty(self.schema());
         let channels = self.partitioning.partition_count();
         let output = futures::stream::once(async move {
-            shuffle_write(writer, stream, partition, channels, partitioner).await?;
-            Ok(empty)
+            let stats = shuffle_write(writer, stream, partition, channels, partitioner).await?;
+            stats.to_record_batch()
         });
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema(),
@@ -268,7 +268,8 @@ async fn shuffle_write(
     partition: usize,
     channels: usize,
     mut partitioner: ShufflePartitioner,
-) -> Result<()> {
+) -> Result<TaskShuffleStats> {
+    let mut stats = TaskShuffleStats::new(channels);
     let mut sink = writer.open(partition).await?;
     let result = async {
         while let Some(batch) = stream.next().await {
@@ -278,6 +279,8 @@ async fn shuffle_write(
             }
             let mut partitions: Vec<Option<RecordBatch>> = vec![None; channels];
             partitioner.partition(batch, |p, batch| {
+                stats.channel_bytes[p] += batch.get_array_memory_size() as u64;
+                stats.channel_records[p] += batch.num_rows() as u64;
                 partitions[p] = Some(batch);
                 Ok(())
             })?;
@@ -289,14 +292,106 @@ async fn shuffle_write(
     }
     .await;
     match result {
-        Ok(true) => sink.commit().await,
+        Ok(true) => {
+            sink.commit().await?;
+            Ok(stats)
+        }
         Ok(false) => {
             // TODO: model successful early-stop separately from error-triggered aborts
-            sink.abort().await
+            sink.abort().await?;
+            Ok(stats)
         }
         Err(error) => {
             let _ = sink.abort().await;
             Err(error)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use datafusion::arrow::array::Int32Array;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::datasource::memory::MemorySourceConfig;
+    use datafusion::physical_plan::common::collect;
+
+    use super::*;
+    use crate::stream::writer::TaskStreamSink;
+
+    #[derive(Debug, Default)]
+    struct RecordingWriter {
+        rows: Arc<Mutex<Vec<usize>>>,
+    }
+
+    struct RecordingSink {
+        rows: Arc<Mutex<Vec<usize>>>,
+    }
+
+    #[tonic::async_trait]
+    impl TaskStreamWriter for RecordingWriter {
+        async fn open(&self, _partition: usize) -> Result<Box<dyn TaskStreamSink>> {
+            Ok(Box::new(RecordingSink {
+                rows: self.rows.clone(),
+            }))
+        }
+    }
+
+    #[tonic::async_trait]
+    impl TaskStreamSink for RecordingSink {
+        async fn write(
+            &mut self,
+            batches: Vec<Option<RecordBatch>>,
+        ) -> Result<TaskStreamWriteState> {
+            let mut rows = self
+                .rows
+                .lock()
+                .map_err(|e| datafusion::common::DataFusionError::Internal(e.to_string()))?;
+            rows.resize(batches.len(), 0);
+            for (i, batch) in batches.iter().enumerate() {
+                rows[i] += batch.as_ref().map_or(0, |b| b.num_rows());
+            }
+            Ok(TaskStreamWriteState::Active)
+        }
+
+        async fn commit(self: Box<Self>) -> Result<()> {
+            Ok(())
+        }
+
+        async fn abort(self: Box<Self>) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn reports_per_channel_shuffle_stats() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let batch = |n: i32| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from((0..n).collect::<Vec<_>>()))],
+            )
+        };
+        let input =
+            MemorySourceConfig::try_new_exec(&[vec![batch(10)?, batch(7)?]], schema.clone(), None)?;
+        let writer = Arc::new(RecordingWriter::default());
+        let rows = writer.rows.clone();
+        let plan = ShuffleWriteExec::new(input, writer, ShufflePartitioning::RoundRobinRow(3));
+        assert_eq!(plan.schema(), TaskShuffleStats::schema());
+        let batches = collect(plan.execute(0, Arc::new(TaskContext::default()))?).await?;
+        assert_eq!(batches.len(), 1);
+        let stats = TaskShuffleStats::try_from_record_batch(&batches[0])?
+            .ok_or_else(|| datafusion::common::DataFusionError::Internal("no stats".into()))?;
+        let written = rows
+            .lock()
+            .map_err(|e| datafusion::common::DataFusionError::Internal(e.to_string()))?
+            .iter()
+            .map(|x| *x as u64)
+            .collect::<Vec<_>>();
+        assert_eq!(stats.channel_records, written);
+        assert_eq!(stats.channel_records.iter().sum::<u64>(), 17);
+        assert!(stats.channel_bytes.iter().all(|x| *x > 0));
+        Ok(())
     }
 }

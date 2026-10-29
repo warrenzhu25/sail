@@ -16,6 +16,7 @@ use crate::id::{JobId, TaskAttempt, TaskKey, TaskStreamKey, WorkerId};
 use crate::stream::reader::TaskStreamSource;
 use crate::stream::writer::{TaskStreamChannelSink, TaskStreamSink};
 use crate::task::definition::TaskDefinition;
+use crate::task::stats::TaskShuffleStats;
 use crate::task_runner::monitor::TaskMonitor;
 use crate::task_runner::preparation::TaskPreparation;
 use crate::task_runner::{TaskRunnerActor, TaskRunnerPlacement};
@@ -105,6 +106,7 @@ impl TaskRunnerActor {
         status: TaskStatus,
         message: Option<String>,
         cause: Option<CommonErrorCause>,
+        shuffle_stats: Option<TaskShuffleStats>,
     ) -> ActorAction {
         if !matches!(status, TaskStatus::Running) {
             self.signals.remove(&key);
@@ -119,6 +121,7 @@ impl TaskRunnerActor {
                             status,
                             message,
                             cause,
+                            shuffle_stats,
                             sequence: None,
                         })
                         .await;
@@ -149,9 +152,17 @@ impl TaskRunnerActor {
                             let key = key.clone();
                             let message = message.clone();
                             let cause = cause.clone();
+                            let shuffle_stats = shuffle_stats.clone();
                             async move {
                                 driver
-                                    .report_task_status(key, status, message, cause, seq)
+                                    .report_task_status(
+                                        key,
+                                        status,
+                                        message,
+                                        cause,
+                                        shuffle_stats,
+                                        seq,
+                                    )
                                     .await
                             }
                         })

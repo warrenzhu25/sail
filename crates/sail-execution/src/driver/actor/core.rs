@@ -175,8 +175,9 @@ impl Actor for DriverActor {
                 status,
                 message,
                 cause,
+                shuffle_stats,
                 sequence,
-            } => self.handle_update_task(ctx, key, status, message, cause, sequence),
+            } => self.handle_update_task(ctx, key, status, message, cause, shuffle_stats, sequence),
             DriverMessage::ProbePendingTask { key } => self.handle_probe_pending_task(ctx, key),
             DriverMessage::FetchDriverStream { key, result } => {
                 self.handle_fetch_driver_stream(ctx, key, result)

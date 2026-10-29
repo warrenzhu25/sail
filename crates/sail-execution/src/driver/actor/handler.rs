@@ -25,6 +25,7 @@ use crate::id::{
 use crate::stream::error::TaskStreamError;
 use crate::stream::reader::TaskStreamSource;
 use crate::task::scheduling::{TaskAssignment, TaskAssignmentGetter, TaskStreamAssignment};
+use crate::task::stats::TaskShuffleStats;
 use crate::task_runner::TaskRunnerMessage;
 
 impl DriverActor {
@@ -242,6 +243,7 @@ impl DriverActor {
         status: TaskStatus,
         message: Option<String>,
         cause: Option<CommonErrorCause>,
+        shuffle_stats: Option<TaskShuffleStats>,
         sequence: Option<u64>,
     ) -> ActorAction {
         if let Some(sequence) = sequence {
@@ -265,6 +267,23 @@ impl DriverActor {
             TaskStatus::Succeeded => {
                 self.job_scheduler
                     .update_task(&key, TaskState::Succeeded, message, cause);
+                if let Some(stats) = shuffle_stats {
+                    self.job_scheduler.update_task_shuffle_stats(&key, stats);
+                    if log::log_enabled!(log::Level::Debug)
+                        && let Some(stats) = self
+                            .job_scheduler
+                            .get_stage_shuffle_stats(key.job_id, key.stage)
+                    {
+                        debug!(
+                            "job {} stage {} shuffle output: {} bytes, {} records, {} channels",
+                            key.job_id,
+                            key.stage,
+                            stats.channel_bytes.iter().sum::<u64>(),
+                            stats.channel_records.iter().sum::<u64>(),
+                            stats.channel_bytes.len(),
+                        );
+                    }
+                }
                 self.unassign_task(ctx, &key);
                 self.refresh_job(ctx, key.job_id);
                 self.run_tasks(ctx);
@@ -330,6 +349,7 @@ impl DriverActor {
                     status: TaskStatus::Failed,
                     message: Some(message),
                     cause: Some(cause),
+                    shuffle_stats: None,
                     sequence: None,
                 })
             }
@@ -418,6 +438,7 @@ impl DriverActor {
                             status: TaskStatus::Failed,
                             message: Some(e.to_string()),
                             cause: Some(CommonErrorCause::new::<PyErrExtractor>(&e)),
+                            shuffle_stats: None,
                             sequence: None,
                         });
                     }
@@ -620,6 +641,7 @@ impl DriverActor {
                         status: TaskStatus::Failed,
                         message: Some("task region not found".into()),
                         cause: None,
+                        shuffle_stats: None,
                         sequence: None,
                     });
                     continue;
@@ -660,6 +682,7 @@ impl DriverActor {
                             status: TaskStatus::Failed,
                             message: Some(message.clone()),
                             cause: Some(cause.clone()),
+                            shuffle_stats: None,
                             sequence: None,
                         });
                     }
@@ -716,6 +739,7 @@ impl DriverActor {
                                     status: TaskStatus::Failed,
                                     message: Some(error.to_string()),
                                     cause: Some(CommonErrorCause::new::<PyErrExtractor>(&error)),
+                                    shuffle_stats: None,
                                     sequence: None,
                                 })
                                 .await;

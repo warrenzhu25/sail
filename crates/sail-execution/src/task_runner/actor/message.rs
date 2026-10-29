@@ -13,6 +13,7 @@ use crate::id::{JobId, TaskAttempt, TaskKey, TaskStreamKey, WorkerId};
 use crate::stream::reader::TaskStreamSource;
 use crate::stream::writer::{TaskStreamChannelSink, TaskStreamSink};
 use crate::task::definition::TaskDefinition;
+use crate::task::stats::TaskShuffleStats;
 use crate::worker::WorkerLocation;
 
 pub enum TaskRunnerMessage {
@@ -33,6 +34,8 @@ pub enum TaskRunnerMessage {
         status: TaskStatus,
         message: Option<String>,
         cause: Option<CommonErrorCause>,
+        /// The shuffle output statistics reported for a succeeded task.
+        shuffle_stats: Option<TaskShuffleStats>,
     },
     ProbePendingLocalStream {
         key: TaskStreamKey,
@@ -162,6 +165,7 @@ impl SpanAssociation for TaskRunnerMessage {
                 status,
                 message,
                 cause,
+                shuffle_stats: _,
             } => {
                 properties.push((SpanAttribute::EXECUTION_JOB_ID, job_id.to_string()));
                 properties.push((SpanAttribute::EXECUTION_STAGE, stage.to_string()));

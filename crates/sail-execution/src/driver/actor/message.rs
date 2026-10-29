@@ -19,6 +19,7 @@ use crate::driver::worker_scaler::WorkerRetryRequest;
 use crate::error::ExecutionResult;
 use crate::id::{JobId, TaskKey, TaskStreamKey, WorkerId};
 use crate::stream::reader::TaskStreamSource;
+use crate::task::stats::TaskShuffleStats;
 
 pub enum DriverMessage {
     Activate {
@@ -69,6 +70,8 @@ pub enum DriverMessage {
         status: TaskStatus,
         message: Option<String>,
         cause: Option<CommonErrorCause>,
+        /// The shuffle output statistics reported for a succeeded task.
+        shuffle_stats: Option<TaskShuffleStats>,
         /// The sequence number from the worker,
         /// or [None] if it is a forced update within the driver.
         sequence: Option<u64>,
@@ -216,6 +219,7 @@ impl SpanAssociation for DriverMessage {
                 status,
                 message,
                 cause,
+                shuffle_stats: _,
                 sequence: _,
             } => {
                 p.push((SpanAttribute::EXECUTION_JOB_ID, job_id.to_string()));
