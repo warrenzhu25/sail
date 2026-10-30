@@ -39,6 +39,27 @@ To address these problems, `sail-execution` also implements an **on-disk shuffle
 
 ## 2. Implementation Status (Read This First)
 
+::: tip Update: the `disk-shuffle-hardening` branch
+The status below describes this branch (up to `7a112171`). The follow-up
+`disk-shuffle-hardening` branch implements most of [Section 13](#_13-what-it-would-take-to-turn-this-on):
+
+| Commit | Change |
+| :--- | :--- |
+| `e6a7bc25` | Wires `OutputMode::Blocking` into the driver through `cluster.shuffle_mode`, `cluster.adaptive_shuffle_enabled`, and `cluster.adaptive_shuffle_target_partition_bytes`. |
+| `2879f373` | Stops reserving task slots for empty task sets in a region. |
+| `8df4dc8d` | Makes coalescing correct. It rewrites downstream merge inputs, keeps broadcast inputs at one partition, skips stages read with `Forward`, decides once before any attempt, skips when statistics are missing, and applies rewrites atomically. |
+| `32cfd682` | Retries stages on worker loss and shuffle fetch failure (`ShuffleFetchError`), invalidating completed tasks whose output lived on the lost worker. These failures don't count toward `task_max_attempts`. |
+| `d10e95e1` | Workers report per-channel shuffle statistics with task status, so coalescing works with remote and Kubernetes workers. |
+| `075cb153` | Adds `cluster.shuffle_dir` and gives each driver and worker its own directory. Recoverable retries are capped at 16. Missing output becomes an error instead of an empty stream. |
+| `7de2cc6c` | Adds 256 KiB buffered I/O, creates data files lazily, propagates errors, never drops batches for pending readers, and floors coalescing at the cluster task slot count. |
+
+Skew mitigation and broadcast-join rewrites are still not wired up. The current
+behavior on that branch is documented in
+[Shuffle Modes, Adaptive Coalescing, And Fault Tolerance](../architecture-deep-dive#shuffle-modes-adaptive-coalescing-and-fault-tolerance),
+and remaining gaps are in the
+[Production Readiness Roadmap](../architecture-deep-dive#production-readiness-roadmap).
+:::
+
 This is a case where the "adaptive disk shuffle" machinery is **built and unit/integration tested, but not yet the default (or even selectable) execution path in a running driver.** Concretely, in `crates/sail-execution/src/job_graph/mod.rs`:
 
 ```rust

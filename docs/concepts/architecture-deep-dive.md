@@ -33,6 +33,8 @@ navigate to the section most relevant to your task:
 | Add or debug a table format | [Data Sources And Table Formats](#data-sources-and-table-formats) |
 | Debug object storage access | [Object Storage](#object-storage) |
 | Add or debug functions | [Functions And Python Execution](#functions-and-python-execution) |
+| Understand shuffle, adaptive execution, or retries | [Shuffle Modes, Adaptive Coalescing, And Fault Tolerance](#shuffle-modes-adaptive-coalescing-and-fault-tolerance) |
+| Plan a production rollout | [Production Readiness Roadmap](#production-readiness-roadmap) |
 
 For a higher-level overview of Sail's architecture without code details, see
 [Architecture Overview](./architecture/).
@@ -1813,6 +1815,13 @@ updates state as tasks complete, dependencies resolve, and workers report
 status. This separation allows the same job graph structure to support
 different scheduling policies.
 
+The scheduler also owns the two runtime decisions that change a running job:
+adaptive coalescing (`try_coalesce_stage`, which rewrites a stage's partitioning
+before it's scheduled) and failure recovery (invalidating and recomputing
+upstream output after a worker is lost or a shuffle fetch fails). Both are
+covered in
+[Shuffle Modes, Adaptive Coalescing, And Fault Tolerance](#shuffle-modes-adaptive-coalescing-and-fault-tolerance).
+
 ### `crates/sail-execution/src/driver/task_assigner/*`
 
 The task assigner maps schedulable tasks to available workers. It considers
@@ -1878,6 +1887,94 @@ The driver uses stream management to assemble job outputs for the client.
 Workers use stream services to exchange partition data. This separation lets the
 control plane schedule and observe work while the data plane moves Arrow record
 batches between execution components.
+
+### Shuffle Modes, Adaptive Coalescing, And Fault Tolerance
+
+::: warning Branch scope
+This section describes the behavior on the `disk-shuffle-hardening` branch
+(commits `e6a7bc25` to `7de2cc6c`), which builds on this branch. Without those
+commits, `OutputMode::Blocking` can't be reached from a running driver, there
+are no `cluster.shuffle_*` keys, and a lost worker isn't recovered. See
+[Implementation Status](./architecture/adaptive-disk-shuffle-design#_2-implementation-status-read-this-first).
+:::
+
+Cluster mode has two shuffle modes, selected with `cluster.shuffle_mode`. Both
+modes, and all the settings below, are marked experimental.
+
+| Mode | Behavior | When to use |
+|------|----------|-------------|
+| `pipelined` (default) | Upstream and downstream stages run at the same time. Batches flow through in-memory `mpsc` channels (`LocalStreamStorage::Memory`) and Arrow Flight. | Low-latency, small-to-medium queries where the whole pipeline fits in cluster memory. |
+| `blocking` | Upstream tasks write their output to local disk (`DiskStream`) and exit. Downstream stages start only after every upstream task has succeeded. | Large shuffles, memory-constrained clusters, and any job that needs adaptive coalescing or recovery from losing a worker. |
+
+**On-disk layout (blocking mode).** Each task attempt writes one Arrow IPC
+stream file **per output channel**, plus a small text index holding
+`total_bytes` and `total_records`:
+
+```text
+{cluster.shuffle_dir or $TMPDIR/sail/shuffle}/
+  driver-{pid}-{nonce}/            # one per driver instance, removed on stop
+    worker_{id}/                   # local workers, removed on stop
+      {job_id}/{stage}/shuffle_{partition}_{attempt}_{channel}.data
+      {job_id}/{stage}/shuffle_{partition}_{attempt}_{channel}.index
+  worker_{id}-{pid}-{nonce}/       # remote (for example Kubernetes) workers
+```
+
+`DiskStreamWriter` writes to `.data.tmp` and `.index.tmp`, then renames both into
+place, using 256 KiB buffered I/O. It creates the data file only when the first
+batch arrives, so empty channels get an index file but no data file. When
+reading, a missing index means the output is lost, and the reader returns an
+error instead of an empty stream. That error is what lets the driver detect the
+loss and recompute the output.
+
+**Shuffle statistics.** When a task finishes, `ShuffleWriteExec` emits
+per-channel byte and record counts. The task monitor sends them to the driver
+in `ReportTaskStatusRequest.shuffle_stats`, and the job scheduler stores them on
+the task attempt. Because the counts are reported this way, adaptive decisions
+work even when the shuffle files live on remote workers. If the counts are
+missing, the driver falls back to reading the index files from its own shuffle
+directory, which only works for local workers.
+
+**Adaptive coalescing** (`try_coalesce_stage` in `job_scheduler/core.rs`).
+Before any task of a stage is scheduled, the scheduler may merge adjacent
+shuffle channels into fewer, larger partitions. It does this only when **all**
+of the following hold:
+
+- `cluster.adaptive_shuffle_enabled` is true (the default) and every shuffle
+  input comes from a completed `blocking` stage.
+- The stage has no `Forward` or `Merge` inputs, and none of its consumers read
+  it with `Forward`. Broadcast inputs are allowed and keep a single partition.
+- All shuffle inputs have the same channel count, that count equals the stage's
+  partition count, and it's greater than 1.
+- Statistics are complete for every upstream task. If any are missing, the
+  scheduler skips coalescing rather than treating them as zero bytes.
+
+The target size is
+`min(adaptive_shuffle_target_partition_bytes, max(total_bytes / min_parallelism, 1 MiB))`.
+Here `min_parallelism` is the cluster's task slot count
+(`max(worker_max_count, worker_initial_count) * worker_task_slots`). This
+matches Spark AQE's parallelism-first mode, which avoids over-coalescing
+CPU-heavy stages. The plan rewrite for the stage and the merge inputs of its
+downstream stages is applied atomically. The decision is made once per stage
+and isn't revisited on retry.
+
+Skewed channels are detected (more than 5x the median and at least 128 MiB) but
+only **logged**. Skew splitting and runtime broadcast-join conversion exist only
+as helpers used in tests.
+
+**Fault tolerance.**
+
+| Failure | How it's detected | What happens |
+|---------|-------------------|--------------|
+| Task error | Task status `Failed` | Retry up to `cluster.task_max_attempts` (default 3). |
+| Worker can't launch a task, or misses heartbeats for `worker_heartbeat_timeout_secs` (default 120) | Worker pool | The worker is marked lost. Its running tasks **and** its completed tasks with local shuffle output are invalidated and rescheduled. |
+| Downstream task can't read upstream output | `ShuffleFetchError` (from `ShuffleReadExec`, carrying the producer task key and worker ID) | The producer is invalidated, even if its worker is already lost or its stage is inactive. An inactive stage is recomputed in full, active downstream attempts are canceled, and the consumer is retried. |
+| Job output stream breaks while a retried final stage is running | `JobOutputStream` | Transient errors are ignored while the job is active, so the new output stream can take over. |
+
+Lost-worker and fetch failures don't count toward `task_max_attempts`. They
+are capped separately (`MAX_RECOVERABLE_TASK_ATTEMPTS = 16`), so a job can't
+retry forever. A stage's shuffle directory is removed once all of its consumers
+have succeeded, the job directory is removed when the job ends, and the whole
+driver or worker directory is removed when it stops.
 
 ### `crates/sail-execution/src/worker_manager/*`
 
@@ -2634,6 +2731,9 @@ sends the physical plan to the driver actor. The driver builds a job graph,
 schedules stages, assigns tasks to workers, and manages output streams. Workers
 execute task fragments and exchange stream data as needed. The driver returns a
 record batch stream to the same protocol layer that local execution uses.
+In `blocking` shuffle mode, stage boundaries are materialized to local disk, so
+the driver can resize downstream stages from the reported shuffle statistics
+and recompute lost upstream output instead of failing the job.
 
 ## Extension Points
 
@@ -2691,6 +2791,12 @@ need to know whether a plan is running locally or in a cluster.
 | Logical plan valid but physical fails | `sail-session/src/planner.rs` extension planner cases |
 | Physical plan valid but local exec fails | `sail-physical-plan` operator, `LocalJobRunner` |
 | Fails only in cluster mode | Driver actor, job scheduler, task assigner, worker actor, streams |
+| `shuffle fetch failed for job ...` in logs | `ShuffleFetchError` in `shuffle_read.rs`. Check whether the producer worker was lost (heartbeat timeout) or its shuffle directory was removed. The job retries on its own, up to 16 recoverable attempts. |
+| `shuffle output not found: ...` | `DiskStream::subscribe`. The output was cleaned up or lived on a lost worker. Confirm that the stage was invalidated and recomputed. |
+| Blocking stage didn't coalesce | Enable debug logs for `job_scheduler`. Look for `skip adaptive coalescing` (missing stats), `Forward`/`Merge` inputs, or a channel count that doesn't match the partition count. |
+| Too few, slow reduce tasks after coalescing | The `min_parallelism` floor comes from the worker slot settings. Lower `cluster.adaptive_shuffle_target_partition_bytes` or raise `worker_task_slots`. |
+| Disk fills up during large shuffles | `cluster.shuffle_dir`: point it at a large local SSD volume (on Kubernetes, an `emptyDir` sized for the shuffle). |
+| Worker killed for out of memory | `runtime.memory_pool.type` defaults to `unbounded`. Switch to `fair` with an explicit `max_size` so operators spill. |
 | Wrong schema returned to client | `NamedPlan` field names, hidden field removal, `plan_analyzer.rs` |
 
 **Additional debugging tips:**
@@ -2717,9 +2823,75 @@ need to know whether a plan is running locally or in a cluster.
   - Are streams connecting between workers? (Check worker actor logs)
   - Is the job graph correct? (Inspect stage dependencies and shuffle boundaries)
 
+## Production Readiness Roadmap
+
+This section assesses where Sail stands for production batch workloads in
+cluster mode and lays out a phased plan to close the gaps. "Production ready"
+means:
+
+1. **Correct.** Results match Spark. Unsupported features fail clearly instead
+   of returning different answers.
+2. **Resilient.** Losing a worker, a pod being preempted, or a disk filling up
+   slows a job down but doesn't fail it.
+3. **Resource bounded.** Memory and disk use stay within configured limits, and
+   operators spill instead of crashing the process.
+4. **Operable.** Operators can see what a job is doing, why it's slow, and why
+   it failed, without reading source code.
+
+### Current State
+
+| Area | Status | Main gap |
+|------|--------|----------|
+| Spark compatibility | Strong. The compatibility data in `python/pysail/data/compatibility` marks most tracked functions as supported. | About 50 functions are planned or only partially supported. There's no continuous differential testing against Spark. |
+| Shuffle | Pipelined (in-memory) by default. Blocking (disk) mode is experimental. | Blocking mode writes M × R files per stage. There's no shuffle service, so output dies with its worker. |
+| Adaptive execution | Coalescing exists, with a parallelism floor and atomic plan rewrites. | Skew is detected but not split. There's no runtime join strategy switch and no dynamic partition pruning from runtime statistics. |
+| Fault tolerance | Task retry, worker-loss recovery, and fetch-failure recompute, with bounded recoverable retries. | No driver high availability. No speculative execution. In pipelined mode, a failure restarts the whole connected pipeline. |
+| Memory | DataFusion memory pools are available. | The default pool is `unbounded`, so a large query can take down a worker. No pool is sized from the container automatically. |
+| Kubernetes | The worker manager supports pod templates and TLS. | Shuffle data lives on pod-local storage, the pod disruption story isn't defined, and there's no autoscaling based on queue depth. |
+| Observability | OpenTelemetry traces, metrics, and logs, plus `trace_execution_plan`. | There's no job or stage UI or history server equivalent. Shuffle bytes, spills, retries, and coalescing decisions aren't exported as metrics. |
+
+### Phase 1: Make Cluster Mode Safe By Default
+
+| # | Work item | Exit criteria |
+|---|-----------|---------------|
+| 1.1 | **Bounded memory by default.** Use the `fair` pool when running in cluster mode, sized from the container or cgroup memory limit, with spilling enabled for sort, aggregate, and join. | TPC-DS SF1000 on the reference cluster finishes with no worker killed for memory, at default settings. |
+| 1.2 | **Promote blocking shuffle from experimental.** Make it the default for multi-stage batch jobs, keeping pipelined for interactive and low-latency queries, chosen automatically or per session. | Blocking mode passes the full test suite and runs TPC-H and TPC-DS with less than 10% overhead compared with pipelined. |
+| 1.3 | **Disk management.** Support multiple shuffle directories (striped across disks), check free space before writing, sweep orphaned `driver-*` and `worker_*` directories left by crashed processes, and fail clearly when the disk is full. | A chaos test that fills the disk ends in a clean failure or retry, never a hang. |
+| 1.4 | **Differential correctness testing.** Run the PySpark and Spark SQL test suites and a nightly random-query fuzzer against Spark, covering NULLs, decimals, timezones, and ANSI mode. | Zero unexplained mismatches on the nightly run for 30 days. |
+
+### Phase 2: Scale And Resilience
+
+| # | Work item | Exit criteria |
+|---|-----------|---------------|
+| 2.1 | **Consolidated shuffle files.** Write one data file plus a binary offset index per map task (the layout in the design doc) instead of one file per channel. This is required for stages with thousands of partitions. | A stage with 10,000 × 10,000 partitions runs without exhausting inodes or file descriptors. |
+| 2.2 | **Durable shuffle for Kubernetes.** Either add a per-node shuffle service (DaemonSet) that outlives worker pods, or support pushing shuffle output to object storage. Track shuffle output location separately from worker liveness. | Preempting 20% of worker pods mid-job doesn't trigger recompute of completed stages. |
+| 2.3 | **Skew handling.** Turn on `split_skew_partition`: split skewed channels across multiple readers and replicate the other side of the join. | A skewed join benchmark (one key holding 50% of rows) finishes within 2x of the uniform case. |
+| 2.4 | **Runtime join selection.** Use the reported shuffle statistics to switch to a broadcast join when one side is small (`should_broadcast_join` exists but is only used in tests). | Measurable speedup on TPC-DS queries with selective filters. |
+| 2.5 | **Speculative execution.** Launch backup attempts for straggler tasks in blocking stages. | Tail latency improves with injected slow workers. |
+| 2.6 | **Driver resilience.** Persist job state so that, at minimum, a driver restart fails in-flight jobs cleanly and frees their workers. Driver high availability can come later. | No orphaned worker pods or shuffle directories after the driver is killed. |
+
+### Phase 3: Operability
+
+| # | Work item | Exit criteria |
+|---|-----------|---------------|
+| 3.1 | **Execution metrics.** Export per-job, per-stage, and per-task metrics: shuffle bytes and records, spill bytes, retries by cause, coalescing decisions, and worker loss events. | Dashboards built only from OTLP metrics can explain a slow job. |
+| 3.2 | **Job and stage UI.** Provide a web UI or a Spark History Server compatible event log that shows the stage DAG, task timelines, and the physical plan with runtime metrics. | Users can debug a slow query without access to logs. |
+| 3.3 | **Configuration hardening.** Graduate the stable `cluster.*` and `runtime.*` options out of experimental, validate them at startup, and document tuning guides. | Every production setting is documented and validated. |
+| 3.4 | **Rollout tooling.** Shadow mode (run on Spark and Sail, compare results on a sample), per-tenant canaries, and automatic fallback to Spark for unsupported plans. | The playbook is documented and tried on a real workload. |
+
+### Suggested Sequencing
+
+| Milestone | Scope | Outcome |
+|-----------|-------|---------|
+| M1 | 1.1 – 1.4 | Cluster mode is safe to try on real batch jobs (beta). |
+| M2 | 2.1 – 2.4 | Handles large, skewed, preemptible workloads (GA candidate). |
+| M3 | 2.5, 2.6, 3.1 – 3.4 | Operable at fleet scale (GA). |
+
 ## Further Reading
 
 - [Query Planning](./query-planning/) for more detail on plan optimization.
+- [Adaptive Disk-Based Shuffle Design](./architecture/adaptive-disk-shuffle-design)
+  for the blocking shuffle subsystem, its commit history, and test coverage.
 - [Benchmark Results](../introduction/benchmark-results/) for performance
   comparisons.
 - [Configuration](../guide/configuration/) for runtime and deployment options.
