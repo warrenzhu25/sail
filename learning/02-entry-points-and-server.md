@@ -1,212 +1,38 @@
 # 02 · Entry Points, Configuration, and the Server Framework
 
-> **You'll learn:** how Sail starts, the roles one binary can play, how
-> configuration is loaded, and the actor and gRPC building blocks every service
-> uses.
->
-> **Crates:** `sail-cli`, `sail-python`, `sail-server`, `sail-common`
-> (configuration and runtime)
-
-
-## In One Minute
-
-- There's **one binary**, `sail`. Its subcommand picks the role: Spark Connect
-  server, shell, script runner, MCP server, Flight SQL server, or cluster
-  worker.
-- **Configuration** = YAML defaults compiled into the binary, overridden by
-  `SAIL_*` environment variables (`__` becomes `.`).
-- Every process has two thread pools: **primary** (queries, RPC) and **io**
-  (storage, catalogs).
-- Long-lived coordinators (driver, workers, session manager) are **actors**:
-  one message at a time, no shared locks.
-- All gRPC services are built with one shared **server builder** (health
-  checks, reflection, tracing, keep-alives).
+Every Sail process starts the same way: one binary, a configuration file baked
+into it, a couple of thread pools, and a handful of long-running components
+that talk to each other through messages. This doc explains that foundation:
+how the `sail` binary decides what to be, where configuration comes from, why
+Sail uses two thread pools, and why its coordinators are built as actors.
 
 ---
 
-## 1. What This Component Does
+## One binary, many roles
 
-Everything in Sail starts in a single binary called `sail`. Depending on its
-arguments it can act as:
+Sail ships as a single executable called `sail`. The first word after it picks a
+role. `sail spark server` starts a Spark Connect server that PySpark clients can
+connect to. `sail spark shell` starts an interactive PySpark shell backed by a
+private Sail server. `sail spark run -f job.py` runs a PySpark script against a
+private server and exits. `sail spark mcp-server` exposes Sail to AI assistants
+through the Model Context Protocol. `sail flight server` starts an Arrow Flight
+SQL server for SQL tools. And `sail worker` turns the process into a cluster
+worker, though you never run that yourself: the driver starts workers for you.
 
-| Role | Command | Who uses it |
-|------|---------|-------------|
-| Spark Connect server | `sail spark server` | PySpark clients (`SparkSession.builder.remote("sc://…")`) |
-| Interactive shell | `sail spark shell` | A developer who wants a PySpark REPL backed by Sail |
-| Script runner | `sail spark run -f job.py` | Batch scripts. Starts a server, runs the script, and exits. |
-| MCP server | `sail spark mcp-server` | AI assistants that speak the Model Context Protocol |
-| Flight SQL server | `sail flight server` | Arrow Flight SQL clients (JDBC/ADBC-style tools) |
-| Cluster worker | `sail worker` | Started automatically by the driver in Kubernetes mode. Internal only. |
-| Python interpreter | (hidden) | Child Python processes started by PySpark or UDF code |
+Why one binary instead of several? Because it guarantees that the server and its
+workers always run exactly the same code, and because it makes shipping simple:
+one container image serves every role. A Kubernetes worker pod runs the same
+image as the server, just with the worker argument.
 
-The same engine is also packaged as the Python library **`pysail`**, which lets
-a Python program start a Spark Connect server inside its own process.
+The shell and script runner deserve a closer look, because they show a pattern
+Sail uses often. Rather than asking you to start a server first, they start one
+themselves, bound to 127.0.0.1 on a random free port so it isn't reachable from
+the network. They then start PySpark connected to that address, and shut the
+server down as soon as Python exits. From your point of view, `sail spark shell`
+behaves like a self-contained PySpark.
 
----
-
-## 2. Why It's Built This Way
-
-**One binary for everything.** A single artifact is easier to ship (one
-container image, one wheel) and guarantees the server and its workers run
-exactly the same code. Kubernetes worker pods run the same image as the
-driver, just with the `worker` argument.
-
-**The binary can pretend to be Python.** Sail runs Python UDFs in an embedded
-interpreter. Python libraries (multiprocessing, some PySpark helpers) start
-child processes by re-running `sys.executable`. Inside Sail, that's the `sail`
-binary, not `python`. To make this work, Sail sets the internal environment
-variable `SAIL_INTERNAL__RUN_PYTHON` before it starts Python. When a child
-process starts with that variable set, `main` skips the CLI completely and
-calls Python's own `Py_Main`. To the Python library, the child behaves exactly
-like a Python interpreter.
-
-**The shell and runner start a private server.** `sail spark shell` and
-`sail spark run` don't need you to start a server first. They bind a server to
-`127.0.0.1` on a random port, run the PySpark shell or script against
-`sc://127.0.0.1:<port>`, and shut the server down when Python exits. Listening
-only on loopback keeps the private server off the network.
-
-**Two thread pools.** Sail creates two Tokio runtimes: a **primary** runtime
-for query execution and RPC handling, and an **io** runtime for object storage
-and other blocking-prone I/O. Keeping them apart means a burst of slow storage
-calls can't starve query execution of threads.
-
----
-
-## 3. How It Works
-
-### 3.1 Startup sequence for `sail spark server`
-
-1. **Native entry point.** The program checks for the embedded-Python variable.
-   If it isn't set, it optionally installs the `mimalloc` allocator, then calls
-   the CLI runner.
-2. **Crypto provider.** The runner installs the AWS-LC TLS crypto provider
-   (needed for HTTPS object stores and TLS between cluster nodes).
-3. **Argument parsing.** `clap` parses the subcommand: `spark server`, `--ip`
-   (default `127.0.0.1`), `--port` (default `50051`), and `-C <dir>` to change
-   directory first.
-4. **Configuration.** The application configuration is loaded (see 3.2).
-5. **Runtimes.** The primary and io Tokio runtimes are created, with the thread
-   stack size taken from `runtime.stack_size`.
-6. **Telemetry.** OpenTelemetry is set up with the resource kind `server` (see
-   [16 · Flight SQL, Telemetry, and Observability](16-flight-sql-and-telemetry.md)).
-   A guard object shuts telemetry down cleanly on exit.
-7. **Listen.** A TCP listener binds to the address, and the Spark Connect
-   service is served on it (see [03 · Spark Connect](03-spark-connect.md)).
-8. **Wait for shutdown.** The server runs until `Ctrl+C`. Sail captures the
-   signal itself in Tokio, because the embedded Python would otherwise swallow
-   it.
-
-### 3.2 Configuration loading
-
-All settings are defined in one YAML file compiled into the binary
-(`crates/sail-common/src/config/application.yaml`). Each entry has a key, a
-type, a default, a description, and sometimes an `experimental: true` flag.
-At startup:
-
-1. The YAML file supplies the **defaults**.
-2. **Environment variables** starting with `SAIL_` override them. Double
-   underscores become dots, so `SAIL_CLUSTER__WORKER_MAX_COUNT=8` sets
-   `cluster.worker_max_count`.
-3. The result is checked against typed Rust structs. Unknown fields are
-   rejected, so a typo fails loudly instead of being silently ignored.
-
-Variables starting with `SAIL_INTERNAL__` are reserved for Sail's own use
-(such as the embedded-Python switch) and are ignored by application
-configuration.
-
-The configuration is grouped into sections:
-
-| Section | Controls | Examples |
-|---------|----------|----------|
-| `mode` | Where queries run | `local`, `local-cluster`, `kubernetes-cluster` |
-| `runtime` | Threads, memory, spilling | `runtime.memory_pool.type`, `runtime.temporary_files.paths` |
-| `cluster` | Driver, workers, tasks, RPC retries | `cluster.worker_task_slots`, `cluster.task_max_attempts` |
-| `execution` | DataFusion execution | `execution.batch_size`, `execution.default_parallelism` |
-| `parquet` | Parquet read and write | `parquet.pushdown_filters`, `parquet.compression` |
-| `kubernetes` | Worker pods | `kubernetes.image`, `kubernetes.namespace`, `kubernetes.worker_pod_template` |
-| `catalog` | Catalogs and defaults | `catalog.list`, `catalog.default_catalog` |
-| `optimizer` | Optimizer switches | `optimizer.enable_join_reorder` |
-| `spark`, `flight` | Protocol sessions | `spark.session_timeout_secs` |
-| `telemetry` | OpenTelemetry export | `telemetry.otlp_endpoint`, `telemetry.export_traces` |
-| `python` | Python data sources | `python.data_source_write_channel_capacity` |
-
-### 3.3 Execution modes
-
-The `mode` setting decides which job runner each session gets (see
-[09 · Local and Cluster Execution](09-local-and-cluster-execution.md)):
-
-| Mode | What happens | When to use |
-|------|--------------|-------------|
-| `local` (default) | The whole query runs in the server process with DataFusion's multi-threaded engine. | Laptops, single machines, development. |
-| `local-cluster` | A driver and several worker **actors** run inside the same process and talk over gRPC on localhost. | Testing distributed behavior without Kubernetes. |
-| `kubernetes-cluster` | The driver runs in the server and starts worker **pods** running `sail worker`. | Real distributed jobs. |
-
-### 3.4 The worker role
-
-`sail worker` is only started by the Kubernetes worker manager. It loads the
-same configuration (the pod receives its worker ID and driver address through
-`SAIL_CLUSTER__*` variables), creates a **worker session** (an execution
-environment without user state, see
-[06 · Sessions and Runtime](06-session-and-runtime.md)), sets up telemetry
-with the resource kind `worker`, registers with the driver, and runs tasks
-until it's told to stop.
-
-### 3.5 The actor framework
-
-The driver, workers, and session manager are **actors**. An actor:
-
-- owns its state privately,
-- receives messages through a small bounded mailbox (8 messages),
-- handles **one message at a time**, so its state never needs locks,
-- never blocks inside a handler. Slow work is spawned as a background task that
-  sends a message back when it's done,
-- can send itself a message after a delay. This is how timeouts and heartbeats
-  are implemented.
-
-Each handler returns either *continue* or *stop*. Background tasks belong to the
-actor and are cancelled when it stops. An actor system keeps track of all
-actors so the process can wait for them to finish on shutdown.
-
-**Why actors?** A cluster driver tracks jobs, stages, tasks, attempts,
-workers, and streams, all changing concurrently. Handling each change as a
-message, one at a time, rules out whole classes of race conditions and makes
-the set of things that can happen explicit: it's exactly the list of message
-types.
-
-### 3.6 The gRPC server builder
-
-Spark Connect, Flight SQL, the driver, and each worker all serve gRPC through
-one shared builder. It provides:
-
-- TCP no-delay and keep-alive, plus HTTP/2 keep-alive pings (every 60 seconds,
-  with a 10-second timeout) and adaptive flow-control windows,
-- a standard **health service**, which reports each added service as serving,
-- **reflection**, so tools like `grpcurl` can discover the API,
-- a tracing layer that attaches OpenTelemetry spans to every request,
-- graceful shutdown when a signal future completes.
-
-There's also a shared **retry strategy** (fixed delay or exponential backoff),
-configured by `cluster.rpc_retry_strategy.*`, for RPCs between the driver and
-workers.
-
----
-
-## 4. Examples
-
-### 4.1 Run a server and connect from PySpark
-
-```bash
-sail spark server --port 50051
-```
-
-```python
-from pyspark.sql import SparkSession
-spark = SparkSession.builder.remote("sc://localhost:50051").getOrCreate()
-spark.sql("SELECT 1 + 1 AS two").show()
-```
-
-### 4.2 Start a server from Python
+The same engine is also available as a Python package, pysail. A Python program
+can start a Spark Connect server inside its own process:
 
 ```python
 from pysail.spark import SparkConnectServer
@@ -220,7 +46,58 @@ spark.range(10).show()
 server.stop()
 ```
 
-### 4.3 Run a local cluster with a bounded memory pool
+## The binary that pretends to be Python
+
+There's one unusual trick in the startup code. Sail runs Python user-defined
+functions in an embedded Python interpreter (see
+[15](15-functions-and-python-udfs.md)). Some Python libraries, such as
+multiprocessing, start helper processes by re-running "the current Python
+executable". Inside Sail, the current executable is the sail binary, not python.
+
+To make this work, Sail sets an internal environment variable,
+SAIL_INTERNAL__RUN_PYTHON, before starting its embedded Python. Any child
+process inherits it. When the sail binary starts and sees that variable, it skips
+all of its own logic and hands control straight to Python's main function. The
+library that launched the child never notices that it wasn't talking to a real
+Python executable.
+
+## Configuration: defaults in the binary, overrides from the environment
+
+All of Sail's settings are described in one YAML file that's compiled into the
+binary. Each entry has a key such as execution.batch_size, a type, a default, a
+description, and sometimes a note that it's experimental. When Sail starts, it
+loads these defaults and then applies any environment variables that start with
+SAIL_. Double underscores in a variable name stand for dots, so
+SAIL_EXECUTION__BATCH_SIZE=4096 sets execution.batch_size to 4096. List values
+use a compact inline syntax, for example
+SAIL_CATALOG__DEFAULT_DATABASE='["analytics"]'.
+
+The loaded values are checked against Rust types that reject unknown fields.
+That's a deliberate choice: if you misspell a variable, say
+SAIL_EXECUTION__BATCHSIZE, Sail refuses to start instead of silently ignoring
+it. Variables starting with SAIL_INTERNAL__ are reserved for Sail's own use and
+are ignored by normal configuration.
+
+The settings are grouped by area. The mode setting decides where queries run.
+The runtime group controls threads, the memory pool, and spill files. The
+cluster group covers drivers, workers, task slots, retries, and timeouts. There
+are also groups for DataFusion execution, Parquet, Kubernetes, catalogs, the
+optimizer, Spark and Flight sessions, telemetry, and Python data sources. Each of
+these is explained in the doc for the component it controls.
+
+## Three ways to run: local, local cluster, Kubernetes
+
+The mode setting is the most important switch. In **local** mode, the default,
+every query runs inside the server process using DataFusion's multi-threaded
+engine. That's the right choice for a laptop or a single large machine. In
+**local-cluster** mode, Sail runs a driver and several workers inside the same
+process. They talk to each other over gRPC on localhost exactly as they would
+across machines, which makes this mode ideal for testing distributed behavior
+without Kubernetes. In **kubernetes-cluster** mode, the driver runs in the
+server and starts workers as separate pods. How each mode executes a query is
+the subject of [09](09-local-and-cluster-execution.md).
+
+A local cluster with a bounded memory pool might be started like this:
 
 ```bash
 export SAIL_MODE=local-cluster
@@ -231,90 +108,100 @@ export SAIL_RUNTIME__MEMORY_POOL__FAIR__MAX_SIZE=8589934592   # 8 GiB
 sail spark server
 ```
 
-### 4.4 Run a script in one step
+## Why two thread pools
 
-```bash
-sail spark run -f etl_job.py
-```
+Sail builds on Tokio, Rust's async runtime, and creates two separate runtimes
+in every process. The primary runtime handles query execution and RPCs. The io
+runtime handles object storage, catalog services, and other work that may wait
+on slow networks.
 
-### 4.5 How configuration is resolved: a worked example
+The reason is isolation. If storage requests and query work shared one pool, a
+burst of slow S3 calls could occupy every thread and stall query execution even
+though the CPU was idle. Keeping them apart means a slow metastore or bucket only
+slows down the work that actually depends on it. There's a second, subtler
+reason: network clients are often tied to the runtime that created them, so
+creating and using them consistently on the io runtime avoids hard-to-debug
+failures.
 
-Suppose the YAML default for `execution.batch_size` is `8192`, and you start
-Sail like this:
+## What happens when the server starts
 
-```bash
-export SAIL_EXECUTION__BATCH_SIZE=4096
-export SAIL_CATALOG__DEFAULT_DATABASE='["analytics"]'
-export SAIL_MODE=local-cluster
-sail spark server
-```
+Starting `sail spark server` runs through a short sequence. The binary first
+checks for the embedded-Python variable, optionally installs the faster mimalloc
+memory allocator, and hands off to the command-line runner. The runner installs
+a TLS crypto provider (needed for HTTPS storage and for TLS between cluster
+nodes), parses the arguments, loads configuration, and creates the two runtimes.
+It initializes telemetry, binds a TCP listener to the requested address
+(127.0.0.1:50051 by default), and serves the Spark Connect service on it. The
+server then runs until it receives Ctrl+C. Sail catches that signal itself,
+because the embedded Python would otherwise swallow it.
 
-| Key | YAML default | Environment | Final value |
-|-----|--------------|-------------|-------------|
-| `execution.batch_size` | `8192` | `4096` | **4096** |
-| `catalog.default_database` | `["default"]` | `["analytics"]` | **["analytics"]** (arrays use inline TOML-style syntax) |
-| `mode` | `local` | `local-cluster` | **local-cluster** |
-| `cluster.worker_task_slots` | `8` | (unset) | **8** |
+A worker's startup is similar but shorter. It loads the same configuration (the
+driver passes the worker's ID and the driver's address through environment
+variables), creates a worker session, initializes telemetry, registers with the
+driver, and starts accepting tasks.
 
-A misspelled variable like `SAIL_EXECUTION__BATCHSIZE=4096` doesn't fail
-silently. Unknown fields are rejected and the server refuses to start, so typos
-surface right away.
+## Why the coordinators are actors
 
-### 4.6 How an actor handles a timeout: a worked example
+The driver, each worker, and the session manager have a hard job: their state
+changes constantly and from many directions at once. A driver tracks jobs,
+stages, tasks, attempts, workers, and data streams, and events about all of
+them arrive concurrently.
 
-Actors never sleep or block. To act later, they **send themselves a message
-with a delay**. Here's how the session manager detects an idle session (see
-[06](06-session-and-runtime.md)):
+Sail handles this with the actor model. An actor owns its state privately and
+receives messages through a small mailbox. It processes **one message at a
+time**, so its state never needs locks, and the full list of things that can
+happen to it is simply its list of message types. An actor must never block
+while handling a message. When it needs to do something slow, it starts a
+background task, which sends the result back as another message.
+
+Timeouts work the same way. An actor never sleeps; it sends itself a message
+with a delay. Here's how the session manager notices an idle session, assuming
+the default 15-minute timeout:
 
 ```text
-t=0s     request arrives      → actor records "active at 0s", schedules Probe(at=0s) for t=900s
-t=300s   request arrives      → actor records "active at 300s", schedules Probe(at=300s) for t=1200s
-t=900s   Probe(at=0s)  fires  → last active (300s) is later than 0s → ignore
-t=1200s  Probe(at=300s) fires → last active (300s) is not later → session is idle → delete it
+t=0s     request arrives      → record "active at 0s", schedule Probe(at=0s) for t=900s
+t=300s   request arrives      → record "active at 300s", schedule Probe(at=300s) for t=1200s
+t=900s   Probe(at=0s) fires   → last activity (300s) is newer than 0s → ignore
+t=1200s  Probe(at=300s) fires → no activity since 300s → the session is idle, delete it
 ```
 
-The same pattern is used for worker heartbeats, task launch timeouts, and stream
-creation timeouts in the driver (see [09](09-local-and-cluster-execution.md)).
+The driver uses exactly the same pattern for worker heartbeats, task launch
+timeouts, and waiting for data streams.
+
+## One way to build every gRPC server
+
+Spark Connect, Flight SQL, the driver, and every worker all serve gRPC, and they
+all do it through one shared builder. That keeps behavior consistent: every
+server has a standard health-check service, reflection so tools like grpcurl
+can discover its API, a tracing layer that records a span for every request,
+TCP keep-alives and HTTP/2 pings (every 60 seconds, with a 10-second timeout) to
+detect dead connections, and graceful shutdown. A shared retry helper, with
+either fixed delays or exponential backoff, is used for calls between the driver
+and workers.
 
 ---
 
-## 5. End-to-End: What Happens When You Type `sail spark shell`
+## Common problems
 
-| Step | What happens |
-|------|--------------|
-| 1 | `main` sees no embedded-Python variable and calls the CLI runner. |
-| 2 | The runner parses `spark shell`. |
-| 3 | Configuration is loaded from YAML plus `SAIL_*` variables. Runtimes and telemetry are created. |
-| 4 | A Spark Connect server binds to `127.0.0.1:0`, so the OS picks a free port. |
-| 5 | The server task starts in the background on the primary runtime. |
-| 6 | Sail starts its embedded Python and calls the bundled shell module with the chosen port. The module creates a PySpark session connected to `sc://127.0.0.1:<port>` and starts an interactive console. |
-| 7 | Each command you type becomes a Spark Connect request to the in-process server. |
-| 8 | When you exit Python, a shutdown signal fires, the server stops gracefully, and telemetry is flushed. |
+If Sail refuses to start with an "unknown field" or "duplicate field" error, an
+environment variable is misspelled or conflicts with another; compare it with
+the YAML schema and remember that double underscores stand for dots. If clients
+on other machines can't connect, the server is probably listening only on
+127.0.0.1; start it with `--ip 0.0.0.0`, and put an authenticating gateway in
+front of it in production. If Kubernetes worker pods start and exit
+immediately, check the driver's externally reachable address
+(cluster.driver_external_host and cluster.driver_external_port) and the pod
+template.
 
----
+## Where to look in the code
 
-## 6. Common Problems
-
-| Symptom | Cause | Fix |
-|---------|-------|-----|
-| Startup fails with "duplicate field" or "unknown field" | A misspelled or conflicting `SAIL_*` variable | Check the spelling against `application.yaml`. Remember `__` stands for `.`. |
-| `Ctrl+C` doesn't stop the server | The signal was captured elsewhere | Use `sail spark server` rather than a custom Python wrapper, or stop the `pysail` server explicitly. |
-| Worker pods start and immediately exit | Driver address or worker ID not passed through | Check the pod template and `cluster.driver_external_host` and `cluster.driver_external_port`. |
-| Clients on other machines can't connect | Server bound to loopback | Pass `--ip 0.0.0.0`. TLS is usually handled by a gateway in front of the server. |
-
----
-
-## 7. Where to Look
-
-| Topic | Location |
-|-------|----------|
-| Binary entry point and embedded Python | `crates/sail-cli/src/main.rs`, `crates/sail-cli/src/python.rs` |
-| Subcommands | `crates/sail-cli/src/runner.rs` |
-| Server, shell, script runner, MCP | `crates/sail-cli/src/spark/` |
-| Worker entry point | `crates/sail-cli/src/worker/entrypoint.rs` |
-| Python bindings (`pysail._native`) | `crates/sail-python/src/` |
-| Python-facing server class | `python/pysail/spark/__init__.py` |
-| Configuration schema and loader | `crates/sail-common/src/config/` (`application.yaml`, `application.rs`) |
-| Primary and io runtimes | `crates/sail-common/src/runtime.rs` |
-| Actor framework | `crates/sail-server/src/actor.rs` |
-| gRPC server builder, retry strategy | `crates/sail-server/src/builder.rs`, `retry.rs` |
+The binary's entry point and the embedded-Python trick are in
+crates/sail-cli/src/main.rs and python.rs, the subcommands in runner.rs, and the
+Spark server, shell, script runner, and MCP server under src/spark/. The worker
+entry point is src/worker/entrypoint.rs. The Python bindings live in
+crates/sail-python, with the Python-facing server class in
+python/pysail/spark/__init__.py. Configuration is defined in
+crates/sail-common/src/config/application.yaml and loaded in application.rs,
+and the two runtimes are created in crates/sail-common/src/runtime.rs. The actor
+framework, the gRPC server builder, and the retry helper are in crates/sail-server
+(actor.rs, builder.rs, retry.rs).

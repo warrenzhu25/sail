@@ -1,372 +1,256 @@
 # 09 · Local and Cluster Execution
 
-> **You'll learn:** how a physical plan actually runs, in-process (local mode)
-> or across a driver and workers (cluster mode); how a plan is cut into stages
-> and tasks; how tasks are scheduled into worker slots; how workers are started,
-> monitored, and stopped; and how failures are retried.
->
-> **Crate:** `sail-execution` (job runners, driver, job graph, scheduler, task
-> assigner, worker pool, worker, task runner, worker managers, plan codec)
->
-> The data exchange between tasks (streams and shuffle) is covered in
-> [10 · Shuffle and Streams](10-shuffle-and-streams.md).
+Everything before this point produces one thing: a DataFusion physical plan.
+This doc is about running it. Sail can run a plan inside a single process or
+spread it across a driver and many workers, and the code that asked for the
+result can't tell the difference. Here's how both modes work, how a plan is cut
+into stages and tasks, how tasks get scheduled onto workers, and what happens
+when things fail.
 
-
-## In One Minute
-
-- **Local mode** runs the physical plan in-process with DataFusion.
-  **Cluster mode** sends it to a **driver**, which runs it on **workers**.
-- The plan is cut into **stages** wherever data must be exchanged (repartition,
-  coalesce, sort-preserving merge). Each stage has one **task** per partition.
-- In the default pipelined mode, connected stages run **together** as one
-  **region**. A region needs about as many slots as its widest stage.
-- Workers start on demand (4 initially, then as needed) and stop after 60
-  seconds idle. Lost workers are detected by missing heartbeats (120 seconds).
-- A failed task reruns its whole region, up to 3 attempts.
+The data exchange between tasks (streams and shuffles) gets its own doc,
+[10](10-shuffle-and-streams.md).
 
 ---
 
-## 1. What This Component Does
+## One small interface: the job runner
 
-Everything up to this point produces one thing: a DataFusion **physical plan**.
-This component runs it and returns a stream of Arrow record batches. It has a
-deliberately small interface, the **job runner**:
+The boundary between planning and execution is deliberately tiny. A **job
+runner** takes a physical plan and a session and returns a stream of Arrow record
+batches. It can also be stopped, at which point it hands back a history of what
+it ran. That's the whole contract.
 
-> *Give me a physical plan and a session, and I'll give you a stream of
-> results.* (Plus *stop*, which returns the history of what ran.)
+There are two job runners. The **local** runner wraps every operator in the plan
+with lightweight tracing (so execution time and row counts reach telemetry) and
+asks DataFusion to execute it in the current process, using all CPU cores.
+DataFusion is already an excellent single-machine engine, so local mode adds
+almost nothing on top.
 
-There are two implementations:
+The **cluster** runner sends the plan to a **driver**, which cuts it into pieces,
+runs those pieces on **workers**, and streams the final result back. Because
+both runners return the same kind of stream, the Spark Connect and Flight SQL
+front ends never need to know which mode is in use. Moving from a laptop to a
+cluster is a configuration change.
 
-| Job runner | Mode | How it runs a plan |
-|------------|------|--------------------|
-| **Local** | `local` | Wraps each operator with tracing and calls DataFusion's `execute_stream` in the same process, using all CPU cores. |
-| **Cluster** | `local-cluster`, `kubernetes-cluster` | Sends the plan to a **driver** actor, which splits it into **stages** and **tasks**, runs the tasks on **workers** (and a few on the driver itself), and streams the final stage's output back. |
+## Cutting a plan into stages
 
-Protocol handlers can't tell which one they're using. The same query works in
-both modes.
+A distributed engine has to move data between machines wherever a computation
+needs rows that live elsewhere. DataFusion's physical plans already mark exactly
+those places, because they need them for multi-threaded execution: a
+**repartition** (redistribute rows by hash or round-robin), a **coalesce** (merge
+many partitions into one), and an **order-preserving merge** (combine sorted
+partitions into one sorted stream). Sail's job graph builder walks the plan and
+cuts it at those operators. Each piece becomes a **stage**, and each stage runs
+as one **task** per partition. A task's output is divided into **channels**, one
+per downstream consumer partition.
 
----
+Take a simple grouped count:
 
-## 2. Why It's Built This Way
+```text
+Aggregate (final) [k]
+  Repartition hash(k, 8)                ← cut here
+    Aggregate (partial) [k]
+      Range 0..10,000,000 (8 partitions)
+```
 
-**DataFusion is already a great single-node engine.** Local mode adds almost
-nothing: tracing and a job ID. All the engineering effort for distribution goes
-into cluster mode.
+The builder produces two stages. Stage 0 contains the range and the partial
+aggregation, with its output hashed by k into 8 channels. Stage 1 contains the
+final aggregation and reads, for each of its 8 partitions, the matching channel
+from every stage-0 task.
 
-**Stages are cut where data is exchanged.** DataFusion's physical plans already
-mark the points where data must be redistributed: repartition operators,
-"coalesce to one partition" operators, and order-preserving merges. Those are
-exactly the places where a distributed engine needs a shuffle. Sail's job graph
-builder cuts the plan there, so the stages follow from the optimizer's
-decisions.
+How a stage reads its input depends on the operator that caused the cut. After
+a hash or round-robin repartition, each downstream partition reads one channel
+from every upstream partition, which is a classic shuffle. After an
+order-preserving merge, the downstream task reads everything from every upstream
+partition and merge-sorts it. And when a join needs a complete copy of one side
+on every partition, as the build side of a "collect left" hash join or a
+nested-loop join does, that side is *broadcast*.
 
-**Actors on both sides.** The driver and each worker are actors (see
-[02](02-entry-points-and-server.md)). Job, stage, task, worker, and stream state
-changes concurrently. Handling every change as a message, one at a time, keeps
-this manageable.
+Some work must happen on the driver itself, because only the driver has the
+session's catalogs and state. Catalog commands and system table scans are placed
+in stages that run on the driver.
 
-**Pipelined regions are gang-scheduled.** In the default pipelined mode,
-producer and consumer tasks run **at the same time** and stream data to each
-other in memory. A consumer can't start without its producers, and producers
-can't finish without consumers reading. So all the tasks in such a connected
-**region** must get slots together. Sail schedules regions as a whole, in the
-order they were queued.
+Before building stages, two safety rewrites run. A global LIMIT must see a
+single input partition, so the builder ensures one. And a collect-left hash join
+whose build side can produce unmatched rows (right, full, and similar joins) is
+turned into a partitioned join. Otherwise, every worker holding a copy of the
+build side would emit those unmatched rows again, and the result would contain
+duplicates.
 
-**Workers are started on demand.** The driver requests workers when queued
-work needs more slots than are free, up to `cluster.worker_max_count`, and
-stops idle workers after `cluster.worker_max_idle_time_secs`. In Kubernetes,
-this is elastic: pods appear for a big query and go away afterwards.
+## The driver and its helpers
 
----
+The driver is an actor (see [02](02-entry-points-and-server.md)) with four
+helpers. The **job scheduler** tracks jobs, stages, tasks, and attempts, decides
+what is ready to run, and prepares each task's definition: the serialized plan
+fragment, where its inputs come from, and where its output goes. The **task
+assigner** keeps the queue of work waiting for capacity, knows which slots are
+free on the driver and on each worker, and calculates how many workers to ask
+for. The **worker pool** manages worker lifecycles: starting them, registering
+them, watching heartbeats, and stopping them. A **task runner** inside the driver
+runs the few tasks placed on the driver.
 
-## 3. How It Works
+Every change, such as a new job, a worker registering, a heartbeat, or a task
+reporting its status, arrives as a message to the driver, and the driver handles
+them one at a time. Tasks move from created to scheduled to running to succeeded
+(or failed or canceled). Stages are active while their tasks run or their output
+is still being read, and inactive afterwards. Jobs run, drain, and end as
+succeeded, failed, or canceled.
 
-### 3.1 Vocabulary
+## Why connected stages are scheduled together
 
-| Term | Meaning |
-|------|---------|
-| **Job** | One execution of a physical plan, such as one `collect()` |
-| **Stage** | A piece of the plan between exchanges. Has N **partitions**. |
-| **Task** | One partition of one stage. Can have several **attempts**. |
-| **Channel** | One slice of a task's output, for example one hash bucket of a shuffle |
-| **Region** | A group of tasks that must be scheduled together (see 3.4) |
-| **Task set** | Tasks from different stages that share **one slot**. Stages in the same *slot-sharing group* (by default, all stages) put partition *p* in the same task set. |
-| **Slot** | A unit of worker capacity. Each worker has `cluster.worker_task_slots` slots (8 by default). |
+In the default **pipelined** mode, stages don't take turns. A downstream task
+reads its inputs while upstream tasks are still producing them, streaming data
+through memory (see [10](10-shuffle-and-streams.md)). That gives low latency, but
+it means a consumer can't make progress without its producers, and producers
+can't finish without consumers reading. So all the tasks of a connected group of
+pipelined stages must start together. The scheduler calls such a group a
+**region**.
 
-### 3.2 From physical plan to job graph
+Capacity is measured in **slots**: each worker offers cluster.worker_task_slots
+of them, eight by default. Tasks from different stages of a region can share a
+slot. By default, partition 3 of stage 0 and partition 3 of stage 1 go into the
+same slot. A region therefore needs about as many slots as its *widest* stage,
+not its total number of tasks. The grouped count above has 16 tasks but needs
+only 8 slots.
 
-The **job graph builder** walks the physical plan bottom-up:
+When the stages in a region are linked one-to-one (partition p feeds partition p,
+with no shuffle in between), the scheduler goes further and splits the region
+per partition, so each chain can be scheduled on its own.
 
-| Operator found | What happens |
-|----------------|--------------|
-| **Repartition** (hash or round-robin) | Cut here. Everything below becomes a stage whose output is split into channels (hash or round-robin). Above, a *shuffle read* operator reads one channel from every upstream partition. |
-| **Coalesce partitions** (N → 1) | Cut here. Upstream output goes to one channel, and a single downstream partition reads all of it. A `fetch` limit becomes a global limit above it. |
-| **Sort-preserving merge** | Cut here, using **merge** input mode: the downstream task reads every upstream partition and merge-sorts them. |
-| **Build side of a collect-left hash join**, nested-loop, cross, or piecewise merge join | Marked *shared*. Every downstream partition needs the whole build side, which is a **broadcast** input. |
-| **Catalog command**, **system table scan** | Placed in a stage that runs **on the driver**, because only the driver has the catalog and session state. |
-| Anything else | Stays inside the current stage. |
+## Assigning work to slots
 
-Before building, two safety rewrites run:
+When a region becomes ready, its tasks join a queue. The assigner takes regions
+from the front of the queue and tries to place **all** of a region's tasks into
+free slots at once. If the region doesn't fit, it goes back to the front of the
+queue and assignment pauses until more capacity appears. Keeping strict queue
+order prevents starvation, at the price that one large region can hold up
+smaller ones behind it. A task that waits longer than
+cluster.task_launch_timeout_secs, 120 seconds by default, fails with "task
+scheduling timeout".
 
-- A **global limit** must see a single input partition, so one is enforced.
-- A **collect-left hash join** whose build side can emit unmatched rows (right,
-  full, and anti-style joins) is turned into a **partitioned** hash join.
-  Otherwise each worker would emit the unmatched build-side rows again,
-  producing duplicates.
+Capacity grows on demand. When a session's driver starts, it immediately asks
+for cluster.worker_initial_count workers, four by default. After that, whenever
+queued work needs more slots than are free, the assigner divides the shortfall
+by the slots per worker and asks the worker pool for that many more, up to
+cluster.worker_max_count (zero means no limit). Workers that have had nothing to
+do for cluster.worker_max_idle_time_secs, 60 seconds by default, are stopped. On
+Kubernetes this means pods appear when a big query arrives and disappear
+afterwards.
 
-Each stage records:
+## What a worker does
 
-| Field | Meaning |
-|-------|---------|
-| Inputs | Which upstream stages, and in what **input mode**: *forward* (same partition), *shuffle* (one channel from all partitions), *merge* (all channels from all partitions), *broadcast* (everything, to every partition) |
-| Plan | The stage's physical plan fragment, with stage-input placeholders |
-| Mode | **Pipelined** (stream in memory, the default) or **Blocking** (materialize to disk). On this branch, blocking mode isn't reachable from configuration, see [10](10-shuffle-and-streams.md). |
-| Distribution | Hash (keys, number of channels) or round-robin (number of channels) |
-| Placement | **Worker** or **Driver** |
-| Group | Slot-sharing group name |
+A worker is also an actor, with its own gRPC server and its own stream manager.
+When it starts, it registers with the driver and begins sending heartbeats.
+When the driver sends it a task, the worker's task runner decodes the plan
+fragment using Sail's plan codec, which knows how to serialize every Sail
+operator, function, and data source. It adjusts Parquet scans so they handle
+Delta column mapping and schema changes, and replaces the stage-input
+placeholders with *shuffle read* operators pointing at the upstream tasks. It adds
+a *shuffle write* operator at the root to send output to the right channels,
+wraps everything with tracing, and starts executing. A small monitor drives the
+task to completion and reports running, succeeded, or failed (with the error)
+back to the driver. Status updates carry sequence numbers, so the driver can
+ignore stale ones.
 
-### 3.3 The driver
+Workers are started by a *worker manager*. In local-cluster mode, it runs worker
+actors inside the same process. In Kubernetes mode, it creates one pod per worker
+from kubernetes.image in kubernetes.namespace, named with a configurable prefix
+and owned by the driver's pod, so Kubernetes cleans them up if the driver goes
+away. An optional pod template customizes resources, node selectors, and
+volumes. Each pod runs `sail worker`, with environment variables telling it its
+ID and how to reach the driver.
 
-The driver actor holds four main components:
-
-| Component | Owns |
-|-----------|------|
-| **Job scheduler** | Jobs, stages, tasks, attempts, and their states. Decides what's ready to run, and produces the task definition (serialized plan, input locations, output location) for each task. |
-| **Task assigner** | The queue of regions waiting for slots, the driver's own slots, each worker's slots, and which task runs where. Calculates how many workers to request. |
-| **Worker pool** | Worker lifecycles: starting through the worker manager, registration, heartbeats, idle and lost detection, stopping. Also gRPC clients to each worker. |
-| **Task runner** | Runs driver-placed tasks (catalog commands, system tables) inside the driver. |
-
-**States:**
-
-- Job: *running* → *draining* → *succeeded*, *failed*, or *canceled*
-- Stage: *active* (tasks may still run or be read) → *inactive*
-- Task attempt: *created* → *scheduled* → *running* → *succeeded*, *failed*, or *canceled*
-
-**Messages the driver handles:** server ready, register worker, worker
-heartbeat, worker known peers, probe pending, idle, or lost worker, execute job,
-clean up job, update task, probe pending task, create or fetch local, remote,
-driver, or worker streams, observe state, and shutdown.
-
-### 3.4 Regions: what gets scheduled together
-
-The scheduler groups tasks into **regions**:
-
-- In pipelined mode, all partitions of a **connected group of pipelined stages**
-  form one region, because they must run at the same time.
-- When every link inside the group is *forward* (partition *p* feeds partition
-  *p*), the region is split **per partition**, so each partition chain can be
-  scheduled on its own.
-- Regions across **blocking** boundaries are independent and depend on each
-  other. A downstream region becomes eligible only when its upstream regions
-  succeed.
-
-**If any task in a region fails, the whole region is rescheduled** (new
-attempts), up to `cluster.task_max_attempts` (3 by default). After that the
-region, and the job, fail.
-
-### 3.5 Assigning tasks to slots
-
-1. When a region becomes eligible, its task sets are added to the **queue**.
-2. The assigner takes regions **from the front** of the queue and tries to place
-   **all** of the region's task sets into vacant slots: driver-placed sets on the
-   driver, worker-placed sets on workers. Because stages in the same
-   slot-sharing group share task sets (partition *p* of every stage goes into
-   bucket *p*), a region needs about as many slots as its **widest stage**, not
-   its total number of tasks.
-3. If the region doesn't fit, it goes **back to the front** and assignment stops
-   for now. This keeps strict queue order. A large region can block smaller ones
-   behind it (head-of-line blocking). A task that waits longer than
-   `cluster.task_launch_timeout_secs` (120 s) for a slot fails with "task
-   scheduling timeout".
-4. For each placed task, the scheduler creates the **task definition** and sends
-   it to the worker (*run task*) or the driver's own task runner.
-5. **Scaling:** when the driver starts (with its session), it launches
-   `cluster.worker_initial_count` workers (4 by default). After that, the
-   assigner counts the slots needed by queued regions, minus vacant slots, and
-   divides by slots per worker. The worker pool starts that many new workers,
-   capped by `cluster.worker_max_count` (0 means no limit).
-
-### 3.6 The worker
-
-A worker is an actor with its own gRPC server and its own stream manager:
-
-1. **Start.** It starts its server, registers with the driver (its host and
-   port), and begins sending heartbeats every
-   `cluster.worker_heartbeat_interval_secs`.
-2. **Run task.** It decodes the plan and hands it to its task runner.
-3. **Execute.** The task runner:
-   - decodes the protobuf plan with Sail's **plan codec**, which knows how to
-     serialize every Sail operator, UDF, and data source,
-   - adapts Parquet scans (for Delta column mapping and schema evolution),
-   - replaces stage-input placeholders with **shuffle read** operators pointing at
-     the upstream tasks, and wraps the root with a **shuffle write** operator for
-     the task's output channels (see [10](10-shuffle-and-streams.md)),
-   - wraps operators with tracing,
-   - executes its partition and starts a **task monitor** that drives the stream to
-     completion and reports *running*, *succeeded*, or *failed* (with an error
-     cause) to the driver.
-4. **Report.** Status updates carry a sequence number, and the driver ignores
-   outdated ones.
-5. **Clean up and stop.** The driver tells the worker to clean up a job's streams,
-   and stops idle workers.
-
-### 3.7 Worker lifecycle and failure detection
-
-| Event | Driver behavior |
-|-------|-----------------|
-| Worker requested | The worker manager starts it: an in-process actor in `local-cluster`, a pod running `sail worker` in Kubernetes |
-| Not registered within `worker_launch_timeout_secs` (120 s) | Treated as failed to start, and the request count is reduced |
-| No heartbeat for `worker_heartbeat_timeout_secs` (120 s) | Worker **lost**: stopped, its tasks marked failed ("task failed for lost worker"), jobs refreshed so regions are rescheduled, and new workers requested |
-| No tasks for `worker_max_idle_time_secs` (60 s) | Worker stopped to free resources |
-| Task still waiting for a slot after `task_launch_timeout_secs` (120 s) | Task marked failed with "task scheduling timeout", which fails and retries its region |
-
-### 3.8 The job output
+## Returning the result
 
 The final stage's output is the job's result. The driver opens streams to the
-final tasks' outputs, through local streams on the driver or by fetching from
-workers, and merges them into the single stream returned to the caller. If the
-consumer goes away (the client cancels), the driver notices the dropped receiver
-and stops forwarding output.
+final tasks' outputs, reading locally or fetching from workers, and merges them
+into the single stream returned to the job runner. If the client goes away, the
+driver notices that nobody is reading and stops forwarding output.
 
-### 3.9 Kubernetes specifics
+## When things fail
 
-The Kubernetes worker manager creates one pod per worker from
-`kubernetes.image` in `kubernetes.namespace`. The pods are named with
-`kubernetes.worker_pod_name_prefix`, owned by the driver pod (so they're
-garbage-collected with it), and optionally customized with
-`kubernetes.worker_pod_template` (resources, node selectors, volumes, …). Each
-pod runs `sail worker` with environment variables carrying its worker ID and the
-driver's external address.
+Failures are handled at the level of regions. If any task in a region fails, the
+whole region is rescheduled with new attempts, up to cluster.task_max_attempts
+(three by default). New attempts write to new stream keys, because the attempt
+number is part of every stream's name, so their data never mixes with the failed
+attempt's. Here's a failure that recovers:
 
----
+```text
+t0  task (stage 1, partition 3, attempt 0) reports FAILED
+t0  region has a failed task, but fewer than 3 attempts → schedule attempt 1 for every task in the region
+t0  the region's tasks are queued again with their new attempt numbers
+t1  attempt 1 runs, reading and writing streams named with attempt = 1
+t2  every task succeeds → the region succeeds → the job succeeds
+```
 
-## 4. Examples
+If the same task fails on all three attempts, the region fails, and the job fails
+with the last error.
 
-### 4.1 Run a local cluster
+Losing a worker looks different, because the worker can't report anything.
+Instead, the driver notices the silence. If a worker hasn't sent a heartbeat for
+cluster.worker_heartbeat_timeout_secs, 120 seconds by default, it's declared
+lost. The driver stops it, marks every task that was assigned to it as failed
+("task failed for lost worker"), refreshes the affected jobs so their regions are
+rescheduled, and asks for a replacement worker if capacity is now short. A worker
+that never registers within cluster.worker_launch_timeout_secs is treated as
+having failed to start.
+
+On this branch, a lost worker counts as an ordinary task failure toward the three
+attempts. The disk-shuffle-hardening branch treats lost workers and lost shuffle
+data as recoverable instead, and recomputes only what was lost (see
+[10](10-shuffle-and-streams.md)).
+
+## Following one job
+
+Start a local cluster with two workers of four slots each, then run the grouped
+count:
 
 ```bash
-SAIL_MODE=local-cluster \
-SAIL_CLUSTER__WORKER_INITIAL_COUNT=2 \
-SAIL_CLUSTER__WORKER_TASK_SLOTS=4 \
-sail spark server
+SAIL_MODE=local-cluster SAIL_CLUSTER__WORKER_INITIAL_COUNT=2 \
+SAIL_CLUSTER__WORKER_TASK_SLOTS=4 sail spark server
 ```
 
 ```python
-df = spark.range(10_000_000).selectExpr("id % 100 AS k", "id AS v")
-df.groupBy("k").sum("v").collect()
+spark.range(10_000_000).selectExpr("id % 100 AS k", "id AS v").groupBy("k").sum("v").collect()
 ```
 
-### 4.2 The job graph for that query
-
-Physical plan (simplified):
-
-```text
-AggregateExec(final, k)
-  RepartitionExec(hash(k), 8)          ← stage boundary
-    AggregateExec(partial, k)
-      RangeExec(0..1e7, 8 partitions)
-```
-
-Job graph:
-
-```text
-=== stage 0 ===  mode=Pipelined partitions=8 distribution=Hash(k, 8 channels) placement=Worker
-  AggregateExec(partial) ← RangeExec
-=== stage 1 ===  inputs=[StageInput(stage=0, mode=Shuffle)] partitions=8 placement=Worker
-  AggregateExec(final) ← ShuffleRead(stage 0, channel = my partition)
-```
-
-Because stage 0 → stage 1 is pipelined, both stages (16 tasks) form **one
-region**. Both stages are in the default slot-sharing group, so partition *p* of
-stage 0 and partition *p* of stage 1 share a slot: the region needs **8 slots**
-at once. Two workers × 4 slots = 8 slots, so it fits without starting more
-workers. With `WORKER_TASK_SLOTS=2`, the assigner would ask for two more workers.
-
-### 4.3 Watching it
-
-```python
-spark.sql("SELECT * FROM system.execution.stages").show(truncate=False)
-spark.sql("SELECT * FROM system.cluster.workers").show()
-```
-
-### 4.4 A failure, step by step
-
-A two-stage pipelined job is running when task (stage 1, partition 3) fails
-with an error:
-
-```text
-t0  task (s1, p3, attempt 0) reports FAILED
-t0  scheduler: region R0 has a failed task with 1 attempt < 3  → region not failed yet
-t0  scheduler: create attempt 1 for every task in R0 (both stages, all partitions)
-t0  assigner: queue R0's task sets again with the new attempts
-t1  new attempts run; streams use new keys (attempt = 1), so no data mixes with attempt 0
-t2  all tasks of attempt 1 succeed → region succeeded → job succeeded
-```
-
-If the same task fails on attempts 0, 1, and 2, the region is marked failed and
-the job fails with the last error.
-
-### 4.5 A lost worker, step by step
-
-```text
-t=0s     worker W3 sends its last heartbeat, then its pod is evicted
-t=120s   heartbeat timeout probe fires: no heartbeat since t=0s → W3 is LOST
-         - W3 is stopped and removed from the slot pool
-         - every task assigned to W3 is marked FAILED ("task failed for lost worker")
-         - affected jobs are refreshed → their regions are rescheduled with new attempts
-         - the assigner asks for a replacement worker if slots are now short
-```
-
-On this branch, a lost worker counts as a normal task failure (toward the 3
-attempts). The `disk-shuffle-hardening` branch treats it as recoverable instead
-(see [10](10-shuffle-and-streams.md)).
+The cluster runner sends the plan to the driver. The scheduler builds the two
+stages described earlier, sees that they're pipelined, and forms one region of 16
+tasks needing 8 slots. The two workers started with the session offer exactly 8
+slots, so the region fits. The driver sends each worker its task definitions. The
+workers decode the fragments, start the stage-0 tasks writing hashed channels and
+the stage-1 tasks reading them, and report progress. The driver merges the
+stage-1 outputs into the result stream, the client receives its 100 rows, the
+tasks report success, and the job ends. A minute later, the idle workers are
+stopped. While this runs, `SELECT * FROM system.execution.stages` and
+system.cluster.workers show what's happening.
 
 ---
 
-## 5. End-to-End: One Query in Cluster Mode
+## Common problems
 
-| # | Component | What happens |
-|---|-----------|--------------|
-| 1 | Cluster job runner | Sends *execute job (plan, task context)* to the driver and waits for a stream. |
-| 2 | Job scheduler | Builds the job graph (stages, inputs, distributions, placements), builds the topology (regions and dependencies), and registers the job. |
-| 3 | Job scheduler | Creates attempt #0 for the tasks of eligible regions and queues them. |
-| 4 | Task assigner | Tries to place the first region into free slots. The driver already started `worker_initial_count` workers when it was created. If the region doesn't fit, it computes how many more workers are needed. |
-| 5 | Worker pool | Starts extra workers if needed. They register and start heartbeats. Each registration triggers another assignment pass. |
-| 6 | Driver | For each placed task, builds the task definition (serialized plan, input locators, output kind) and sends *run task* to the worker. |
-| 7 | Workers | Decode and rewrite the plan, start the tasks, and report *running*. Upstream tasks write channels to their stream manager. Downstream tasks fetch them (see [10](10-shuffle-and-streams.md)). |
-| 8 | Driver | Opens the final stage's outputs and returns the merged stream to the job runner, which returns it to the protocol layer. |
-| 9 | Workers | Report *succeeded*. The region and job succeed. Stages whose consumers are done are cleaned up. |
-| 10 | Idle workers | Stopped after 60 seconds without tasks. |
-| On failure | | A failed task fails its region. The region is rescheduled with new attempts, up to 3. A lost worker fails all of its tasks. |
+"Task scheduling timeout" means a region couldn't get enough slots within 120
+seconds, either because the cluster can never be big enough (raise
+cluster.worker_max_count or cluster.worker_task_slots, or reduce
+execution.default_parallelism) or because workers start slowly (raise the
+timeout). Small queries waiting behind a big one are seeing head-of-line
+blocking in the queue; running big jobs in separate sessions gives them separate
+drivers. "Task failed for lost worker" means heartbeats stopped: check the pod's
+logs and memory, and bound the memory pool (see [06](06-session-and-runtime.md)).
+An error about an order-preserving repartition means the plan contains one, which
+can't be distributed yet. And a query that works locally but fails in
+local-cluster mode usually contains an operator or function the plan codec can't
+serialize, or a function missing from the worker session.
 
----
+## Where to look in the code
 
-## 6. Troubleshooting
-
-| Symptom | Likely cause | Fix |
-|---------|--------------|-----|
-| Job fails with "task scheduling timeout" | A region needs more slots than the cluster can provide within 120 seconds (`worker_max_count × worker_task_slots`, or workers start too slowly) | Raise `worker_max_count` or `worker_task_slots`, reduce partitions (`execution.default_parallelism`), or raise `cluster.task_launch_timeout_secs`. |
-| Small queries wait behind a big one | Head-of-line blocking in the region queue | Run big jobs in separate sessions, which get separate drivers, or give the cluster more slots. |
-| "task failed for lost worker" | Heartbeats stopped: pod killed, out of memory, network | Check the pod logs and memory. Bound the memory pool (see [06](06-session-and-runtime.md)). |
-| "repartition is order-preserving …" error | An order-preserving repartition can't be distributed yet | Rewrite the query, or run locally. |
-| Works in `local`, fails in `local-cluster` | An operator or UDF can't be serialized by the plan codec, or a function is missing in the worker session | Add codec support. Check the worker session's functions. |
-
----
-
-## 7. Where to Look
-
-| Topic | Location |
-|-------|----------|
-| Job runners (local and cluster) | `crates/sail-execution/src/job_runner.rs` |
-| Job graph and builder | `crates/sail-execution/src/job_graph/` (`mod.rs`, `planner.rs`) |
-| Driver actor and messages | `crates/sail-execution/src/driver/actor/`, `driver/event.rs` |
-| Job scheduler, topology, state | `crates/sail-execution/src/driver/job_scheduler/` |
-| Task assigner (slots, scaling) | `crates/sail-execution/src/driver/task_assigner/` |
-| Worker pool | `crates/sail-execution/src/driver/worker_pool/` |
-| Job output stream | `crates/sail-execution/src/driver/output.rs` |
-| Worker actor | `crates/sail-execution/src/worker/` |
-| Task runner and monitor | `crates/sail-execution/src/task_runner/` |
-| Task definitions and regions | `crates/sail-execution/src/task/` (`definition.rs`, `scheduling.rs`) |
-| Worker managers (local, Kubernetes) | `crates/sail-execution/src/worker_manager/` |
-| Plan codec (operators, UDFs, sources ↔ protobuf) | `crates/sail-execution/src/codec.rs`, `proto/` |
-| gRPC services and clients | `crates/sail-execution/src/driver/server.rs`, `client.rs`, `worker/`, `rpc.rs` |
+Everything here lives in crates/sail-execution. The job runners are in
+src/job_runner.rs, and the job graph and its builder in src/job_graph/ (mod.rs and
+planner.rs). The driver actor and its messages are under src/driver/actor/ and
+src/driver/event.rs, the scheduler with its topology and state under
+src/driver/job_scheduler/, the slot assigner under src/driver/task_assigner/, the
+worker pool under src/driver/worker_pool/, and the job output stream in
+src/driver/output.rs. The worker actor is under src/worker/, the task runner and
+monitor under src/task_runner/, and task definitions and regions under src/task/.
+Worker managers for local and Kubernetes modes are in src/worker_manager/. The
+plan codec, which serializes operators, functions, and data sources, is
+src/codec.rs, with its protobuf definitions under proto/.

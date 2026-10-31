@@ -1,337 +1,219 @@
-# 04 · SQL Parser and Analyzer
+# 04 · SQL Parser and Analyzer: From Text to a Plan
 
-> **You'll learn:** how a SQL string becomes a syntax tree, then a spec plan;
-> how Sail's parser is generated from Rust types; which SQL is supported; and
-> how to add new syntax.
->
-> **Crates:** `sail-sql-parser` (lexer, AST, parser), `sail-sql-macro`
-> (derive macros that generate the parser), `sail-sql-analyzer` (AST → spec
-> plan)
+SQL reaches Sail from several directions: `spark.sql(...)` calls from PySpark,
+statements from Flight SQL clients, and the definitions of saved views, which
+are stored as SQL text and parsed again each time the view is read. Smaller
+fragments arrive too, such as a type string like `"id INT, tags ARRAY<STRING>"`
+in `createDataFrame`, an expression in `df.selectExpr("price * qty")`, or a
+table name in `spark.table("db.t")`.
 
+All of these go through the same three steps. A **lexer** cuts the text into
+tokens, a **parser** arranges the tokens into a syntax tree, and an
+**analyzer** turns the tree into Sail's spec plan. This doc explains each step,
+why Sail wrote its own parser, and how to add new syntax.
 
-## In One Minute
-
-- SQL goes through three steps: **lexer** (text → tokens), **parser** (tokens →
-  syntax tree), **analyzer** (syntax tree → spec plan).
-- The grammar is written as **Rust types**. A derive macro generates the parser,
-  so adding syntax usually means adding a field or variant.
-- About 360 keywords live in a text file, and code for them is generated at
-  build time.
-- Nothing is looked up during parsing or analysis. Unknown tables and columns
-  are only detected later, by the resolver.
-- The same entry functions serve Spark Connect, Flight SQL, and view expansion.
-
----
-
-## 1. What This Component Does
-
-SQL reaches Sail from several places:
-
-- `spark.sql("…")` from PySpark (through Spark Connect),
-- SQL statements from Flight SQL clients,
-- view definitions, which are stored as SQL text and re-parsed when a view is
-  read,
-- smaller snippets: a data type string (`"struct<a:int>"`), an expression string
-  (`df.selectExpr("a + 1")`), a table name (`"db.t"`), or a date or interval
-  literal.
-
-This component turns that text into Sail's **spec plan** (see
-[05 · The Spec Plan Model](05-spec-plan-and-config.md)) in three steps:
-
-```
+```text
 "SELECT region, count(*) FROM sales.orders WHERE amount > 100 GROUP BY region"
-   │  1. Lexer        → tokens:  SELECT · region · , · count · ( · * · ) · FROM · …
-   │  2. Parser       → AST:     Query { select: [...], from: [...], where: ..., group_by: [...] }
-   │  3. Analyzer     → spec:    Aggregate(Filter(Read("sales.orders"), amount > 100), [region], [count(*)])
+   │  lexer    → SELECT · region · , · count · ( · * · ) · FROM · sales · . · orders · WHERE · …
+   │  parser   → a syntax tree: Query { select list, from, where, group by }
+   │  analyzer → spec plan: Aggregate(Filter(Read("sales.orders"), amount > 100), group by region)
    ▼
-spec::Plan::Query(...)
+spec plan (names still unresolved)
 ```
 
 ---
 
-## 2. Why It's Built This Way
+## Why Sail has its own Spark SQL parser
 
-**Sail has its own Spark SQL parser.** Generic SQL parsers don't match Spark's
-dialect closely enough. Spark has backtick identifiers, `LATERAL VIEW`,
-`DISTRIBUTE BY`/`CLUSTER BY`/`SORT BY`, `INSERT OVERWRITE DIRECTORY`, typed
-literals like `INTERVAL '1' DAY` and `X'0A'`, the `<=>` operator, `DIV`, and
-many statement forms. Owning the parser lets Sail match Spark's grammar and
-error behavior exactly.
+General-purpose SQL parsers don't match Spark's dialect closely enough. Spark
+has backtick-quoted identifiers, `LATERAL VIEW`, `DISTRIBUTE BY` and `SORT BY`,
+`INSERT OVERWRITE DIRECTORY`, typed literals such as `INTERVAL '1' DAY` and
+`X'0A'`, the null-safe equality operator `<=>`, integer division with `DIV`, and
+dozens of statement forms. Owning the parser lets Sail follow Spark's grammar
+exactly and report errors the way Spark does.
 
-**The grammar is written as Rust types.** Each AST node is an ordinary Rust
-struct or enum, and a derive macro generates its parser:
+The parser is built on chumsky, a Rust library for writing parsers out of small
+composable pieces. It keeps track of where each token came from and what kind of
+thing the parser expected at each point, which lets errors point at the exact
+spot ("expected an expression at line 3, column 17") instead of just saying
+"syntax error".
 
-- a **struct** means "these parts in this order",
-- an **enum** means "one of these alternatives",
-- `Option<T>` means "optional", and `Vec<T>` or `Sequence<T, Comma>` means
-  "repeated" or "separated by commas".
+## The grammar is written as Rust types
 
-So the AST *is* the grammar. Adding syntax usually means adding a field or a
-variant, and the parser follows automatically. The same derive also produces a
-**syntax descriptor** (useful for generating grammar documentation) and a
-**text** form that turns the AST back into SQL.
+The most unusual design decision is that Sail's SQL grammar isn't written as
+grammar rules at all. It's written as ordinary Rust structs and enums, and a
+macro generates the parser from them.
 
-**Parsing and meaning are separate steps.** The parser only checks shape. The
-analyzer maps shape to meaning but still doesn't look anything up: no catalogs,
-no function registry, no schemas. All of that happens later, during resolution
-(see [07 · The Plan Resolver](07-plan-resolver.md)). Keeping these steps
-separate makes each one simple, easy to test, and reusable. The Spark Connect
-and Flight SQL front ends both call the same two functions.
+The idea is simple. A struct means "these parts, in this order". An enum means
+"one of these alternatives". An optional field means "this part may be
+missing", and a list field means "this part may repeat", optionally separated by
+commas. So the definition of a query (an optional WITH clause, a body, then
+modifiers like ORDER BY and LIMIT) is literally a struct with those three
+fields. The syntax tree *is* the grammar.
 
-**Errors that point at the problem.** The parser is built on **chumsky**, a
-parser combinator library that tracks spans (where each token came from) and
-labels (what kind of thing was expected). A syntax error can say "expected an
-expression at line 3, column 17" instead of just "parse error".
+This pays off when Spark adds syntax: supporting a new clause usually means
+adding a field or an enum variant, and the parser follows automatically. The
+same macro also generates a way to print the tree back as SQL, which the tests
+use to check that parsing round-trips correctly, and a description of the syntax
+that can be used to document the grammar.
 
----
+Some parts of the grammar can't be generated this way and are written by hand.
+Terminals such as keywords, literals, and operators are hand-written. Recursive
+structures, like a query containing a subquery or an expression containing
+expressions, are declared first and filled in afterwards. Operator precedence
+gets special handling too, as described below.
 
-## 3. How It Works
+## Step one: cutting text into tokens
 
-### 3.1 Keywords are generated at build time
+Sail's keyword list is a plain text file of about 360 Spark keywords, one per
+line, in alphabetical order. At build time, a script reads the file and
+generates a keyword type, a fast lookup table, and one small parser per keyword.
+Adding a keyword means adding a line to the file.
 
-`data/keywords.txt` lists about 360 Spark SQL keywords in alphabetical order
-(ADD, AFTER, ALL, …). A build script reads the file and generates:
+The lexer walks through the text and produces tokens, remembering the exact
+original text and position of each one. A word might be a keyword, a name, or
+the start of a number (numbers are interpreted later, so 1e5 and 10L both start
+life as words). Strings remember which quote style they used, because in Spark a
+backtick-quoted string is an identifier while a single-quoted one is a literal.
+Escape sequences aren't processed yet. Whitespace and comments become tokens
+too, so positions stay exact, and the parser skips them. Block comments can be
+nested.
 
-- a `Keyword` enum with one variant per keyword (`SELECT` → `Select`,
-  `SYSTEM_TIME` → `SystemTime`),
-- a fast lookup table from text to keyword,
-- one small parser type per keyword, so the AST can write `pub select: Select`.
+## Step two: arranging tokens into a tree
 
-To add a keyword, add a line to the file in sorted order.
+The parser tries the grammar's alternatives against the tokens. For statements,
+that means trying each statement form until one fits. Sail recognizes about 45:
+queries; USE and SET CATALOG; creating, altering, and dropping databases,
+tables, and views; the SHOW and DESCRIBE family; INSERT INTO and INSERT
+OVERWRITE (including the REPLACE WHERE and DIRECTORY forms); MERGE, UPDATE,
+DELETE, and LOAD DATA; caching commands; SET for configuration and time zone;
+EXPLAIN; ANALYZE TABLE; and COMMENT ON.
 
-### 3.2 The lexer: text → tokens
+Inside queries, the parser handles everything Spark allows in a FROM clause:
+table names, subqueries, VALUES, nested joins, and table functions, joined with
+inner, cross, left, right, and full outer joins, semi and anti joins, natural
+joins, and USING. Set operations (UNION, INTERSECT, and EXCEPT or MINUS, each
+with ALL or DISTINCT) and the modifiers WINDOW, ORDER BY, SORT BY, CLUSTER BY,
+DISTRIBUTE BY, LIMIT, and OFFSET are all part of the query structure.
 
-The lexer splits the input into tokens and keeps the original text and position
-of each one:
+### How operator precedence works
 
-| Token | Examples | Notes |
-|-------|----------|-------|
-| Word | `SELECT`, `orders`, `123`, `1e5` | Records whether the word is a keyword. Numbers start as words and are interpreted later. |
-| String | `'abc'`, `"abc"`, `` `col name` ``, `X'0A'`, `r'\d+'` | Records the quote style and any prefix. Escape sequences aren't processed yet. |
-| Whitespace | spaces, tabs, newlines | Kept as tokens so spans stay exact, then skipped by the parser. |
-| Comment | `-- …`, `/* … */` | Block comments can be nested. |
-| Punctuation | `(`, `)`, `,`, `.`, `+`, `<`, `=`, … | Multi-character operators (`<=>`, `>>>`, `::`) are assembled by the parser. |
-
-Three **parser options** control dialect details: whether a quote can be
-escaped by doubling it (`'it''s'`), whether triple-quoted strings are allowed,
-and whether double-quoted text is an identifier or a string. Sail uses Spark's
-defaults.
-
-### 3.3 The parser: tokens → AST
-
-Most AST types use the derived parser. Some can't be derived and are written by
-hand:
-
-- **Terminals**: keywords, literals, operators, identifiers.
-- **Recursive types**: a query contains subqueries, and an expression contains
-  expressions. These are declared first and defined afterwards, which the
-  macro's `dependency` attribute supports.
-- **Operator precedence**: expressions use a Pratt parser, which applies binding
-  strength explicitly.
-
-**Operator precedence**, from tightest to loosest binding, matching Spark:
-
-| Level | Operators |
-|-------|-----------|
-| Postfix | field access `a.b`, subscript `a[0]`, `::` cast |
-| Unary | `+a`, `-a`, `~a` |
-| 24 | `*`, `/`, `%`, `DIV` |
-| 23 | `+`, `-`, `\|\|` (string concatenation) |
-| 22 | `<<`, `>>`, `>>>` |
-| 21 | `&` |
-| 20 | `^` |
-| 19 | `\|` |
-| 18 | `=`, `==`, `!=`, `<>`, `<`, `<=`, `>`, `>=`, `<=>`, `!<`, `!>` |
-| Postfix | `IS [NOT] NULL`, `[NOT] BETWEEN`, `[NOT] IN`, `[NOT] LIKE`, `RLIKE`, … |
-| Prefix | `NOT`, `!` |
-| 14 | `AND` |
-| 13 | `OR` |
+Expressions need more care than the rest of the grammar, because
+`a + b * c > 10 AND NOT d OR e` has to group the way Spark groups it. Sail uses
+a Pratt parser, which assigns each operator a binding strength. From tightest to
+loosest, matching Spark: field access, subscripts, and `::` casts first; then
+unary plus, minus, and bitwise not; then multiplication, division, modulo, and
+DIV; then addition, subtraction, and string concatenation with `||`; then
+bit shifts; then bitwise and, xor, and or; then all the comparisons; then
+postfix tests like IS NULL, BETWEEN, IN, and LIKE; then NOT; then AND; and
+finally OR.
 
 So `a + b * c > 10 AND NOT d OR e` parses as
-`((a + (b * c)) > 10 AND (NOT d)) OR e`.
+`((a + (b * c)) > 10 AND (NOT d)) OR e`, and `a = 1 OR b = 2 AND c = 3` means
+`a = 1 OR (b = 2 AND c = 3)`. When in doubt, add parentheses; the parser keeps
+them.
 
-**What a query looks like in the AST.** A query has an optional `WITH` clause,
-a body, and modifiers (`WINDOW`, `ORDER BY`, `SORT BY`, `CLUSTER BY`,
-`DISTRIBUTE BY`, `LIMIT`, `OFFSET`). The body is either a single `SELECT` or a
-set operation (`UNION`, `INTERSECT`, `EXCEPT`/`MINUS`, with `ALL` or
-`DISTINCT`). A `FROM` item can be a table name, a subquery, `VALUES`, a nested
-join, or a table function. Every Spark join type is supported: inner, cross,
-left/right/full outer, left/right semi, left/right anti, natural, and `USING`.
+### What a syntax error looks like
 
-**Statements.** About 45 statement kinds are recognized:
-
-| Group | Statements |
-|-------|------------|
-| Queries | `SELECT …`, `WITH …`, `VALUES …`, `TABLE t` |
-| Catalogs and databases | `USE`, `SET CATALOG`, `CREATE`/`ALTER`/`DROP DATABASE`, `SHOW DATABASES`, `SHOW CATALOGS` |
-| Tables | `CREATE TABLE`, `CREATE TABLE … AS SELECT`, `REPLACE TABLE`, `ALTER TABLE`, `DROP TABLE`, `REFRESH TABLE`, `SHOW TABLES`, `SHOW TABLE EXTENDED`, `SHOW CREATE TABLE`, `SHOW COLUMNS`, `DESCRIBE` |
-| Views | `CREATE`/`ALTER`/`DROP VIEW`, `SHOW VIEWS` |
-| Functions | `REFRESH FUNCTION`, `DROP FUNCTION`, `SHOW FUNCTIONS` |
-| Writes | `INSERT INTO`, `INSERT OVERWRITE`, `INSERT … REPLACE WHERE`, `INSERT OVERWRITE DIRECTORY`, `MERGE INTO`, `UPDATE`, `DELETE`, `LOAD DATA` |
-| Caching | `CACHE TABLE`, `UNCACHE TABLE`, `CLEAR CACHE` |
-| Session | `SET key = value`, `SET TIME ZONE` |
-| Other | `EXPLAIN`, `ANALYZE TABLE[S]`, `COMMENT ON …` |
-
-### 3.4 The analyzer: AST → spec plan
-
-The analyzer walks the AST and builds spec plan nodes. It's split by kind of
-node:
-
-- **Statements** decide between a query and a command. A query becomes
-  `spec::Plan::Query`. `CREATE TABLE` becomes a create-table command node with a
-  table definition (columns, format, partitioning, location, options), `USE db`
-  becomes a set-current-database command, and so on.
-- **Queries** become relational nodes: `FROM` becomes a read of a named table,
-  `WHERE` a filter, the `SELECT` list a projection, `GROUP BY` an aggregate,
-  `ORDER BY` a sort, and `LIMIT` a limit. `WITH` clauses become named
-  subqueries. `LATERAL VIEW explode(…)` becomes a generator.
-- **Expressions** become spec expressions. Names become *unresolved
-  attributes*, function calls become *unresolved functions*, `*` becomes an
-  *unresolved star*, and `CASE`, `CAST`, `EXTRACT`, `SUBSTRING`, lambdas,
-  subqueries, and `EXISTS` each map to their spec form.
-- **Literals** are parsed fully: numbers (integer, decimal, and float, including
-  Spark suffixes like `10L`, `1.5BD`, `2D`), strings with escapes, binary
-  (`X'…'`), dates, timestamps (with and without time zone), and intervals
-  (`INTERVAL '1-2' YEAR TO MONTH`, `INTERVAL 3 DAYS 4 HOURS`).
-- **Data types** map Spark type names (`INT`, `BIGINT`, `DECIMAL(10,2)`,
-  `STRING`, `VARCHAR(10)`, `ARRAY<…>`, `MAP<…>`, `STRUCT<…>`, `TIMESTAMP_NTZ`, …)
-  to spec types.
-
-Nothing is looked up. A query that mentions a table that doesn't exist still
-analyzes fine. The error comes later, during resolution.
-
-### 3.5 Parameters
-
-`spark.sql("SELECT * FROM t WHERE id = ?", args=[42])` and the named form
-`:id` are supported. The Spark Connect layer converts the arguments into
-literal or expression values and attaches them to the plan. Placeholders in the
-SQL become *placeholder* expressions that the resolver fills in.
-
----
-
-## 4. Examples
-
-### 4.1 Walking through one query
-
-```sql
-SELECT region, count(*) AS n
-FROM sales.orders
-WHERE amount > 100
-GROUP BY region
-ORDER BY n DESC
-LIMIT 10
-```
-
-| Step | Result |
-|------|--------|
-| Tokens | `SELECT`(keyword) · `region`(word) · `,` · `count` · `(` · `*` · `)` · `AS`(keyword) · `n` · `FROM`(keyword) · `sales` · `.` · `orders` · `WHERE` · `amount` · `>` · `100` · … |
-| AST | A query whose body is a select with two projection items, `FROM` as the table name `sales.orders`, `WHERE` as a binary expression (`amount` `>` `100`), and `GROUP BY` `region`. Its modifiers are `ORDER BY` `n DESC` and `LIMIT 10`. |
-| Spec | Limit(10, Sort([n DESC], Aggregate(group=[region], agg=[region, count(*) AS n], Filter(amount > 100, Read(table "sales.orders"))))) |
-
-Every name in the spec (`region`, `amount`, `n`, `count`, `sales.orders`) is
-still unresolved.
-
-### 4.2 Snippet parsing from DataFrames
-
-```python
-df.selectExpr("upper(name) AS u", "price * qty AS total")   # parse_expression
-df.filter("amount > 100")                                    # parse_expression
-spark.createDataFrame(rows, "id INT, tags ARRAY<STRING>")    # parse_data_type
-spark.table("db.t")                                          # parse_object_name
-```
-
-### 4.3 Seeing the parse
-
-`EXPLAIN` and the analyzer's tests print the AST and spec plans. Many tests
-check a **round trip**: parse the SQL, turn it back into text, and compare it
-with the expected normalized form.
-
-### 4.4 Precedence in action
-
-| SQL expression | How it's grouped | Why |
-|----------------|------------------|-----|
-| `1 + 2 * 3` | `1 + (2 * 3)` = 7 | `*` (24) binds tighter than `+` (23) |
-| `a = 1 OR b = 2 AND c = 3` | `a = 1 OR (b = 2 AND c = 3)` | `AND` (14) binds tighter than `OR` (13) |
-| `NOT a = b` | `NOT (a = b)` | Comparison (18) binds tighter than `NOT` |
-| `x \|\| 'a' = 'ba'` | `(x \|\| 'a') = 'ba'` | String concatenation is at the `+` level, above comparison |
-| `-a.b[0]` | `-((a.b)[0])` | Postfix access binds tightest |
-
-When in doubt, add parentheses. The parser preserves them in the AST.
-
-### 4.5 Syntax errors
-
-A malformed statement fails in the parser, before anything else runs:
+A malformed statement fails here, before anything else runs. Because tokens
+carry their positions and the parser knows what it expected, the error can point
+at the problem:
 
 ```python
 >>> spark.sql("SELECT * FORM t")
 pyspark.errors.exceptions.connect.ParseException: ... (points at the unexpected token "FORM")
 ```
 
-The error carries the position (from the token's span) and what was expected
-(from the parser's labels), and reaches PySpark as `ParseException`.
+## Step three: turning the tree into a spec plan
 
-### 4.6 What "nothing is looked up" means in practice
+The analyzer walks the syntax tree and builds spec plan nodes (see
+[05](05-spec-plan-and-config.md)). At the top level it decides whether a
+statement is a query or a command. A SELECT becomes a query plan. A CREATE TABLE
+becomes a create-table command carrying the column list, format, partitioning,
+location, and options. USE db becomes a set-current-database command, and so on.
+
+Within a query, the analyzer maps clauses to relational steps: FROM becomes a
+read of a named table, WHERE a filter, the SELECT list a projection, GROUP BY an
+aggregation, ORDER BY a sort, LIMIT a limit. WITH clauses become named
+subqueries, and LATERAL VIEW explode(...) becomes a generator step. Expressions
+become spec expressions: names turn into unresolved column references, function
+calls into unresolved function calls, and `*` into an unresolved star. CASE,
+CAST, EXTRACT, SUBSTRING, lambdas, subqueries, and EXISTS each have their own
+spec form.
+
+Literals are interpreted fully at this stage, because their meaning doesn't
+depend on the session. That covers numbers with Spark's suffixes (10L for a
+long, 1.5BD for a decimal, 2D for a double), strings with escapes, binary
+literals like X'0A', dates, timestamps with and without time zones, and
+intervals in both styles: INTERVAL '1-2' YEAR TO MONTH and INTERVAL 3 DAYS 4
+HOURS. Spark type names like DECIMAL(10,2), VARCHAR(10), and
+ARRAY<STRUCT<...>> are turned into spec types.
+
+### Nothing is looked up yet
+
+The analyzer never consults a catalog, the function registry, or a schema. A
+query that mentions a table that doesn't exist analyzes perfectly well:
 
 ```python
-spark.sql("SELECT x FROM table_that_does_not_exist")   # no error yet (lazy query)
-_.show()                                                # now: TABLE_OR_VIEW_NOT_FOUND
+df = spark.sql("SELECT x FROM table_that_does_not_exist")   # no error yet
+df.show()                                                   # now: TABLE_OR_VIEW_NOT_FOUND
 ```
 
-The first line parses and analyzes successfully, because the shape is valid
-SQL. The table is only looked up when the plan is resolved for execution.
+The first line succeeds because the shape is valid SQL. The table is only looked
+up when the plan is resolved (see [07](07-plan-resolver.md)). Keeping lookups out
+of parsing and analysis makes both steps simple, deterministic, and easy to
+test, and it puts every "doesn't exist" error in one place.
+
+### Parameters
+
+Parameterized queries, such as `spark.sql("SELECT * FROM t WHERE id = ?",
+args=[42])` or the named form with `:id`, are supported. The placeholders become
+placeholder expressions in the spec plan, the Spark Connect layer attaches the
+argument values, and the resolver fills them in.
 
 ---
 
-## 5. End-to-End: `spark.sql("CREATE TABLE t (id INT) USING parquet")`
+## Following one statement end to end
 
-| # | What happens |
-|---|--------------|
-| 1 | Spark Connect receives a SQL command and calls `parse_one_statement`. |
-| 2 | The lexer produces tokens: `CREATE`, `TABLE`, `t`, `(`, `id`, `INT`, `)`, `USING`, `parquet`. |
-| 3 | The parser tries each statement form and matches *create table*: name `t`, a column list with `id` of type `INT`, and a `USING parquet` clause. |
-| 4 | The analyzer turns this into a create-table command with a table definition: the column `id` with type Int32, format `parquet`, and no location (so it's a managed table). |
-| 5 | Because it's a command, Spark Connect runs it immediately. The resolver turns it into a catalog command operator, the catalog creates the table, and an empty result is returned (see [03 · Spark Connect](03-spark-connect.md)). |
+Take `spark.sql("CREATE TABLE t (id INT) USING parquet")`. Spark Connect receives
+a SQL command and calls the parser's single-statement entry point. The lexer
+produces the tokens CREATE, TABLE, t, (, id, INT, ), USING, and parquet. The
+parser tries the statement forms and matches create-table, with the name t, a
+column list holding id of type INT, and a USING clause. The analyzer turns this
+into a create-table command with one Int32 column, format parquet, and no
+location, which means a managed table. Because it's a command, Spark Connect runs
+it immediately: the resolver wraps it in a catalog command, the catalog creates
+the table, and an empty result goes back to the client.
 
----
+## Adding new syntax
 
-## 6. Extending the SQL Grammar
+To support a new clause or statement, add any new keywords to the keyword file
+in alphabetical order, then add a field or variant to the syntax tree types in
+the parser crate. A new statement is usually a new variant whose fields are its
+keywords and parts in order. If the new part contains queries or expressions,
+use the macro's dependency attributes so it receives the already-declared
+recursive parsers. Then teach the analyzer to turn the new tree node into spec
+nodes, adding a spec node and resolver support if nothing existing fits. Finish
+with a round-trip parser test and an end-to-end test; the gold data tests
+compare results with real Spark (see [17](17-testing-and-development.md)).
 
-**To add a new clause or statement:**
+Three pitfalls are worth knowing. Generated parsers can't handle left recursion,
+so such rules must be written by hand, as the expression operators are.
+Alternatives are tried in order, so longer and more specific forms (LEFT SEMI)
+must come before shorter ones (LEFT). And a new keyword can break existing
+queries that use that word as a column name, so check whether Spark treats it as
+reserved, and test it as an identifier.
 
-1. Add any new keywords to `data/keywords.txt`, in sorted order.
-2. Add fields or variants to the AST type in `src/ast/` (`statement.rs`,
-   `query.rs`, or `expression.rs`). For example, a new statement is a new
-   `Statement` variant whose fields are the keyword tokens and parts in order.
-3. If the new part is recursive, set the `dependency` and `function` attributes
-   so it receives the already-declared query or expression parser.
-4. Map the new AST node to spec nodes in `sail-sql-analyzer`. If no spec node
-   fits, add one (see [05](05-spec-plan-and-config.md)) and handle it in the
-   resolver (see [07](07-plan-resolver.md)).
-5. Add parser tests (round trip) and an end-to-end test. Gold-data tests in the
-   repository compare results with real Spark (see
-   [17 · Testing and Development](17-testing-and-development.md)).
+## Where to look in the code
 
-**Pitfalls:**
-
-- Derived parsers can't handle **left recursion**. Write such rules by hand
-  (as with expression operators).
-- Alternatives are tried **in order**. Put longer or more specific forms first,
-  for example `LEFT SEMI` before `LEFT`.
-- New keywords can break queries that use those words as identifiers. Check
-  how Spark treats the keyword (reserved or not), and add tests that use it as
-  a column name.
-
----
-
-## 7. Where to Look
-
-| Topic | Location |
-|-------|----------|
-| Keyword list and generator | `crates/sail-sql-parser/data/keywords.txt`, `crates/sail-sql-parser/build.rs` |
-| Lexer and tokens | `crates/sail-sql-parser/src/lexer.rs`, `token.rs`, `string.rs` |
-| AST (the grammar) | `crates/sail-sql-parser/src/ast/` (`statement.rs`, `query.rs`, `expression.rs`, `data_type.rs`, `literal.rs`, `identifier.rs`) |
-| Parser options | `crates/sail-sql-parser/src/options.rs` |
-| Derive macros (`TreeParser`, `TreeSyntax`, `TreeText`) | `crates/sail-sql-macro/src/` |
-| Entry functions (`parse_one_statement`, `parse_expression`, …) | `crates/sail-sql-analyzer/src/parser.rs` |
-| AST → spec | `crates/sail-sql-analyzer/src/` (`statement.rs`, `query.rs`, `expression.rs`, `data_type.rs`, `literal/`) |
-| Callers | Spark Connect (`proto/plan.rs`), Flight SQL (`service.rs`), view expansion (`sail-plan/src/resolver/query/read.rs`) |
+The keyword list is crates/sail-sql-parser/data/keywords.txt, turned into code
+by that crate's build.rs. The lexer and tokens are in src/lexer.rs, token.rs, and
+string.rs, and the syntax tree, which doubles as the grammar, is under src/ast/
+(statement.rs, query.rs, expression.rs, data_type.rs, literal.rs,
+identifier.rs). Parser options are in src/options.rs. The derive macros that
+generate parsers live in crates/sail-sql-macro. The analyzer is
+crates/sail-sql-analyzer: parser.rs holds the entry points such as
+parse_one_statement and parse_expression, and statement.rs, query.rs,
+expression.rs, data_type.rs, and literal/ turn the tree into spec plans. Callers
+include the Spark Connect translator, the Flight SQL service, and view expansion
+in the resolver.

@@ -1,274 +1,176 @@
 # 15 · Functions and Python UDFs
 
-> **You'll learn:** how Sail provides about 500 Spark-compatible built-in
-> functions, how a function name in a query becomes executable code, and how
-> Python UDFs, pandas UDFs, UDAFs, UDTFs, `mapInPandas`, and `applyInPandas`
-> run inside Sail's embedded Python interpreter.
->
-> **Crates:** `sail-function` (Spark-compatible function implementations),
-> `sail-plan/src/function` (the name → builder tables), `sail-python-udf`
-> (Python UDF execution), `sail-python` (the `pysail` bindings)
-
-
-## In One Minute
-
-- About 500 Spark functions are listed in **tables** that map each name to a
-  **builder**. The builder turns resolved arguments into a DataFusion expression.
-- Where Spark differs from DataFusion (NULL handling, date formats, ANSI mode),
-  Sail provides its own implementation in `sail-function`.
-- Python UDFs run **in the Sail process** through embedded CPython (PyO3). No
-  separate Python workers or sockets are involved.
-- Prefer **pandas or Arrow UDFs** (one call per batch) over plain `@udf` (one
-  call per row).
-- In cluster mode, every worker needs the same Python packages installed.
+A large part of Spark compatibility comes down to functions. Spark has hundreds
+of built-in functions, and users expect every one of them to behave exactly as
+it does in Spark, down to how it treats NULLs and which date format letters it
+accepts. PySpark users also expect their own Python functions to just work. This
+doc explains how Sail provides about 500 Spark-compatible functions, how a
+function name in a query becomes executable code, and how Python UDFs run inside
+Sail.
 
 ---
 
-## 1. What This Component Does
+## DataFusion first, Spark semantics where they differ
 
-| Part | Responsibility |
-|------|----------------|
-| **Function tables** (in `sail-plan`) | Map each Spark function name to a *builder* that produces a DataFusion expression from resolved arguments |
-| **Function implementations** (`sail-function`) | Spark-compatible scalar, aggregate, and window functions that DataFusion doesn't provide, or provides with different semantics |
-| **Python UDF runtime** (`sail-python-udf`) | Runs user Python code over Arrow data inside the Sail process, through PyO3 |
+DataFusion already ships a large function library, and many Spark functions map
+straight onto it: square root, absolute value, lower case. Others differ in ways
+that would produce wrong answers if Sail used DataFusion's version. Spark's
+concat returns NULL if any argument is NULL. Spark's date_format uses Java-style
+patterns like yyyy-MM-dd rather than strftime's %Y-%m-%d. element_at counts
+array positions from 1. Dividing by zero returns NULL unless ANSI mode is on, in
+which case it raises an ArithmeticException, and casting the string 'abc' to an
+integer behaves the same way.
 
-Approximate counts in the function tables:
+For functions like these, the sail-function crate provides Spark-specific
+implementations: Spark's concat, Spark's date parts and intervals, Spark's number
+formatting and parsing, Spark-compatible hashing, and so on, organized by area
+(strings, dates and times, arrays, maps, math, JSON, CSV, XML, URLs, variants,
+geospatial data). It also adds aggregates that DataFusion lacks, such as mode,
+percentile, kurtosis, skewness, product, max_by and min_by, numeric histograms,
+try_avg, and bitmap aggregates, plus Spark's version of the ntile window
+function. Each is an ordinary DataFusion function: it works on whole Arrow
+arrays at a time, runs on cluster workers just like a built-in, and takes part in
+DataFusion's optimizations.
 
-| Kind | Entries |
-|------|---------|
-| Scalar | ≈ 360: string (74), math (64), datetime (54), misc (31), array (25), conversion (14), lambda (12), conditional (11), predicate (11), collection, map, xml, variant, json, hash, bitwise, url, geo, csv, struct |
-| Aggregate | ≈ 64 |
-| Window | ≈ 70 entries (ranking and offset functions, plus aggregates usable as window functions) |
-| Generators | 6 (`explode`, `explode_outer`, `posexplode`, `posexplode_outer`, `inline`, `inline_outer`, …) |
-| Table-valued | `range`, … |
+## From a name to code: builders
 
-The repository also tracks Spark compatibility per function in
-`python/pysail/data/compatibility/functions/` (status: supported, partially
-supported, planned, or not supported).
+Sail doesn't put its Spark functions into DataFusion's function registry.
+Instead, it keeps its own tables that map each Spark function name to a small
+piece of code called a **builder**. There are separate tables for scalar
+functions (about 360, the largest groups being string, math, and date
+functions), aggregates (about 64), window functions, generators such as explode
+and inline, and table-valued functions such as range.
 
----
+A builder receives the function's arguments, already resolved and typed, along
+with the session's settings, and returns a DataFusion expression. That's more
+flexible than a plain registry entry, and the flexibility is the point. Many
+builders are one line: square root maps directly to DataFusion's version with a
+cast to double. Some point at a Sail implementation: concat uses Spark's concat.
+Some contain real logic: they inspect argument types, insert casts, rewrite one
+call into several expressions, or read the session's time zone or ANSI setting
+to decide how to behave.
 
-## 2. Why It's Built This Way
+When the resolver meets a function call (see [07](07-plan-resolver.md)), it
+looks in three places, in order. First come functions registered in the session,
+which are mostly Python UDFs. Then the built-in scalar and generator table. Then
+the aggregate table. Window functions in an OVER clause use the window table. A
+name found nowhere produces an "unknown function" error. Because session
+functions are checked first, a user function named upper replaces the built-in
+upper, just as in Spark.
 
-**DataFusion first, Spark semantics where needed.** Many Spark functions map
-directly onto DataFusion functions (`sqrt`, `abs`, `lower`). Others differ in
-small but important ways:
+A few calls get special handling. count(\*) is rewritten to count a constant,
+because there's no column to count. Aggregates also support DISTINCT, FILTER
+(WHERE …), IGNORE NULLS, and ordered-set syntax like
+`percentile_cont(0.5) WITHIN GROUP (ORDER BY x)`. Higher-order functions such as
+`transform(arr, x -> x + 1)` take lambdas, and named arguments are supported.
 
-- `concat` returns NULL if any argument is NULL in Spark.
-- Date formats use Java patterns (`yyyy-MM-dd`), not strftime.
-- ANSI mode makes overflows and invalid casts raise errors.
-- Division by zero returns NULL (non-ANSI).
-- Array indexes start at 1 in `element_at`.
+## Python UDFs run inside Sail
 
-For these, `sail-function` provides Spark-specific implementations
-(`SparkConcat`, `spark_date_part`, `spark_to_number`, …), and the table points
-at those instead.
+Spark runs Python UDFs in separate Python worker processes and ships data to
+them over sockets. Sail takes a different approach: it **embeds CPython** in its
+own process using PyO3, and hands Arrow data to Python directly. There's no
+inter-process serialization and no pool of Python processes to manage.
 
-**Builders, not a flat registry.** A builder gets the **resolved arguments**
-and a **function context** (session time zone, ANSI mode, plan config). It can
-inspect argument types, insert casts, rewrite into several expressions, or pick
-different implementations depending on the session. DataFusion's plain function
-registry can't express that.
+Here's what happens to a UDF. When a PySpark program defines and uses one, it
+sends Sail the function pickled with cloudpickle, along with its return type,
+its *eval type* (which tells Sail what style of UDF it is), and whether it's
+deterministic. Sail stores it as a session function. During resolution, Sail
+creates the matching expression or operator, recording the input and output
+Arrow types and the relevant session settings (time zone and pandas conversion
+options). The first time the function runs, Sail acquires Python's interpreter
+lock, unpickles it, and keeps the Python object for reuse. For each batch of
+data, Sail converts the input Arrow arrays into what the function expects, calls
+it, and converts the results back to Arrow using the declared return type. A
+bundled Python helper module does the conversions, using PySpark's own
+serializers where possible. If the function raises an exception, the traceback
+is captured and reaches the client as a PythonException (see
+[03](03-spark-connect.md)).
 
-**Python runs in-process.** Spark runs Python UDFs in separate worker processes
-and moves data through sockets. Sail **embeds** CPython (PyO3) and passes Arrow
-data to it directly. That removes inter-process serialization and process
-management. The function is unpickled lazily, once, and reused.
+## Styles of Python UDF
 
----
+PySpark offers several styles of Python function, and Sail supports them all.
+The difference between them is mostly about how much data each call to Python
+sees.
 
-## 3. How It Works
-
-### 3.1 Resolving a function call
-
-When the resolver meets an unresolved function `f(args…)` (see
-[07](07-plan-resolver.md)):
-
-1. Resolve the arguments.
-2. If the session has a **user function** named `f` (a registered Python UDF),
-   use it.
-3. Else, if `f` is in the **scalar or generator table**, call its builder.
-4. Else, if `f` is in the **aggregate table**, build an aggregate expression,
-   applying `DISTINCT`, `FILTER`, `ORDER BY`, and `IGNORE NULLS`.
-5. Window functions in `OVER (…)` use the **window table**.
-6. Otherwise: *unknown function*.
-
-**Builder styles** (examples from the code):
-
-| Style | Example | Meaning |
-|-------|---------|---------|
-| `unary` / `binary` | `("sqrt", F::unary(double(expr_fn::sqrt)))` | Fixed arity, with a cast wrapper |
-| `udf` | `("concat", F::udf(SparkConcat::new()))` | Use a Sail scalar UDF |
-| `custom` | `("upper", F::custom(upper))`, `("try_element_at", F::custom(\|i\| element_at(i, true)))` | Arbitrary logic with access to the function context |
-| `nullary` | `current_date()`-style functions | No arguments |
-
-### 3.2 Built-in implementations
-
-`sail-function` is organized by area:
-
-- `scalar/`: array, collection, csv, datetime (Spark date parts, intervals,
-  `make_timestamp`, `unix_timestamp`, `convert_tz`, Java-format → chrono format,
-  …), geo, hash (Spark-compatible `hash`, `xxhash64`, …), json, map, math, misc,
-  predicate, string (`format_number`, `levenshtein`, `soundex`, `mask`,
-  `regexp_extract_all`, `sentences`, `split`, `to_number`, …), url, variant, xml,
-  struct helpers, `explode`
-- `aggregate/`: `mode`, `percentile`, `percentile_disc`, `kurtosis`,
-  `skewness`, `product`, `max_by` / `min_by`, `histogram_numeric`, `try_avg`,
-  bitmap aggregates, `schema_of_variant_agg`
-- `window/`: Spark's `ntile`
-
-Each is a DataFusion UDF, UDAF, or UDWF. That means it's vectorized over Arrow
-arrays, works in both local and cluster mode (the plan codec serializes it by
-name), and takes part in DataFusion's optimizations.
-
-### 3.3 Python UDF kinds
-
-| PySpark API | Sail kind | How it runs |
-|-------------|-----------|-------------|
-| `@udf` (row-at-a-time) | Batch scalar UDF | Arrow arrays are converted to Python values, the function is called per row, and results are converted back |
-| `@udf(useArrow=True)` | Arrow-batched scalar UDF | Python receives Arrow-backed batches |
-| `@pandas_udf` (scalar), iterator-of-series | Scalar pandas, scalar pandas iterator | Columns are passed as `pandas.Series` per batch |
-| Spark 4 Arrow scalar UDFs | Scalar Arrow, scalar Arrow iterator | Columns are passed as `pyarrow` arrays |
-| `@pandas_udf` grouped aggregate | UDAF | Each group's rows are collected, and the function returns one value |
-| `df.groupBy(…).applyInPandas(f, schema)` | Group map | Batches are collected per group into a list of structs, then `f(pandas.DataFrame)` returns rows |
-| `df.groupBy(…).cogroup(…).applyInPandas` | Cogroup map | Two groups go to the function together |
-| `df.mapInPandas(f, schema)`, `mapInArrow` | Map-partitions iterator | The **map partitions** operator streams each partition's batches through `f` (see [08](08-logical-physical-plans-and-optimizers.md)) |
-| `@udtf` | Python UDTF | A table function that can produce many rows per input row |
-| `spark.udf.register("name", f)` | Any of the above | Registered in the session, so it's callable from SQL |
-
-### 3.4 Execution details
-
-1. **Registration.** The client sends the function's pickled bytes
-   (cloudpickle), return type, eval type, and whether it's deterministic. Sail
-   stores it as a session function (see [11](11-catalogs.md)).
-2. **Planning.** The resolver creates the right expression or operator for the
-   kind, with the input and output Arrow types and the UDF configuration
-   (session time zone, pandas conversion settings from
-   `spark.sql.execution.pandas.*`).
-3. **First call.** Sail takes Python's interpreter lock, unpickles the function,
-   and caches the Python object.
-4. **Each batch.** Arrow arrays are handed to Python. A bundled Python helper
-   module converts between Arrow and PySpark or pandas values, using PySpark's
-   own serializers where possible. The function runs, and results are converted
-   back to Arrow with the declared return type.
-5. **Errors.** Python exceptions are captured with their traceback and appear to
-   the client as `PythonException` (see [03](03-spark-connect.md)).
-
-**Performance:**
-
-- Plain `@udf` is the slowest: one Python call per row. Prefer `pandas_udf` or
-  Arrow UDFs, which do one call per batch.
-- All Python code in a process shares the **interpreter lock**. Pure-Python work
-  from parallel partitions takes turns. Vectorized pandas or NumPy code releases
-  the lock for much of its work.
-- In cluster mode, each worker runs its own embedded Python, so the same Python
-  packages must be installed on every worker image.
-
----
-
-## 4. Examples
+A plain `@udf` is called once per row. Sail converts each value into a Python
+object, calls the function, and converts the result back. `@udf(useArrow=True)`
+and Spark 4's Arrow UDFs receive whole Arrow batches. `@pandas_udf` receives
+each column as a pandas Series, one batch at a time, and can also come in an
+iterator form. A grouped-aggregate pandas UDF collects each group's rows and
+returns one value. `applyInPandas` after a groupBy gives the function each
+group as a pandas DataFrame and expects rows back, and the cogrouped form hands
+two groups to the function together. `mapInPandas` and `mapInArrow` stream each
+whole partition through the function, using a dedicated operator (see
+[08](08-logical-physical-plans-and-optimizers.md)). Python table functions
+(`@udtf`) can produce many rows from each input row. Any of these can be
+registered with `spark.udf.register` so SQL can call it.
 
 ```python
-from pyspark.sql import functions as F
 from pyspark.sql.functions import udf, pandas_udf
 import pandas as pd
 
-# Built-ins
-df.select(F.date_format("ts", "yyyy-MM-dd"), F.element_at("arr", 1), F.concat("a", "b"))
-
-# Row-at-a-time UDF
 @udf("int")
-def plus_one(x): return x + 1
+def plus_one(x): return x + 1                       # called once per row
 
-# Vectorized pandas UDF
 @pandas_udf("double")
-def zscore(v: pd.Series) -> pd.Series: return (v - v.mean()) / v.std()
+def zscore(v: pd.Series) -> pd.Series:              # called once per batch
+    return (v - v.mean()) / v.std()
 
-# Grouped map
-def normalize(pdf: pd.DataFrame) -> pd.DataFrame:
-    pdf["v"] = pdf["v"] - pdf["v"].mean(); return pdf
-df.groupBy("k").applyInPandas(normalize, schema="k long, v double")
-
-# mapInPandas
-def keep_positive(it):
-    for pdf in it: yield pdf[pdf.v > 0]
-df.mapInPandas(keep_positive, schema=df.schema)
-
-# Register for SQL
 spark.udf.register("plus_one", plus_one)
 spark.sql("SELECT plus_one(id) FROM range(3)").show()
 ```
 
-### 4.1 Spark semantics vs. "plain SQL" semantics
+## Making UDFs fast
 
-| Expression | Spark (and Sail) | A typical SQL engine |
-|------------|------------------|----------------------|
-| `concat('a', NULL)` | `NULL` | Some return `'a'` |
-| `date_format(ts, 'yyyy-MM-dd')` | Java-style pattern | strftime-style `'%Y-%m-%d'` |
-| `element_at(array(10, 20), 1)` | `10` (1-based) | `arr[0]` style (0-based) |
-| `1 / 0` (ANSI off) | `NULL` | Error |
-| `1 / 0` (ANSI on) | `ArithmeticException` | Error |
-| `CAST('abc' AS INT)` (ANSI off) | `NULL` | Error |
+The style you choose matters more than anything else. Take a column of ten
+million rows processed in batches of 8,192. A plain `@udf` makes about ten million
+Python calls, each converting one value in and one value out. A pandas or Arrow
+UDF makes about 1,220 calls, one per batch, and does its conversions on whole
+arrays. That's roughly eight thousand times fewer trips into Python, and the
+work inside those calls usually happens in pandas, NumPy, or Arrow, which are
+written in native code.
 
-These differences are why each function goes through a builder that can pick a
-Spark-compatible implementation and read the session's ANSI setting.
+There's a second reason vectorized UDFs scale better. All Python code in one
+process shares Python's interpreter lock, so when several partitions run
+pure-Python code in parallel, they take turns. Native libraries like pandas and
+NumPy release the lock for much of their work, so vectorized UDFs spend far less
+time waiting.
 
-### 4.2 UDF styles and their cost
+In cluster mode, each worker runs its own embedded Python, so every worker image
+needs the same Python packages your UDFs import.
 
-For a column of 10 million rows, in batches of 8,192 rows:
+## Following one UDF
 
-| Style | Python calls | Data conversion |
-|-------|--------------|-----------------|
-| `@udf` (row-at-a-time) | ≈ 10,000,000 | Each value is converted to a Python object and back |
-| `@udf(useArrow=True)` | ≈ 1,220 | Batch-level Arrow conversion |
-| `@pandas_udf` | ≈ 1,220 | Arrow → `pandas.Series` → Arrow, vectorized |
-| Arrow UDF (Spark 4) | ≈ 1,220 | Arrow arrays directly |
+Take `df.select(zscore("v"))`. PySpark pickles zscore and sends a projection
+whose expression is an inline UDF of the scalar pandas style returning a double.
+Spark Connect translates it into a spec inline-UDF expression. The resolver
+creates a Python UDF expression of the right kind, with v's type and the session
+settings. Physical planning places it in a projection, and in cluster mode the
+pickled bytes travel inside the task's plan. For each batch, Sail takes the
+interpreter lock, fetches the cached function, turns column v into a pandas
+Series, calls zscore, converts the result into an Arrow array of doubles, and
+moves on.
 
-Vectorized styles make about 8,000× fewer Python calls, and they spend most of
-their time in native code (pandas, NumPy, Arrow) that doesn't hold Python's
-interpreter lock.
+## Adding a built-in function
 
----
+First check whether DataFusion already has the function with Spark's behavior.
+If it does, a new line in the right builder table is enough. If not, write the
+implementation in sail-function under the right area, handling NULLs and ANSI
+mode, then add a builder that calls it. If you've created a new kind of function
+object that must run on workers, make sure the plan codec can serialize it (see
+[09](09-local-and-cluster-execution.md)). Finally add tests that compare with
+Spark (see [17](17-testing-and-development.md)), and update the compatibility
+data under python/pysail/data/compatibility/functions/, which records each
+function's status as supported, partially supported, planned, or not supported.
 
-## 5. End-to-End: `df.select(zscore("v"))`
+## Where to look in the code
 
-| # | Component | What happens |
-|---|-----------|--------------|
-| 1 | PySpark | Pickles `zscore` and sends a projection whose expression is an inline UDF (eval type: scalar pandas, return type `double`). |
-| 2 | Spark Connect | Converts it to a spec inline UDF expression. |
-| 3 | Resolver | Builds a Python scalar UDF expression (kind: scalar pandas) with the input type of `v` and the UDF settings. |
-| 4 | Physical planning | A projection operator evaluates the UDF expression. In cluster mode the pickled bytes go into the task plan. |
-| 5 | Execution | For each batch: take the interpreter lock, get the cached function, convert column `v` to a `pandas.Series`, call `zscore`, convert the result to an Arrow `Float64` array, and continue. |
-| 6 | Result | Arrow batches flow on to the client. |
-
----
-
-## 6. Adding a Built-in Function
-
-1. Check whether DataFusion already has it with the right semantics. If so,
-   just add a table entry.
-2. If not, implement a UDF, UDAF, or UDWF in `sail-function` under the right
-   area: its signature, return type logic, and an `invoke` that works on Arrow
-   arrays and handles NULLs and ANSI mode.
-3. Add `("spark_name", builder)` to the matching list in
-   `sail-plan/src/function/`.
-4. If it's a new UDF type that must run on workers, make sure the plan codec can
-   serialize it (see [09](09-local-and-cluster-execution.md)).
-5. Add tests (gold data or Spark comparison, see
-   [17](17-testing-and-development.md)) and update the compatibility JSON.
-
----
-
-## 7. Where to Look
-
-| Topic | Location |
-|-------|----------|
-| Function tables and builders | `crates/sail-plan/src/function/` (`common.rs`, `scalar/`, `aggregate.rs`, `window.rs`, `generator.rs`, `table/`) |
-| Function lookup during resolution | `crates/sail-plan/src/resolver/expression/function.rs` |
-| Spark-compatible implementations | `crates/sail-function/src/` (`scalar/`, `aggregate/`, `window/`) |
-| Python UDF kinds | `crates/sail-python-udf/src/udf/` |
-| Arrow ↔ Python conversion | `crates/sail-python-udf/src/conversion.rs`, `python/spark.py` |
-| Pickled payload formats | `crates/sail-python-udf/src/cereal/` |
-| UDF settings | `crates/sail-python-udf/src/config.rs` |
-| Python bindings (`pysail`) | `crates/sail-python/` |
-| Compatibility data | `python/pysail/data/compatibility/functions/` |
+The builder tables live in crates/sail-plan/src/function/: common.rs defines the
+builder styles, scalar/ holds the scalar tables by category, and aggregate.rs,
+window.rs, generator.rs, and table/ hold the rest. The order in which the
+resolver looks up functions is in crates/sail-plan/src/resolver/expression/function.rs.
+Spark-compatible implementations are in crates/sail-function/src/, under scalar/,
+aggregate/, and window/. The Python UDF runtime is crates/sail-python-udf: the UDF
+styles are under src/udf/, conversion between Arrow and Python in conversion.rs
+and the bundled python/spark.py, pickled payload handling in src/cereal/, and UDF
+settings in config.rs. The pysail bindings are in crates/sail-python.

@@ -1,304 +1,203 @@
-# 08 · Logical and Physical Plans, Extension Nodes, and Optimizers
+# 08 · Plans, Extension Nodes, and Optimizers
 
-> **You'll learn:** which operators Sail adds to DataFusion and why; how custom
-> logical nodes become physical operators; which optimizer rules run and in
-> what order; and how cost-based join reordering works.
->
-> **Crates:** `sail-logical-plan`, `sail-physical-plan`,
-> `sail-logical-optimizer`, `sail-physical-optimizer`, plus the extension
-> planner in `sail-session/src/planner.rs`
-
-
-## In One Minute
-
-- DataFusion provides most operators. Sail adds about 15 **extension nodes** for
-  Spark-only behavior: `range`, `show`, Python `mapInPandas`,
-  `monotonically_increasing_id`, writes, deletes, merge, catalog commands,
-  barriers, and streaming.
-- Each logical extension node has a physical operator, connected by the
-  **extension planner**.
-- Side effects only happen during **execution**, never while planning. The
-  **barrier** node makes "create the table, then write" safe.
-- Sail keeps **all** of DataFusion's physical optimizer rules, in order, and
-  adds a few of its own.
-- Optional **cost-based join reordering** picks a good join order for many-table
-  queries.
+DataFusion comes with a rich set of operators: scans, filters, projections,
+joins, aggregations, sorts, windows, unions, and repartitioning. Spark needs a
+few more. This doc explains which operators Sail adds and why, how they plug
+into DataFusion without forking it, which optimizer rules run, and how Sail's
+cost-based join reordering works.
 
 ---
 
-## 1. What This Component Does
+## Two kinds of plans
 
-DataFusion has a rich set of built-in operators: scans, filters, projections,
-joins, aggregates, sorts, windows, unions, and repartitioning. Spark needs a few
-more. Sail fills the gap in two layers:
+Planning in DataFusion happens in two layers. A **logical plan** says what to
+compute: "filter these rows, group them by region, count them". A **physical
+plan** says how: "scan these Parquet files in eight parallel partitions,
+pre-aggregate each one, repartition by a hash of region, then finish the
+aggregation". The resolver (see [07](07-plan-resolver.md)) produces the logical
+plan. Optimizer rules improve it, a planner turns it into a physical plan, and
+more rules improve that.
 
-| Layer | What Sail adds |
-|-------|----------------|
-| **Logical** (what to compute) | About 15 **extension nodes** that represent Spark-only operations |
-| **Physical** (how to compute) | A matching **execution operator** for each, plus a few physical-only helpers |
-| **Planning** | An **extension planner** that maps each logical node to its operator |
-| **Optimization** | A curated list of DataFusion's logical and physical rules plus Sail's own rules, including **cost-based join reordering** |
+Sail adds its own operators at both layers. Each Spark-specific feature gets a
+logical **extension node** describing what it means, and a matching physical
+operator that does the work. DataFusion explicitly supports this: applications
+can define their own logical nodes and physical operators and register a
+planner that connects them. Because Sail uses these extension points rather than
+changing DataFusion, it can keep up with DataFusion releases.
 
----
+## The operators Sail adds, and why
 
-## 2. Why It's Built This Way
+Most of Sail's extension nodes exist because Spark defines a behavior precisely
+and users depend on it.
 
-**Use DataFusion's extension points, don't fork it.** DataFusion lets
-applications define their own logical nodes (`UserDefinedLogicalNode`) and
-physical operators (`ExecutionPlan`), and plug in a planner for them. Sail's
-Spark-specific behavior lives entirely in these extensions, so Sail can keep up
-with DataFusion releases.
+**Range** implements `spark.range(...)`, generating numbers in parallel across a
+chosen number of partitions. **Show string** implements `df.show()`, formatting
+rows as Spark's familiar text table (or HTML in notebooks), with Spark's
+truncation rules. **Monotonic ID** implements `monotonically_increasing_id()`
+with Spark's exact formula: the partition number shifted left by 33 bits, plus
+the row's position within the partition. So partition 0 produces 0, 1, 2, and
+so on, partition 1 starts at 8,589,934,592, and the values match what Spark
+would produce for the same partitioning. **Spark partition ID** returns the
+current partition number.
 
-**The resolver has no side effects.** Resolving a plan must not change anything.
-For example, `CREATE TABLE AS SELECT` can't create the table while planning,
-because `EXPLAIN` of that statement must not create the table either. Side
-effects are expressed as nodes and happen only during **execution**. The
-**barrier** node exists for this: "run these preconditions (such as a catalog
-change) first, then the main plan."
+**Sort within partitions** implements `sortWithinPartitions` and SORT BY, which
+sort each partition separately without a global sort. **Explicit repartition**
+records a repartition the user asked for, such as `df.repartition(8,
+"customer_id")` or DISTRIBUTE BY, so that the optimizer doesn't remove it; a late
+rule turns it into a real repartition. That matters because users repartition on
+purpose, for example to control how many output files a write produces.
 
-**Keep every DataFusion rule, add a few.** Sail's physical rule list is checked
-by a test: it must contain **all** of DataFusion's default physical rules, **in
-the same order**, with Sail's rules inserted around them. This guards against
-accidentally dropping an optimization when upgrading DataFusion.
+**Map partitions** runs Python functions over whole partitions for `mapInPandas`,
+`mapInArrow`, and Python table functions (see
+[15](15-functions-and-python-udfs.md)). **File write**, **file delete**, and
+**merge into** describe writes, DELETE, and MERGE; their physical form comes from
+the table format (see [12](12-data-sources-and-formats.md) and
+[13](13-lakehouse-delta-and-iceberg.md)). A **catalog command** node wraps DDL
+and metadata commands and calls the catalog manager when the plan runs. Finally,
+a handful of streaming nodes run plans over unbounded input (more on these
+below).
 
----
+## Planning never changes anything: the barrier
 
-## 3. How It Works
+There's one principle behind several of these nodes: **resolving or planning a
+query must never have side effects**. Consider CREATE TABLE ... AS SELECT. It's
+tempting to create the table while planning and then plan the write. But then
+EXPLAIN of that statement would create the table, and a planning error after the
+create would leave an empty, orphaned table behind.
 
-### 3.1 Sail's extension nodes
+Sail solves this with a **barrier** node. A barrier holds some *precondition*
+plans and a *main* plan, and guarantees that the preconditions run to
+completion before the main plan starts. Every write is wrapped in one: the
+precondition might be "create the target table" and the main plan "write the
+data". Planning only describes the work. At execution time the barrier runs the
+create, waits for it, and then starts the write. A physical optimizer rule
+enforces the waiting, even when the plans have different numbers of partitions,
+by making sure no partition of the main plan can start before every partition of
+the preconditions has finished.
 
-| Logical node | Physical operator | Spark feature | What it does |
-|--------------|-------------------|---------------|--------------|
-| Range | RangeExec | `spark.range(…)`, `range()` table function | Generates numbers in parallel, split across a set number of partitions |
-| ShowString | ShowStringExec | `df.show()`, notebook HTML | Formats rows as a text or HTML table, with Spark's truncation rules |
-| MapPartitions | MapPartitionsExec | `mapInPandas`, `mapInArrow`, Python UDTFs | Streams each partition through a Python function (see [15](15-functions-and-python-udfs.md)) |
-| MonotonicId | MonotonicIdExec | `monotonically_increasing_id()` | Computes `(partition_id << 33) + row_number_within_partition`, exactly like Spark |
-| SparkPartitionId | SparkPartitionIdExec | `spark_partition_id()` | Returns the current partition number |
-| SortWithinPartitions | a sort that keeps partitioning | `sortWithinPartitions`, `SORT BY` | Sorts each partition separately |
-| ExplicitRepartition | ExplicitRepartitionExec → rewritten to a repartition | `repartition(n)`, `repartition(n, cols)`, `DISTRIBUTE BY` | Records a user-requested repartition so the optimizer keeps it |
-| SchemaPivot | SchemaPivotExec | (internal helper) | Collects its input and outputs a single string column built from the given column names. The current resolver doesn't produce this node. |
-| FileWrite | the table format's writer | `df.write`, `INSERT`, CTAS | Writes data through the format's sink (see [12](12-data-sources-and-formats.md)) |
-| FileDelete | the format's row-level writer | `DELETE FROM` | Deletes rows in lakehouse tables (see [13](13-lakehouse-delta-and-iceberg.md)) |
-| MergeInto | the lakehouse merge plan, with a cardinality check | `MERGE INTO` | Runs merge actions and enforces that each target row matches at most one source row |
-| CatalogCommand (in `sail-plan`) | CatalogCommandExec | DDL, `SHOW`, `DESCRIBE`, `USE`, … | Calls the catalog manager at execution time and returns a result table |
-| Barrier | BarrierExec | Every write | Wraps each file write. Runs precondition plans (such as the catalog command that creates the target table) to completion before the write starts. |
-| Stream source wrapper, adapter, filter, limit, collector | Stream* operators | Structured Streaming | Run a plan over unbounded input and produce updates (see 3.5) |
+## From logical node to physical operator
 
-### 3.2 The extension planner
+When DataFusion meets a logical node it doesn't recognize, it asks the
+registered extension planners, in order, whether they can handle it. Sail
+registers three. The lakehouse planners come first, because DELETE, UPDATE, and
+MERGE on Delta and Iceberg tables need format-specific plans. The system table
+planner comes next, for the `system.*` tables. Sail's general planner comes last
+and handles everything else described above. The first planner that recognizes
+the node produces the operator. If none does, planning fails, so **every new
+logical node needs a planner case**.
 
-When DataFusion finds a logical node it doesn't know, it asks the registered
-extension planners **in order**:
+## Logical optimization
 
-1. **Lakehouse planners**: Delta and Iceberg row-level operations, such as
-   expanding `DELETE`, `UPDATE`, and `MERGE` into scan, rewrite, and commit plans.
-2. **System table planner**: the `system.*` tables.
-3. **Sail's general planner**: everything in the table above.
+Sail takes DataFusion's standard logical rules, such as pushing filters down,
+removing unused columns, folding constants, eliminating common subexpressions,
+and decorrelating subqueries, and makes three changes. Lakehouse rules run
+**first**, so that DELETE, UPDATE, and MERGE are expanded into ordinary scans and
+joins before the standard rules optimize them. A rule for a common lateral-join
+pattern runs before DataFusion's own lateral-join rule: queries like
+`LATERAL (SELECT t1.a + 1)` are rewritten into a simple cross join plus a
+projection. And one DataFusion rule that pushes down leaf projections is
+removed, because it doesn't suit how Sail uses projections.
 
-The first planner that recognizes the node produces the operator. If none does,
-planning fails, so **every new logical node needs a planner case**.
+## Physical optimization
 
-### 3.3 Logical optimizer rules
+After the physical plan is built, about twenty rules adjust it. Most come from
+DataFusion: computing count, min, and max from statistics when possible;
+choosing join algorithms and which side to build hash tables on; pushing
+filters, projections, limits, and sorts down; inserting repartitions so that
+joins and aggregations see the data partitioned the way they need; adding or
+removing sorts; using top-K for ORDER BY ... LIMIT; making long-running operators
+yield to the scheduler; and finally a sanity check that every requirement is
+met.
 
-Sail takes DataFusion's default analyzer rules (type coercion and so on) and
-default optimizer rules, with these changes:
+Sail keeps **all** of DataFusion's default physical rules, **in the same
+order**, and a test fails if that ever stops being true. That guards against
+silently losing an optimization when DataFusion is upgraded. Sail inserts four
+rules of its own. Join reordering runs early, if enabled (see below). Near the
+end, one rule turns the user's explicit repartition into a real repartition
+operator. Another makes sure the build side of a "collect left" hash join has
+exactly one partition, a safety net that matters after joins have been
+reordered. The last enforces the barrier behavior described above.
 
-| Change | Why |
-|--------|-----|
-| Lakehouse rules run **first** (for example, *expand row-level operation*) | `DELETE`, `UPDATE`, and `MERGE` must become ordinary scans and joins before the standard rules optimize them |
-| **Decorrelate lateral projection** is added before DataFusion's lateral-join decorrelation | Handles the common case `LATERAL (SELECT t1.a + 1)` by turning it into a cross join plus a projection |
-| *Push down leaf projections* is removed | Doesn't fit how Sail uses projections |
+## Streaming plans
 
-Everything else (filter pushdown, projection pruning, constant folding, common
-subexpression elimination, subquery decorrelation, limit pushdown, …) is standard
-DataFusion.
+If a query reads from a streaming source, such as the rate or socket test
+sources, an extra rewrite runs after logical optimization. It turns the plan
+into a *streaming plan*, in which every operator except the sink carries extra
+fields marking each row as an addition or a retraction. This is how a streaming
+aggregation can correct a result it already emitted. A collector node at the top
+can turn this stream of updates back into final results, as long as the query is
+bounded.
 
-### 3.4 Physical optimizer rules
+## Cost-based join reordering
 
-The rules run in this order. Sail's additions are in **bold**.
+When a query joins many tables, as star and snowflake schemas do, the order of
+the joins can change the runtime by orders of magnitude. Sail includes an
+optional join reorder rule, enabled with optimizer.enable_join_reorder, that
+chooses the order using estimated sizes.
 
-| # | Rule | Purpose |
-|---|------|---------|
-| 1 | Output requirements (add) | Remember required ordering and distribution at the root |
-| 2 | Aggregate statistics | Answer `count(*)`, `min`, `max` from statistics when possible |
-| 3 | **Join reorder** (if `optimizer.enable_join_reorder`) | Cost-based join order, see 3.6 |
-| 4 | Join selection | Choose hash, sort-merge, or nested-loop join, build side, and partitioned vs. collect-left |
-| 5 | Limited distinct aggregation | `SELECT DISTINCT … LIMIT n` stops early |
-| 6 | Filter pushdown | Push filters into scans and through joins |
-| 7 | Enforce distribution | Insert repartitions so joins and aggregates get the partitioning they need |
-| 8 | Combine partial/final aggregate | Merge two aggregation steps when there's no repartition between them |
-| 9 | Enforce sorting | Insert or remove sorts |
-| 10 | Optimize aggregate order | Use existing order for aggregates |
-| 11 | Projection pushdown | Drop unused columns early |
-| 12 | Output requirements (remove) | |
-| 13 | Top-K aggregation | `ORDER BY agg LIMIT k` |
-| 14 | Limit push past windows, limit pushdown | Push limits down |
-| 15 | Projection pushdown (again), push down sort | |
-| 16 | Ensure cooperative | Make long-running operators yield to the async scheduler |
-| 17 | Filter pushdown (post-optimization) | Dynamic filters, for example from hash join build sides |
-| 18 | **Rewrite explicit repartition** | Turn the user's `repartition()` node into a real repartition operator |
-| 19 | **Rewrite collect-left hash join** | Safety net: make sure the build side of a collect-left hash join has exactly one partition, even after reordering |
-| 20 | **Enforce barrier partitioning** | Make sure all barrier preconditions finish before the main plan starts |
-| 21 | Sanity check | Check that distribution and ordering requirements are met |
+Here's the intuition with numbers. Suppose a sales fact table has a billion
+rows, a stores table filtered to one region has ten rows, and a products table
+has 100,000 rows. Joining sales with products first produces a billion-row
+intermediate result, and joining that with stores then shrinks it to about five
+million. Joining sales with stores first produces only about five million rows,
+and the products join keeps it there. The cost model adds up the sizes of the
+intermediate results, so the first order costs around a billion and the second
+around ten million. The rule picks the second, the same choice an experienced
+engineer would make by hand.
 
-### 3.5 Streaming plans
+To get there, the rule first finds regions of the plan made of inner equi-joins
+(along with filters and projections between them) and treats everything else as
+an opaque input. It builds a graph in which tables are vertices and join
+conditions are edges, and groups columns that are joined by equality, so they
+share one estimate of how many distinct values they hold. It estimates the size
+of each table and each join from statistics: row counts, distinct counts, and
+guesses for filter selectivity. Joins without equality conditions are estimated
+pessimistically on purpose, to avoid accidentally building near-cross-products.
 
-If a plan reads from a streaming source (rate, socket, Kafka-style formats, …),
-a rewrite step after logical optimization turns it into a **streaming plan**.
-Every operator except the sink carries a *flow event* schema: the data columns
-plus extra fields that mark whether a row is being added or retracted. A
-**collector** node at the top can turn the stream of retractable updates back
-into final results, as long as the query is bounded.
+It then searches for the best order with dynamic programming over connected
+subsets of tables, using the DPhyp algorithm. The cost of joining two subplans is
+the cost of each plus the size of their join. If the search would generate more
+than 10,000 candidate plans, it falls back to a greedy algorithm, and above ten
+tables it prunes more aggressively. For star schemas with one dominant fact
+table, it penalizes joining dimensions to each other first when the estimates
+are uncertain. Finally it rebuilds the plan in the chosen order, restoring the
+original column order and the filters and projections.
 
-### 3.6 Cost-based join reordering
+## Following one node through planning
 
-When a query joins many tables (star and snowflake schemas, TPC-DS style), the
-order of the joins can change runtime by orders of magnitude. Sail's join
-reorder rule (off by default) works on physical plans:
+Take `spark.range(1_000_000).selectExpr("id % 10 AS k").groupBy("k").count().show()`.
+The resolver produces a show-string node over an aggregation over a projection
+over a range node. Logical optimization simplifies the projection, and the two
+extension nodes pass through untouched. The extension planner turns the range
+node into a range operator split across the target number of partitions and the
+show-string node into its operator, while DataFusion plans the aggregation as a
+partial and a final step. Physical optimization inserts a hash repartition on k
+between the two steps, and Sail's rules check the result. When it runs, the
+show-string operator returns one batch containing the formatted table.
 
-1. **Find reorderable regions.** Walk the plan bottom-up, collecting maximal
-   groups of inner equi-joins (plus filters and projections), and treat
-   everything else as a leaf relation.
-2. **Build a join graph.** Relations are vertices, and join conditions are
-   edges. Columns joined by equality are placed in **equivalence sets**, which
-   share a single estimate of distinct values.
-3. **Estimate cardinalities** from scan statistics: row counts, distinct counts,
-   and filter selectivity (with fixed guesses for non-equality filters and a
-   deliberately pessimistic guess for theta joins, to avoid near-cross-products).
-4. **Enumerate join orders** with dynamic programming over connected subsets
-   (the DPhyp approach). The cost of joining A and B is cost(A) + cost(B) +
-   cardinality(A ⋈ B). The search falls back to a **greedy** algorithm when more
-   than 10,000 candidate plans would be generated, and prunes more aggressively
-   above 10 relations.
-5. **Protect the fact table.** In star schemas with one dominant "fact" table
-   (at least 5 relations, with the fact table holding most of the rows), joins
-   that avoid the fact table and have low-confidence estimates get a penalty,
-   so dimensions aren't joined to each other first.
-6. **Rebuild the plan** in the chosen order, restoring the original column order
-   and any filters and projections.
+## Adding a new operator
 
----
+Define the logical node in sail-logical-plan: its name, inputs, output schema,
+expressions, and how to rebuild it with new inputs, with no side effects.
+Implement the physical operator in sail-physical-plan, including its
+partitioning and ordering properties and an execute method that returns a stream
+of batches. Add a planner case connecting the two in sail-session. Teach the
+resolver to produce the node (see [07](07-plan-resolver.md)). If the operator
+must run on cluster workers, add it to the plan codec so it can be serialized
+(see [09](09-local-and-cluster-execution.md)). And if it has partitioning or
+ordering requirements, declare them, so the distribution and sorting rules can
+work around it.
 
-## 4. Examples
+## Where to look in the code
 
-### 4.1 `monotonically_increasing_id()`
-
-```python
-spark.range(0, 10, numPartitions=2).withColumn("id2", F.monotonically_increasing_id()).show()
-```
-
-Partition 0 produces IDs 0–4. Partition 1 produces `1<<33` (8589934592) through
-8589934596. Those are the same values Spark produces.
-
-### 4.2 `repartition` stays where you put it
-
-```python
-df.repartition(8, "customer_id").write.parquet("out/")
-```
-
-The explicit repartition node survives logical optimization, and the late
-physical rule turns it into a hash repartition into 8 partitions. That gives 8
-output file groups, as in Spark.
-
-### 4.3 CTAS uses a barrier
-
-```sql
-CREATE TABLE top_customers AS
-SELECT customer_id, sum(amount) AS total FROM orders GROUP BY 1 ORDER BY total DESC LIMIT 100
-```
-
-The plan is roughly *Barrier(precondition = create-table catalog command,
-main = FileWrite(query))*. The table is created during execution, never during
-planning, and the write starts only after the create succeeds.
-
-### 4.4 Turning on join reordering
-
-```bash
-export SAIL_OPTIMIZER__ENABLE_JOIN_REORDER=true
-```
-
-Then compare `EXPLAIN` output for a five-table star join with the setting off
-and on.
-
-### 4.5 Join reordering with numbers
-
-A star query joins a large fact table with two dimensions:
-
-| Relation | Rows after filters |
-|----------|--------------------|
-| `sales` (fact) | 1,000,000,000 |
-| `stores` (filtered to one region) | 10 |
-| `products` | 100,000 |
-
-Assume each join shrinks or keeps rows as follows: `sales ⋈ stores` keeps the
-sales for 10 stores, about **5,000,000** rows. Joining that with `products` (a
-lookup) keeps 5,000,000.
-
-| Order | Intermediate result | Cost = sum of intermediate sizes |
-|-------|---------------------|----------------------------------|
-| (`sales` ⋈ `products`) ⋈ `stores` | 1,000,000,000 rows first | ≈ 1,005,000,000 |
-| (`sales` ⋈ `stores`) ⋈ `products` | 5,000,000 rows first | ≈ 10,000,000 |
-
-The cost model (cost of children + size of the join result) picks the second
-order, joining the selective dimension first. That's the decision a human
-would make, and the optimizer makes it automatically when
-`optimizer.enable_join_reorder=true`.
-
-### 4.6 Why a barrier instead of "just run the catalog command first"
-
-If the resolver created the table while planning, then:
-
-- `EXPLAIN CREATE TABLE … AS SELECT …` would create the table.
-- A planning error *after* the create would leave an empty, orphaned table.
-
-With a barrier, planning has no side effects. At execution time the barrier
-runs the create command to completion, then starts the write, and both appear
-in one plan you can inspect with `EXPLAIN`.
-
----
-
-## 5. End-to-End: A Logical Node's Journey
-
-Take `spark.range(1_000_000).selectExpr("id % 10 AS k").groupBy("k").count().show()`:
-
-| # | Stage | Plan shape |
-|---|-------|------------|
-| 1 | Resolver | ShowString( Aggregate( Projection( **RangeNode**(0..1e6) ) ) ) |
-| 2 | Logical optimizer | Projection simplified. ShowString and Range stay as extension nodes. |
-| 3 | Extension planner | RangeNode → RangeExec (split across target partitions). ShowString → ShowStringExec. Aggregate → partial and final AggregateExec. |
-| 4 | Physical optimizer | Enforce distribution inserts a hash repartition on `k` between the partial and final aggregates. Sail's rules check the plan. |
-| 5 | Job runner | Executes. ShowStringExec returns one batch with the formatted table. |
-
----
-
-## 6. Adding a New Operator
-
-1. **Logical node** in `sail-logical-plan`: implement DataFusion's user-defined
-   logical node interface (name, inputs, schema, expressions, and how to rebuild
-   with new inputs). Keep it free of side effects.
-2. **Physical operator** in `sail-physical-plan`: implement `ExecutionPlan`
-   (properties such as partitioning and ordering, `execute` returning a stream).
-3. **Planner case** in `sail-session/src/planner.rs`: map node → operator.
-4. **Resolver** in `sail-plan`: produce the node from the right spec plan
-   (see [07](07-plan-resolver.md)).
-5. **Cluster support**: if the operator must run on workers, add it to the plan
-   codec so it can be serialized and sent to workers (see
-   [09](09-local-and-cluster-execution.md)).
-6. **Optimizer interaction**: if the operator has partitioning or ordering
-   requirements, declare them so the distribution and sorting rules work around
-   it.
-
----
-
-## 7. Where to Look
-
-| Topic | Location |
-|-------|----------|
-| Logical extension nodes | `crates/sail-logical-plan/src/` |
-| Physical operators | `crates/sail-physical-plan/src/` |
-| Catalog command node and operator | `crates/sail-plan/src/catalog.rs`, `crates/sail-physical-plan/src/catalog_command.rs` |
-| Extension planner (node → operator) | `crates/sail-session/src/planner.rs` |
-| Logical rule list | `crates/sail-logical-optimizer/src/lib.rs`, `crates/sail-session/src/optimizer.rs` |
-| Physical rule list | `crates/sail-physical-optimizer/src/lib.rs` |
-| Join reordering | `crates/sail-physical-optimizer/src/join_reorder/` (`graph.rs`, `cardinality_estimator.rs`, `enumerator.rs`, `cost_model.rs`, `reconstructor.rs`) |
-| Barrier and collect-left rules | `crates/sail-physical-optimizer/src/barrier.rs`, `collect_left.rs` |
-| Streaming rewrite | `crates/sail-plan/src/streaming/rewriter.rs`, `crates/sail-logical-plan/src/streaming/` |
+Sail's logical extension nodes are in crates/sail-logical-plan/src and their
+physical operators in crates/sail-physical-plan/src. The catalog command node is
+defined in crates/sail-plan/src/catalog.rs. The planner that maps nodes to
+operators is crates/sail-session/src/planner.rs. The logical rule list is
+assembled in crates/sail-logical-optimizer/src/lib.rs and
+crates/sail-session/src/optimizer.rs, and the physical rule list in
+crates/sail-physical-optimizer/src/lib.rs. Join reordering lives under
+crates/sail-physical-optimizer/src/join_reorder/ (graph.rs,
+cardinality_estimator.rs, enumerator.rs, cost_model.rs, reconstructor.rs), and
+the barrier and collect-left rules sit next to it in barrier.rs and
+collect_left.rs. The streaming rewrite is in crates/sail-plan/src/streaming/.

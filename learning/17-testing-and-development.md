@@ -1,192 +1,143 @@
-# 17 · Testing and Development Workflow
+# 17 · Testing and Development
 
-> **You'll learn:** how the repository is laid out, how to build Sail (Rust and
-> Python), the kinds of tests and when to use each, how gold data and snapshot
-> tests work, how the PySpark test suite is run against Sail, and a practical
-> workflow for making a change.
-
-
-## In One Minute
-
-- Rust code is built with `cargo`. The Python package `pysail` is built with
-  `maturin` inside `hatch` environments.
-- **Gold data** JSON files lock in exact outputs for SQL syntax, expressions, and
-  functions. Regenerate them with `SAIL_UPDATE_GOLD_DATA=1 cargo test` and commit
-  the diff.
-- **Python tests** run real PySpark code against an in-process Sail server.
-- Spark's own test suite and the Ibis test suite are run against Sail to track
-  compatibility.
-- A typical change: reproduce → fix → update gold data → run the area's Python
-  tests → update compatibility data → format and lint.
+This doc is a practical guide to working on Sail: how the repository is laid
+out, how to build it, which kinds of tests exist and what each is good for, how
+the "gold data" tests work, and a sensible workflow for making a change.
 
 ---
 
-## 1. Repository Map
+## Finding your way around
 
-| Path | Contents |
-|------|----------|
-| `crates/` | All Rust crates (about 35). See the crate map in [README](README.md). |
-| `python/pysail/` | The `pysail` Python package: server wrapper, CLI shims, examples, compatibility data, and **Python tests** |
-| `docs/` | The public documentation site (VitePress) |
-| `scripts/` | Spark test harness, gold data bootstrap, build helpers |
-| `docker/`, `k8s/`, `deployments/`, `compose.yml` | Container images, Kubernetes manifests, local service stacks (for example for HMS or MinIO) |
-| `pyproject.toml` | Python build (maturin) and `hatch` environments for development and testing |
-| `Cargo.toml` | Rust workspace |
+Rust code lives in crates/, about 35 crates in total; the README's crate list
+says which doc covers each. The Python package, pysail, lives in
+python/pysail/, along with its tests, examples, and the compatibility data that
+tracks which Spark functions are supported. The public documentation site is in
+docs/. Scripts for running Spark's own test suite and for collecting gold data
+are in scripts/. Container images, Kubernetes manifests, and a compose file for
+local services such as a Hive Metastore or MinIO live in docker/, k8s/,
+deployments/, and compose.yml. Two files tie it together: Cargo.toml defines the
+Rust workspace, and pyproject.toml defines the Python build and the hatch
+environments used for development.
 
----
+## Building
 
-## 2. Building
+pysail is a Rust extension module built with PyO3 and maturin, plus some Python
+code, so the sail binary and the Python package share all of the engine code.
+You build the Rust crates with `cargo build`, and a release CLI binary with
+`cargo build -r -p sail-cli --bins`. To use your changes from Python, run
+`hatch run maturin develop`, which builds pysail and installs it into the
+development environment. `hatch run maturin build` builds a wheel instead, and
+`hatch run install-pysail` installs a built wheel into the test environment.
+Before sending a change, format and lint with `cargo +nightly fmt`,
+`cargo clippy --all-targets --all-features`, and `hatch fmt`.
 
-| Goal | Command |
-|------|---------|
-| Build Rust crates | `cargo build` |
-| Build the CLI binary (release) | `cargo build -r -p sail-cli --bins` |
-| Build and install `pysail` into the dev environment | `hatch run maturin develop` |
-| Build a wheel | `hatch run maturin build` (add `--release`) |
-| Install a built wheel into the test environment | `hatch run install-pysail` |
-| Format and lint | `cargo +nightly fmt`, `cargo clippy --all-targets --all-features`, `hatch fmt` |
+Builds of the full workspace are slow, so test one crate at a time with
+`cargo test -p <crate>` while iterating. The development docs under
+docs/development/ have a recipe for reducing build times with linker and
+profile settings, as well as setup instructions, debugging tips, and notes on
+cross-compiling.
 
-The `pysail` package is a Rust extension (built with PyO3 and maturin) plus
-Python modules. The `sail` binary and `pysail` share all of the engine code.
+## The kinds of tests, and when to use each
 
-See `docs/development/` (setup, build, recipes) for prerequisites, faster builds,
-debugging, and cross-compilation.
+**Rust unit tests** live next to the code they test and are the right tool for
+algorithms and small components: partition coalescing, parsers, the plan codec,
+actor behavior.
 
----
+**Gold data tests** lock in Sail's exact output for large sets of inputs: SQL
+syntax, expressions, functions, data types, and plans. They're described in
+detail below.
 
-## 3. Kinds of Tests
+**Python integration tests** under python/pysail/tests/ start a real Sail server,
+usually inside the test process through pysail, and run PySpark code against it.
+Their folders mirror Sail's components, with tests for aggregation, catalogs,
+data sources, Delta, Iceberg, execution, functions, Glue, Hive Metastore,
+streaming, and more. Some of them use pytest-bdd **feature files**, readable
+scenario tables describing behaviors, and some use **snapshot tests** that
+store expected plans or outputs in files, refreshed with `--snapshot-update`.
 
-| Kind | Where | Run with | Good for |
-|------|-------|----------|----------|
-| **Rust unit tests** | `#[cfg(test)]` modules in each crate | `cargo test -p <crate>` | Algorithms, small components (coalescing, parsers, codecs, actors) |
-| **Gold data tests** | `crates/*/tests/gold_data/*.json` | `cargo test` | Locking in exact outputs for SQL syntax, expressions, functions, data types, and plans |
-| **Python integration tests** | `python/pysail/tests/` | `hatch run pytest` | End-to-end PySpark behavior against a real Sail server |
-| **BDD feature tests** | `*.feature` files with pytest-bdd | `hatch run pytest` | Readable scenario tables (for example function behaviors, Iceberg and Delta features) |
-| **Snapshot tests** | `__snapshots__/` (syrupy) | `hatch run pytest`, with `--snapshot-update` to refresh | Plan and output snapshots for features |
-| **Spark's own test suite** | Patched PySpark test suite run against Sail | `scripts/spark-tests/*.sh` | Broad compatibility tracking |
-| **Ibis tests** | The Ibis backend test suite against Sail | `hatch run test-ibis:…` | Third-party DataFrame library compatibility |
-| **Ignored integration tests** | For example HMS with Kerberos | `cargo test … -- --ignored` | Tests that need external services (containers) |
+Beyond its own tests, Sail is regularly checked against **Spark's own PySpark
+test suite**. Scripts build a patched PySpark (3.5 or 4.1), start a Sail server,
+run the suite against it, and produce a report of what passed and failed. This
+is how compatibility is tracked over time. The **Ibis** project's backend test
+suite is run the same way. A few integration tests need external services, such
+as a Kerberos-secured Hive Metastore, and are marked as ignored so they only run
+when asked for explicitly.
 
-### 3.1 Gold data tests
+## Gold data: reviewing behavior like code
 
-**Gold data** records the **actual** output of many inputs (SQL statements,
-expressions, function calls) in JSON files that are reviewed like code:
+A gold data file records the *actual* output Sail produces for many inputs, in
+JSON, and is committed and reviewed like code. An entry looks like this:
 
 ```json
 { "input":  { "query": "SELECT map(1.0, '2', 3.0, '4');",
               "result": ["{1.0:\"2\",3.0:\"4\"}"],
-              "schema": { "type": "struct", "fields": [ … ] } },
+              "schema": { "type": "struct", "fields": [ ... ] } },
   "output": { "success": "ok" } }
 ```
 
-- **Inputs** are collected once from the Spark project's own tests by a bootstrap
-  script (`scripts/spark-gold-data/bootstrap.sh`, with a Spark patch). This is
-  rare, mainly when Spark is upgraded.
-- **Outputs** are what Sail produces: success, a result, or an error message.
-- When you change behavior, regenerate and **commit** the gold data so reviewers
-  see the difference:
+The input side, the query along with the result and schema Spark produced, was
+collected once from Spark's own test suite by a bootstrap script, which is rerun
+only when Spark is upgraded. The output side records what Sail does with that
+input: success, or the error message it produced. When you change behavior, you
+regenerate the outputs and commit them:
 
 ```bash
-env SAIL_UPDATE_GOLD_DATA=1 cargo test     # rewrite outputs
-cargo test                                  # verify they're stable
+env SAIL_UPDATE_GOLD_DATA=1 cargo test     # rewrite outputs from the current code
+cargo test                                  # confirm they're stable
 ```
 
-Gold data lives in, for example, `crates/sail-sql-parser/tests/gold_data/`
-(syntax) and `crates/sail-spark-connect/tests/gold_data/` (data types,
-expressions, functions by category, plans, table schemas).
+The value of this approach shows up in code review. Suppose you fix concat so it
+returns NULL when any argument is NULL. The diff shows exactly that change in
+the one entry that exercises it. If ten other functions' outputs changed too,
+that's obvious in the diff and worth investigating before merging. Gold data
+lives under tests/gold_data/ in the crates that use it, such as sail-sql-parser
+for syntax and sail-spark-connect for data types, expressions, functions by
+category, plans, and table schemas.
 
-### 3.2 Python tests
+## A workflow for fixing a function
 
-Python tests start a Sail Spark Connect server, usually in-process through
-`pysail`, and run PySpark code against it. Folders mirror the components:
-`aggregate`, `catalog`, `catalog_integration`, `datasource`, `delta`,
-`iceberg`, `execution`, `function`, `glue`, `hms`, `literal`, `optimizer`,
-`streaming`, and more. Some tests run against a real Spark as well, to compare
-results.
+Suppose a Spark function returns the wrong answer. Start by reproducing it:
+build pysail with `hatch run maturin develop` and write a small failing test in
+python/pysail/tests/spark/function/, or a quick script against a development
+server. Find the function's builder in sail-plan's function tables and, if it
+has its own implementation, the code in sail-function (see
+[15](15-functions-and-python-udfs.md)). Fix it, and add a Rust unit test if the
+logic stands on its own.
 
-```bash
-hatch run maturin develop          # build pysail into the env
-hatch run pytest                   # all Python tests
-hatch run pytest python/pysail/tests/spark/delta -k merge
-env SPARK_REMOTE="sc://localhost:50051" hatch run pytest   # against an already-running server
-```
+Then regenerate gold data with `env SAIL_UPDATE_GOLD_DATA=1 cargo test` and read
+the diff carefully, making sure only the outputs you intended changed. Run the
+Python tests for the area and refresh snapshots if needed. If the function's
+support status changed, update the compatibility data. Finish by formatting and
+linting.
 
-### 3.3 Running Spark's test suite
+## A workflow for a cluster-only bug
 
-`scripts/spark-tests/` builds a patched PySpark (3.5 or 4.1), starts a Sail
-server (`run-server.sh`), runs PySpark's tests against it (`run-tests.sh`), and
-summarizes the results (`generate-test-report.sh`, plus `jq` scripts to list
-passed and failed tests and count errors). CI uses this to track compatibility
-over time. See `docs/development/spark-tests/`.
+If something fails only in cluster mode, reproduce it with a local cluster by
+setting SAIL_MODE=local-cluster (see [09](09-local-and-cluster-execution.md)).
+Turn on detailed logs with `RUST_LOG=sail_execution=debug,info`: the task runner
+logs each task's final plan, and the driver logs its state changes. Query
+system.execution.stages and system.execution.tasks to see which stage and
+attempt failed. If an operator can't be sent to workers, look at the plan codec
+in sail-execution's codec.rs.
 
----
+## A few habits that help
 
-## 4. A Practical Workflow for a Change
+Test one crate at a time rather than the whole workspace. Prefer gold data and
+feature files over ad-hoc assertions when the thing you're testing is Spark
+behavior, because reviewers can see the exact change and the expected outputs
+are easy to regenerate. Use RUST_LOG with a crate name and debug to see what
+Sail is doing: every Spark Connect request and response, every task plan, and
+every storage call is logged at that level. And when something is running on a
+cluster, the system tables are the fastest way to see what's going on.
 
-**Example: fix a Spark function's behavior.**
+## Where to look in the code
 
-1. **Reproduce.** Write a failing PySpark snippet against a dev server:
-   `hatch run maturin develop`, then a quick script or a new test in
-   `python/pysail/tests/spark/function/`.
-2. **Locate.** Find the function in `sail-plan/src/function/…` (the builder) and,
-   if needed, `sail-function/src/…` (the implementation). See
-   [15](15-functions-and-python-udfs.md).
-3. **Fix**, and add a Rust unit test if the logic is self-contained.
-4. **Update gold data:** `env SAIL_UPDATE_GOLD_DATA=1 cargo test`. Review the JSON
-   diff and make sure only the intended outputs changed.
-5. **Run Python tests** for the area, and update snapshots if needed
-   (`--snapshot-update`).
-6. **Update compatibility data** in `python/pysail/data/compatibility/` if
-   support status changed.
-7. **Format and lint:** `cargo +nightly fmt`, `cargo clippy …`, `hatch fmt`.
-
-**Example: debug a cluster-only failure.**
-
-1. Reproduce with `SAIL_MODE=local-cluster` (see
-   [09](09-local-and-cluster-execution.md)).
-2. Turn on logs: `RUST_LOG=sail_execution=debug,info`. The task runner logs each
-   task's rewritten physical plan, and the driver logs state transitions.
-3. Look at `system.execution.stages` and `system.execution.tasks`.
-4. If an operator fails to serialize, look at the plan codec
-   (`sail-execution/src/codec.rs`).
-
-### 4.1 What a gold data change looks like in review
-
-Fixing `concat` to return NULL when any argument is NULL changes one gold entry:
-
-```diff
-   "input": { "query": "SELECT concat('a', NULL);" },
--  "output": { "success": { "result": ["a"] } }
-+  "output": { "success": { "result": ["NULL"] } }
-```
-
-The reviewer sees exactly which behaviors changed. Unintended changes (for
-example, ten other functions changing output at the same time) are obvious in
-the diff. (The JSON above is simplified to show the shape of the change.)
-
----
-
-## 5. Tips
-
-| Tip | Why |
-|-----|-----|
-| Use `cargo test -p <crate>` | Rebuilding and testing the whole workspace is slow |
-| Read `docs/development/recipes/reducing-build-time.md` | Linker and profile settings that speed up builds a lot |
-| Prefer gold data or feature files over ad-hoc asserts for Spark behavior | Reviewers see the exact behavior change, and outputs are easy to regenerate |
-| Use `RUST_LOG=<crate>=debug` | Every Spark Connect request and response, task plan, and object store call is logged at debug level |
-| Use the system tables | Fastest way to see what the cluster is doing |
-
----
-
-## 6. Where to Look
-
-| Topic | Location |
-|-------|----------|
-| Development docs | `docs/development/` (`setup/`, `build/`, `recipes/`, `spark-tests/`) |
-| Contributor guide | `CONTRIBUTING.md`, `docs/development/architecture-contributor-guide.md` |
-| Gold data helpers | `crates/sail-common/src/tests.rs` (`SAIL_UPDATE_GOLD_DATA`), `crates/sail-gold-test/` |
-| Gold data files | `crates/*/tests/gold_data/` |
-| Gold data bootstrap | `scripts/spark-gold-data/` |
-| Spark test harness | `scripts/spark-tests/` |
-| Python tests | `python/pysail/tests/` |
-| Hatch environments | `pyproject.toml` (`[tool.hatch.envs.*]`) |
+The development docs are in docs/development/ (setup/, build/, recipes/, and
+spark-tests/), and contributor guidance is in CONTRIBUTING.md and
+docs/development/architecture-contributor-guide.md. The gold data helper,
+including the SAIL_UPDATE_GOLD_DATA switch, is in crates/sail-common/src/tests.rs,
+with supporting code in crates/sail-gold-test. Gold data files are under
+tests/gold_data/ in each crate that uses them, and the bootstrap script is in
+scripts/spark-gold-data/. The Spark test harness is in scripts/spark-tests/, the
+Python tests in python/pysail/tests/, and the hatch environments in
+pyproject.toml.

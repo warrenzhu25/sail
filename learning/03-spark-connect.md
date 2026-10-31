@@ -1,212 +1,59 @@
-# 03 · Spark Connect: The Front Door
+# 03 · Spark Connect: How PySpark Talks to Sail
 
-> **You'll learn:** how a PySpark client talks to Sail, how Spark protobuf
-> messages become Sail plans, how results stream back, and how sessions,
-> configuration, errors, reconnection, and cancellation work.
->
-> **Crate:** `sail-spark-connect`
-
-
-## In One Minute
-
-- PySpark builds a **plan** in the client and sends it over gRPC. Sail is the
-  server that runs it, so existing PySpark code works unchanged.
-- Each request is translated **once** into Sail's spec plan, and nothing deeper
-  in Sail sees Spark protobuf.
-- Results stream back as Arrow batches, with **heartbeats** (every 15 seconds)
-  and **reattach** support for dropped connections.
-- `spark.sql("SELECT …")` is lazy, but `spark.sql("CREATE …")` runs immediately,
-  just like in Spark.
-- Errors come back as the Spark exception class PySpark expects
-  (`AnalysisException`, `ParseException`, …).
-
----
-
-## 1. What This Component Does
-
-**Spark Connect** is the client/server protocol introduced in Spark 3.4. A
-PySpark program using Spark Connect doesn't run a JVM. It builds a description
-of the query (a tree of protobuf *relations*) and sends it over gRPC to a
-server. Sail implements that server, so **unchanged PySpark code** can run on
-Sail just by pointing the client at Sail's address:
+Spark Connect, introduced in Spark 3.4, split Spark into a thin client and a
+server. A PySpark program using Spark Connect doesn't run a JVM at all. It
+builds a description of what it wants, sends that description over gRPC, and
+receives results back. Sail implements the server side of this protocol, which
+is why existing PySpark code runs on Sail unchanged: you only point the client
+at a different address.
 
 ```python
 spark = SparkSession.builder.remote("sc://sail-host:50051").getOrCreate()
 ```
 
-This crate is responsible for:
-
-1. serving the Spark Connect gRPC API,
-2. finding or creating the client's session,
-3. **translating** Spark's protobuf plans into Sail's protocol-neutral spec plan
-   (see [05 · The Spec Plan Model](05-spec-plan-and-config.md)),
-4. handing the plan to the planner and job runner,
-5. **streaming** results back as Arrow batches, with heartbeats, reconnection,
-   and cancellation,
-6. translating Sail errors into the exception classes PySpark expects.
+This doc follows one PySpark action through the Spark Connect front end and
+explains the design decisions along the way: why translation happens
+immediately, how results are streamed, how dropped connections are survived, and
+how errors are made to look exactly like Spark's.
 
 ---
 
-## 2. Why It's Built This Way
+## Compatibility at the wire, not in the code
 
-**Compatibility at the wire, not in the code.** Sail doesn't reimplement
-PySpark. It reimplements the protocol PySpark speaks. Everything the client
-library does (DataFrame building, pandas conversion, error display) keeps
-working because Sail sends exactly the messages a Spark server would.
+An obvious way to support PySpark would be to reimplement its API. Sail doesn't
+do that. It reimplements the *protocol* that PySpark speaks. Everything the
+client library does locally, including building DataFrames, converting results
+to pandas, and formatting errors, keeps working, because Sail sends exactly the
+messages a real Spark server would send.
 
-**Translate once, at the edge.** Spark's protobuf has roughly 60 relation types
-and many commands. This crate converts them into the spec plan **right away**.
-Nothing deeper in Sail sees Spark protobuf, so the planner is shared with SQL
-and Flight SQL, and protocol quirks stay in one crate.
+The protocol is a handful of RPCs. ExecutePlan runs a query or a command and is
+by far the most important. AnalyzePlan answers questions about a plan without
+running it, such as its schema or its explain string. Config reads and writes
+session settings. Others upload artifacts like Python files, cancel running
+operations, reconnect to running operations, acknowledge received results, and
+end sessions. Sail also accepts gzip- and zstd-compressed messages.
 
-**Results are buffered for reconnection.** Long-running queries over unreliable
-networks drop connections. Spark Connect lets a client **reattach** to a running
-operation and continue from the last response it received. Sail supports this
-by buffering each response, with an ID, until the client confirms it has
-received it.
+## Finding the session
 
-**Heartbeats keep idle streams alive.** A query can take minutes before
-producing its first row. Proxies and load balancers often close connections
-that are silent for too long. Sail sends an empty batch every 15 seconds
-(`spark.execution_heartbeat_interval_secs`) while it waits.
+Every request carries a session ID and a user ID. The first thing Sail does is
+ask the session manager (see [06](06-session-and-runtime.md)) for that session,
+creating it if this is the first request. A Spark Connect session holds the IDs,
+the user's Spark settings, the operations currently running, and any streaming
+queries. Sail sets the session time zone to the server's local time zone by
+default. A session that receives no requests for 15 minutes
+(spark.session_timeout_secs) is removed.
 
----
+Some Spark settings change how a query is interpreted, not just how it runs.
+When a plan is resolved, Sail collects these into a small *plan config*: the
+session time zone, whether ANSI mode is on, whether a plain TIMESTAMP means "with
+local time zone" or "without time zone", the default table format, the warehouse
+directory, whether implicit cross joins are allowed, whether to use 64-bit Arrow
+string offsets, and the pandas settings that Python UDFs need. Changing any of
+these with `spark.conf.set` takes effect on the next query.
 
-## 3. How It Works
+## Translating once, at the edge
 
-### 3.1 The RPC surface
-
-| RPC | Purpose | Sail behavior |
-|-----|---------|---------------|
-| `ExecutePlan` | Run a query (`Root` relation) or a command | Main path, see 3.3. Compressed plans aren't supported. |
-| `AnalyzePlan` | Ask about a plan without running it | Schema, explain, tree string, is-local, is-streaming, Spark version, DDL parsing, JSON-to-DDL, storage level. `persist`/`unpersist` are accepted but do nothing. Input files, same-semantics, and semantic-hash return "not implemented". |
-| `Config` | Get, set, or unset session settings | Stored per session. Some settings are read-only, and removed settings produce warnings. |
-| `AddArtifacts`, `ArtifactStatus` | Upload Python files, JARs, and other artifacts | Handled by the artifact manager. |
-| `Interrupt` | Cancel operations | By all, by tag, or by operation ID. |
-| `ReattachExecute` | Reconnect to a running operation | Replays buffered responses after the last one the client saw. |
-| `ReleaseExecute` | Tell the server the client has received responses | Frees buffered responses up to an ID, or all of them. |
-| `ReleaseSession` | End a session | Removes the session from the session manager. |
-| `FetchErrorDetails`, `CloneSession` | Error details, session cloning | Limited support. |
-
-The service accepts and sends **gzip** and **zstd** compressed messages and
-uses Spark's default maximum inbound message size.
-
-### 3.2 Sessions
-
-Each request carries a **session ID** and a **user ID**. The session manager
-(see [06 · Sessions and Runtime](06-session-and-runtime.md)) returns the
-existing session or creates one through a Spark-specific factory. That factory:
-
-- attaches a **Spark session** extension holding the session and user IDs, the
-  Spark configuration, running operations ("executors"), and streaming queries,
-- sets `spark.sql.session.timeZone` to the server's system time zone by default,
-- sets an idle timeout of 15 minutes (`spark.session_timeout_secs`), after
-  which an unused session is removed.
-
-**Spark settings that change planning.** When a plan is resolved, the session's
-Spark settings are turned into a **plan config**, the set of settings that
-affect how a query is interpreted:
-
-| Spark setting | Effect in Sail |
-|---------------|----------------|
-| `spark.sql.session.timeZone` | Time zone for timestamp functions and casts |
-| `spark.sql.ansi.enabled` | ANSI SQL mode: errors instead of NULLs on overflow and invalid casts |
-| `spark.sql.timestampType` | Whether `TIMESTAMP` means `TIMESTAMP_LTZ` (default) or `TIMESTAMP_NTZ` |
-| `spark.sql.sources.default` | Default file format for tables |
-| `spark.sql.warehouse.dir` | Where managed tables are stored |
-| `spark.sql.crossJoin.enabled` | Whether implicit cross joins are allowed |
-| `spark.sql.execution.arrow.useLargeVarTypes` | Use 64-bit-offset Arrow strings and binaries |
-| Pandas UDF settings (assign columns by name, safe conversion, …) | Passed to the Python UDF runtime |
-
-### 3.3 Running a query, step by step
-
-1. **Find the session** for the session ID and user ID.
-2. **Pick a handler.** A `Root` relation is a query. A `Command` is dispatched
-   by type: register function, write (v1 and v2), create view, SQL command,
-   streaming start and management, register table function, register data
-   source, checkpoint, merge into table, and so on. Unsupported commands
-   (ML, pipelines, resource profiles, extensions) return "not implemented".
-3. **Translate to a spec plan.** The relation tree is converted node by node.
-   Expressions, literals, and data types each have their own converters.
-4. **Resolve and plan.** The spec plan and the session's plan config go to the
-   planner, which returns a physical plan (see
-   [07 · The Plan Resolver](07-plan-resolver.md)).
-5. **Execute.** The physical plan goes to the session's job runner, which returns
-   a stream of Arrow batches (see
-   [09 · Local and Cluster Execution](09-local-and-cluster-execution.md)).
-6. **Stream the response** in one of two modes:
-   - **Lazy** (queries): an *executor* task reads the stream and sends a
-     **schema** message, then **Arrow batch** messages, then **complete**. If the
-     result is empty, it still sends one empty batch so the client learns the
-     schema. Each message gets a UUID and is kept in the buffer until released.
-   - **Eager silent** (most commands): the stream is read to the end right away,
-     which makes the side effect happen, then only "complete" is sent.
-7. **Wrap each message** as an `ExecutePlanResponse` with the session ID,
-   operation ID, and response ID.
-
-### 3.4 SQL commands vs. SQL queries
-
-`spark.sql("…")` arrives as a **SQL command**. Sail first translates it:
-
-- If it's a **query** (`SELECT …`), Sail doesn't run it yet. It returns the
-  relation to the client, which runs it later when you call `.show()` or
-  `.collect()`. This matches Spark's lazy DataFrames.
-- If it's a **command** (`CREATE TABLE`, `INSERT`, `SET`, …), Sail runs it
-  **immediately**, collects the output into one batch, and returns it as a local
-  relation. This matches Spark, where `spark.sql("CREATE TABLE …")` takes effect
-  before the call returns.
-
-### 3.5 Reattach and release
-
-When the client sets the *reattachable* option (PySpark does by default):
-
-- Every response is buffered with its ID.
-- If the connection drops, the client calls `ReattachExecute` with the last
-  response ID it received. Sail pauses the executor task, replays buffered
-  responses after that ID, and resumes reading the stream.
-- As the client processes responses, it calls `ReleaseExecute` so Sail can drop
-  them from the buffer and keep memory bounded.
-
-### 3.6 Interrupts
-
-`Interrupt` can target every operation in the session, operations with a given
-**tag** (set by the client with `spark.addTag`), or one **operation ID**. The
-matching executors are stopped, and the response lists the IDs that were
-interrupted.
-
-### 3.7 Streaming queries
-
-`writeStream.start()` starts a streaming plan. Its stream is attached to a
-**streaming query** object in the session. Later commands, such as status, stop,
-await termination, and the query manager's list and get, work on these objects.
-The client-side listener bus isn't supported yet.
-
-### 3.8 Errors
-
-Sail errors are mapped to Spark exception classes so PySpark raises the right
-Python exception:
-
-| Kind of problem | Spark class the client sees |
-|-----------------|-----------------------------|
-| SQL syntax error | `ParseException` |
-| Unknown table, column, or function; type mismatch | `AnalysisException` |
-| Failure while running | `QueryExecutionException`, `SparkRuntimeException` |
-| Bad number or argument | `NumberFormatException`, `IllegalArgumentException` |
-| Overflow or division error (ANSI mode) | `ArithmeticException` |
-| Date and time parsing | `DateTimeException` |
-| Python UDF error | `PythonException` |
-| Not supported yet | `UnsupportedOperationException` |
-
-Like Spark, every exception is sent with gRPC status `INTERNAL`, plus error
-details naming the class. Messages are cut off at about 3.7 KB because gRPC
-limits total header size to 16 KB, and long Python tracebacks would otherwise
-break the response. Cancellations use the `CANCELLED` status.
-
----
-
-## 4. Examples
-
-### 4.1 A DataFrame query
+Let's follow a typical action:
 
 ```python
 df = (spark.read.parquet("s3://bucket/orders")
@@ -215,130 +62,140 @@ df = (spark.read.parquet("s3://bucket/orders")
 df.show()
 ```
 
-What Sail receives when `.show()` runs: a `Root` relation that is roughly
-*ShowString(Aggregate(Filter(Read(parquet, s3://bucket/orders))))*. The
-translator produces a spec query plan with a read node, a filter node holding
-the unresolved expression `amount > 100`, an aggregate node grouping by the
-unresolved column `region`, and a show-string node. The result streams back as
-one Arrow batch containing the formatted table text.
+When `show()` runs, PySpark sends ExecutePlan with a tree of protobuf
+*relations*: roughly "show the result of aggregating the result of filtering the
+result of reading these files", plus a fresh operation ID.
 
-### 4.2 A SQL command
+Sail's first move is to translate this tree into its own neutral spec plan (see
+[05](05-spec-plan-and-config.md)): a read node, a filter node holding the
+unresolved expression amount > 100, an aggregate node grouping by an unresolved
+column called region, and a show-string node on top. Spark's protocol has about
+sixty relation types and many command types, each with its own converter.
+Expressions, literals, and data types have converters too.
 
-```python
-spark.sql("CREATE TABLE t (id INT) USING parquet")   # runs now
-df = spark.sql("SELECT * FROM t")                    # doesn't run yet
-df.collect()                                         # runs now
-```
+Why translate immediately? Because it keeps Spark's protocol from leaking into
+the rest of Sail. Nothing past this point ever sees a Spark protobuf. The
+resolver, the optimizer, and the execution engine work on the same spec plan
+whether the request came from PySpark, from SQL text, or from a Flight SQL
+client. Protocol quirks stay in one crate, and features don't have to be
+implemented twice.
 
-### 4.3 Session settings
+The spec plan then goes to the resolver and planner (see
+[07](07-plan-resolver.md)), which return a physical plan. That plan is handed to
+the session's job runner (see [09](09-local-and-cluster-execution.md)), which
+starts executing it and returns a stream of Arrow record batches.
 
-```python
-spark.conf.set("spark.sql.session.timeZone", "UTC")
-spark.conf.set("spark.sql.ansi.enabled", "true")
-spark.sql("SELECT CAST('abc' AS INT)").show()  # raises an error in ANSI mode
-```
+## Streaming results back
 
-### 4.4 Cancelling with tags
+For a query, Sail starts an *executor*: a small background task that reads the
+result stream and turns it into Spark Connect responses. It sends the schema
+first, then one message per Arrow batch, then a completion message. If the
+result is empty, it still sends one empty batch so the client learns the column
+types. Each message gets a unique response ID.
 
-```python
-spark.addTag("nightly")
-# ... start long-running queries in other threads ...
-spark.interruptTag("nightly")
-```
+Two features make this streaming robust. The first is heartbeats. A query might
+run for minutes before producing its first row, and proxies and load balancers
+often cut connections that stay silent too long. So while it waits, the
+executor sends an empty batch every 15 seconds
+(spark.execution_heartbeat_interval_secs).
 
-### 4.5 What travels over the wire for one `collect()`
-
-Simplified message sequence for a query that returns two batches:
+The second is reconnection. PySpark marks its operations as *reattachable*,
+which means Sail keeps each response in a buffer until the client confirms it
+has received it. If the network drops in the middle of a long result, the client
+reconnects and says which response it saw last, and Sail replays everything
+after that from its buffer, then continues. Here's what a two-batch result looks
+like on the wire, slightly simplified:
 
 ```text
-Client → Server   ExecutePlan(session=S, operation=O, plan=Root(...), reattachable=true)
-Server → Client   ExecutePlanResponse(response_id=r1, schema=<id: long, name: string>)
-Server → Client   ExecutePlanResponse(response_id=r2, arrow_batch=<rows 0..8191>)
-Client → Server   ReleaseExecute(operation=O, until=r2)        # server can drop r1, r2
-Server → Client   ExecutePlanResponse(response_id=r3, arrow_batch=<rows 8192..9999>)
-Server → Client   ExecutePlanResponse(response_id=r4, result_complete)
-Client → Server   ReleaseExecute(operation=O, all)
+Client → Server   ExecutePlan(session=S, operation=O, reattachable)
+Server → Client   response r1: schema
+Server → Client   response r2: Arrow batch (rows 0–8191)
+Client → Server   ReleaseExecute(O, up to r2)          ← Sail may now forget r1 and r2
+Server → Client   response r3: Arrow batch (rows 8192–9999)
+Server → Client   response r4: complete
+Client → Server   ReleaseExecute(O, all)
 ```
 
-If the connection breaks after `r2`, the client sends
-`ReattachExecute(operation=O, last_response_id=r2)` and Sail replays `r3`, `r4`
-from its buffer, then keeps streaming.
+If the connection had broken after r2, the client would send ReattachExecute
+naming r2, and Sail would replay r3 and r4. The release messages are what keep
+the buffer from growing forever.
 
-### 4.6 What an error looks like to the user
+## Commands run now; queries run later
+
+Not every request is a query. Most commands, such as writes and view creation,
+are run to completion right away, and only a completion message is returned.
+
+SQL strings need special care, because `spark.sql(...)` arrives as a single
+"SQL command" whether the text is a query or a command, and Spark treats the two
+differently. Sail translates the SQL first and checks which it is. For a query
+like `SELECT * FROM t`, it doesn't run anything. It returns the query back to the
+client as a relation, which runs later, when you call `show()` or `collect()`.
+That's Spark's normal laziness. For a command like `CREATE TABLE`, it runs the
+command immediately, collects its output into one small batch, and returns that.
+That matches Spark too: `spark.sql("CREATE TABLE …")` has already created the
+table by the time the call returns.
+
+## Cancelling and streaming queries
+
+Clients can cancel work with the Interrupt RPC, targeting every operation in the
+session, every operation with a given tag (set with `spark.addTag`), or a single
+operation ID. Sail removes the matching executors from the session, stops them,
+and reports which operation IDs were interrupted.
+
+Structured Streaming works through the same front end. Calling
+`writeStream.start()` resolves a streaming plan and attaches its result stream
+to a streaming query object kept in the session. Later commands check status,
+stop the query, wait for it to end, or list running queries by working on those
+objects. Client-side streaming listeners aren't supported yet.
+
+## Errors that look like Spark's
+
+When something fails, PySpark expects a particular exception class. Code like
+`except AnalysisException:` depends on it, and so do notebooks that format
+errors. So Sail classifies every error and sends the Spark class name PySpark
+expects. A syntax error becomes ParseException. An unknown table, column, or
+function becomes AnalysisException. A failure during execution becomes
+QueryExecutionException or SparkRuntimeException. Overflow in ANSI mode becomes
+ArithmeticException, a failing Python UDF becomes PythonException, and an
+unsupported feature becomes UnsupportedOperationException.
+
+Like Spark itself, Sail sends all of these with the gRPC status INTERNAL plus
+error details naming the class, and PySpark reads those details to raise the
+matching Python exception:
 
 ```python
 >>> spark.sql("SELECT no_such_column FROM range(1)").show()
 pyspark.errors.exceptions.connect.AnalysisException: ... cannot resolve attribute ...
 ```
 
-Behind the scenes: the resolver fails, the error is classified as an analysis
-error, and Sail sends gRPC status `INTERNAL` with error details naming
-`org.apache.spark.sql.AnalysisException`. PySpark reads the class name and
-raises the matching Python exception, which is why `except AnalysisException:`
-blocks in existing code keep working.
-
-### 4.7 Lazy vs. eager, side by side
-
-| Call | When Sail does the work | What the client gets back immediately |
-|------|-------------------------|----------------------------------------|
-| `df = spark.table("t").filter(...)` | Never (client-side only) | Nothing is sent |
-| `df.count()` | Now | The count |
-| `df2 = spark.sql("SELECT * FROM t")` | Only parsing and translation now. Execution later. | A relation describing the query |
-| `spark.sql("CREATE TABLE t2 (x INT)")` | Now, the table is created | An empty result |
-| `df.write.parquet(path)` | Now | Completion |
+One practical detail: gRPC limits the total size of response headers to 16 KB,
+and long Python tracebacks can easily exceed that. Sail cuts error messages off
+at about 3.7 KB and marks them as truncated. The full message is always in the
+server log.
 
 ---
 
-## 5. End-to-End: One `df.collect()`
+## Common problems
 
-| # | Where | What happens |
-|---|-------|--------------|
-| 1 | PySpark | Serializes the DataFrame's relation tree and calls `ExecutePlan` with a new operation ID and the reattachable option. |
-| 2 | Server | Reads the session ID and user ID, and gets or creates the session. |
-| 3 | Server | Sees a `Root` relation and calls the relation handler. |
-| 4 | Translator | Converts the relation tree to a spec query plan. |
-| 5 | Planner | Builds a plan config from the Spark settings, resolves the spec plan, and optimizes it into a physical plan. |
-| 6 | Job runner | Starts execution and returns a stream. |
-| 7 | Executor | Sends the schema, then each Arrow batch (or an empty one every 15 seconds while waiting), then "complete", buffering each by ID. |
-| 8 | PySpark | Receives batches, calls `ReleaseExecute` as it goes, and builds Python rows (or a pandas DataFrame for `toPandas`). |
-| 9 | If the network drops | PySpark calls `ReattachExecute` with the last response ID, and Sail replays the rest. |
+"Not implemented" errors mean the relation, command, or analysis type hasn't
+been built yet; the converters list every unsupported case explicitly, so that's
+the place to add support. If a DataFrame operation and the equivalent SQL
+return different results, the two translation paths produced different spec
+plans; turn on debug logging for this crate, which logs every request and
+response, and compare them. If long queries fail behind a proxy, lower the
+heartbeat interval below the proxy's idle timeout. If session settings seem to
+be forgotten, the session was probably idle for longer than 15 minutes and was
+removed.
 
----
+## Where to look in the code
 
-## 6. Extending and Debugging
-
-**Adding support for a new relation or command.** Find its `TODO` branch in the
-relation or command converter. Add a matching spec node if one doesn't exist
-(see [05 · The Spec Plan Model](05-spec-plan-and-config.md)), convert the
-protobuf fields into it, then teach the resolver to handle it (see
-[07 · The Plan Resolver](07-plan-resolver.md)).
-
-**Debugging a wrong result.** Turn on debug logging for this crate. Every
-request and response is logged at debug level. Compare the incoming relation
-with the spec plan it was translated to. If the spec plan already looks wrong,
-the bug is in this crate. If not, look at resolution.
-
-| Symptom | Likely cause |
-|---------|--------------|
-| `UnsupportedOperationException: … not implemented` | The relation, command, or analysis type isn't implemented yet. |
-| A DataFrame call and the same SQL return different results | The two translation paths produce different spec plans. |
-| Long queries fail behind a proxy | Heartbeat interval longer than the proxy's idle timeout. Lower `spark.execution_heartbeat_interval_secs`. |
-| Client error messages end in "[truncated]" | The message was longer than the gRPC header limit. Check the server log for the full message. |
-| Session settings "forgotten" | The session was idle for more than 15 minutes and was removed. Raise `spark.session_timeout_secs`. |
-
----
-
-## 7. Where to Look
-
-| Topic | Location |
-|-------|----------|
-| Server start | `crates/sail-spark-connect/src/entrypoint.rs` |
-| RPC implementations | `crates/sail-spark-connect/src/server.rs` |
-| Execution and analysis handlers | `crates/sail-spark-connect/src/service/` (`plan_executor.rs`, `plan_analyzer.rs`, `config_manager.rs`, `artifact_manager.rs`) |
-| Streaming responses, buffering, heartbeats | `crates/sail-spark-connect/src/executor.rs` |
-| Protobuf → spec conversion | `crates/sail-spark-connect/src/proto/` (`plan.rs`, `expression.rs`, `literal.rs`, `data_type*.rs`) |
-| Spark session extension | `crates/sail-spark-connect/src/session.rs` |
-| Session factory and timeout | `crates/sail-spark-connect/src/session_manager.rs` |
-| Spark settings → plan config | `crates/sail-spark-connect/src/config.rs` |
-| Error mapping | `crates/sail-spark-connect/src/error.rs` |
-| Streaming queries | `crates/sail-spark-connect/src/streaming.rs` |
+Everything lives in crates/sail-spark-connect. The server starts in
+src/entrypoint.rs, and the RPC implementations are in src/server.rs. The
+handlers for executing plans, analyzing plans, configuration, and artifacts are
+under src/service/. The executor that streams results, buffers them for
+reconnection, and sends heartbeats is in src/executor.rs. Translation from Spark
+protobuf to the spec plan is under src/proto/, with plan.rs handling relations
+and commands. The Spark session extension is in src/session.rs, the session
+factory and timeout in src/session_manager.rs, the mapping from Spark settings to
+the plan config in src/config.rs, error classification in src/error.rs, and
+streaming queries in src/streaming.rs.

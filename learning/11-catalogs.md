@@ -1,281 +1,193 @@
 # 11 · Catalogs: Finding Tables
 
-> **You'll learn:** how Sail turns a name like `prod.sales.orders` into a table
-> with a schema, format, and location; how multiple catalogs coexist; how
-> temporary views work; which metastores Sail supports and how to configure
-> them; and how caching and runtime isolation are layered on.
->
-> **Crates:** `sail-catalog` (interface, manager, commands, caching and runtime
-> wrappers), `sail-catalog-memory`, `sail-catalog-system`, `sail-catalog-glue`,
-> `sail-catalog-hms`, `sail-catalog-iceberg`, `sail-catalog-unity`,
-> `sail-catalog-onelake`
-
-
-## In One Minute
-
-- **Catalog providers** store metadata: in-memory, Glue, Hive Metastore, Iceberg
-  REST, Unity, OneLake, and the read-only `system` catalog.
-- The per-session **catalog manager** interprets names (one-, two-, and
-  three-part, with the current catalog and database) and holds temporary views.
-- Lookup order for reads: **temporary view → global temporary view → table →
-  view**.
-- Remote providers are wrapped with a **cache** (TTL and size limits,
-  invalidated on DDL) and a **runtime** layer (calls run on the io thread pool).
-- Catalogs are configured in `catalog.list`. The in-memory catalog's metadata
-  lasts **only as long as the session**.
+When a query mentions prod.sales.orders, something has to turn that name into a
+table with columns, a file format, and a location. That something is the catalog
+layer. This doc explains how Sail interprets table names, how several catalogs
+live side by side, how temporary views fit in, which metastores Sail can talk
+to, and why caching and thread isolation are layered around them.
 
 ---
 
-## 1. What This Component Does
+## Two jobs, two kinds of component
 
-A **catalog** answers metadata questions: *Which databases exist? What tables
-are in `sales`? What are the columns, format, location, and partitioning of
-`sales.orders`?* It also carries out DDL: create, alter, and drop databases,
-tables, and views.
+A catalog has to answer metadata questions ("which databases exist?", "what are
+the columns and location of sales.orders?") and carry out DDL (create, alter,
+and drop databases, tables, and views). Sail splits this work between two kinds
+of component.
 
-Sail separates two jobs:
+**Catalog providers** store metadata. Each one talks to a particular metastore:
+an in-memory store, AWS Glue, a Hive Metastore, an Iceberg REST catalog, Unity
+Catalog, or Microsoft OneLake. There's also a built-in, read-only system catalog
+that describes Sail itself.
 
-| Job | Who | What |
-|-----|-----|------|
-| **Interpreting names** | The **catalog manager** (one per session) | Decides which catalog and database a name refers to, handles temporary views, keeps the current catalog and database, and runs catalog commands |
-| **Storing metadata** | **Catalog providers** (one per configured catalog) | Talk to a metastore: in-memory, AWS Glue, Hive Metastore, Iceberg REST, Unity Catalog, or Microsoft OneLake |
+The **catalog manager**, one per session, interprets names. It decides which
+catalog and database a name refers to, keeps track of the current catalog and
+database, holds temporary views, and runs catalog commands.
 
----
+The split exists because Spark's rules for interpreting names are subtle (one-,
+two-, and three-part names, current catalog and database, the global temporary
+database), and if every provider implemented them, they would drift apart. So
+the manager implements them once, and providers only ever see a catalog, a
+namespace, and an object name. Adding a new metastore means implementing about a
+dozen simple operations, such as creating, getting, listing, altering, and
+dropping databases, tables, and views, and translating between that metastore's
+types and Sail's.
 
-## 2. Why It's Built This Way
+## Configuring catalogs
 
-**One small interface for every metastore.** Every provider implements the same
-dozen operations: create, get, list, and drop databases; create, get, list,
-alter, and drop tables; and create, get, list, and drop views. Adding a metastore
-means implementing those and translating between its types and Sail's.
-
-**Name resolution in one place.** Spark's rules for one-, two-, and three-part
-names, the current catalog and database, and the global temporary database are
-subtle. If each provider implemented them, the providers would drift apart. The
-manager implements them once, and providers only see "catalog, namespace,
-object".
-
-**Multi-level namespaces.** Some catalogs (Iceberg REST, Unity) have nested
-namespaces. Sail represents a database as a **namespace**, a non-empty list of
-parts, rather than a single string.
-
-**Layers for cross-cutting behavior.** Two things apply to every remote
-catalog, so they're added as **wrappers** around providers:
-
-- a **runtime wrapper**, which runs every provider call on Sail's **io**
-  runtime. A slow metastore can't block query execution threads, and client
-  libraries that expect a particular Tokio runtime get one.
-- a **caching wrapper**, which caches database, table, and view lookups (with
-  size and TTL limits) and invalidates entries on DDL.
-
-A typical remote catalog looks like *cache → runtime → provider*.
-
----
-
-## 3. How It Works
-
-### 3.1 Configuration
-
-Catalogs are declared in `catalog.list`, a list of inline tables (TOML-style)
-in an environment variable:
+Catalogs are declared in one setting, catalog.list, written in a compact inline
+syntax:
 
 ```bash
 export SAIL_CATALOG__LIST='[
   {name="sail", type="memory", initial_database=["default"]},
   {name="glue", type="glue", region="us-east-1"},
-  {name="ice",  type="iceberg-rest", uri="https://rest.example.com", warehouse="s3://lake/wh"}
+  {name="ice",  type="iceberg_rest", uri="https://rest.example.com", warehouse="s3://lake/wh"}
 ]'
 export SAIL_CATALOG__DEFAULT_CATALOG=sail
-export SAIL_CATALOG__DEFAULT_DATABASE='["default"]'
 ```
 
-| Type | Required settings | Optional settings |
-|------|-------------------|-------------------|
-| `memory` | `name`, `initial_database` | `initial_database_comment` |
-| `glue` | `name` | `region`, `endpoint_url` |
-| `hive_metastore` (`hms`) | `name`, `uris` | `thrift_transport`, `auth` (for example Kerberos), `kerberos_service_principal`, `min_sasl_qop`, `connect_timeout_secs` |
-| `iceberg_rest` | `name`, `uri` | `warehouse`, `prefix`, `oauth_access_token`, `bearer_access_token` |
-| `unity` | `name` | `uri`, `default_catalog`, `token` |
-| `onelake` | `name`, `url` | `bearer_token` (otherwise uses the Azure CLI) |
+Each type takes its own settings. Glue takes a region and optional endpoint.
+Hive Metastore takes server URIs plus optional transport, Kerberos, and timeout
+settings. Iceberg REST takes a URI, warehouse, prefix, and OAuth or bearer
+token. Unity takes a URI, default catalog, and token. OneLake takes a URL and
+an optional bearer token (otherwise it asks the Azure CLI for one). Every remote
+type also accepts cache settings, described below. Secrets are kept as secret
+strings and never printed in logs.
 
-Every remote type also accepts **cache settings**: a cache type, size, and TTL
-for databases, tables, and views. Secrets are kept as secret strings and never
-printed.
+Out of the box, Sail has a single in-memory catalog called sail with a database
+called default. If you define exactly one catalog and don't name a default, it
+becomes the default. With several catalogs, you must choose one, or Sail refuses
+to start. A catalog called system is always added, and that name is reserved.
 
-**Defaults:** the default configuration has one in-memory catalog named `sail`
-with a database named `default`. If `catalog.default_catalog` is empty and
-exactly one catalog is defined, that catalog becomes the default. With several
-catalogs you must choose one. A catalog named **`system`** is always added
-(see [06](06-session-and-runtime.md)), and that name is reserved.
+## How a name is interpreted
 
-### 3.2 Name resolution
+The manager keeps a current catalog, a current database, and the name of the
+global temporary database (global_temp). With those, it reads names like this.
+A name with one part is an object in the current catalog and current database. A
+longer name splits into the object (the last part) and a qualifier (everything
+before it). If the qualifier's first part is the name of a registered catalog,
+that's the catalog and the rest is the namespace; otherwise the whole qualifier
+is a namespace in the current catalog. Namespaces can have several levels, which
+some catalogs such as Iceberg REST support.
 
-The manager keeps a **current catalog**, a **current database**, and the name
-of the **global temporary database** (`global_temp`).
+Here's how that plays out with catalogs sail (the default) and glue, and current
+database default. orders means sail.default.orders. sales.orders means the
+orders table in database sales of the sail catalog, because sales isn't a
+catalog. glue.sales.orders means catalog glue, database sales. glue.orders is an
+error, "empty namespace", because it names a catalog but no database.
+global_temp.v refers to a global temporary view. After `USE glue.sales`, the bare
+name orders means glue.sales.orders.
 
-**Database references:**
+## The order of lookup
 
-| Reference | Resolves to |
-|-----------|-------------|
-| `[db]` | current catalog, database `db` |
-| `[c, db]`, if `c` is a registered catalog | catalog `c`, database `db` |
-| `[c, ns1, ns2]`, if `c` is a registered catalog | catalog `c`, namespace `ns1.ns2` |
-| `[ns1, ns2]`, if `ns1` isn't a catalog | current catalog, namespace `ns1.ns2` |
+Reading a table goes through a fixed sequence. If the name has one part, the
+manager first checks the session's **temporary views**, so a temporary view
+named orders hides a table named orders. If the qualifier is the global
+temporary database, it checks **global temporary views**. Otherwise it asks the
+catalog's provider for a **table**, and if there's none, for a saved **view**.
+If all of those come up empty, the user gets TABLE_OR_VIEW_NOT_FOUND.
 
-**Table and view references:** the last part is the object name. The rest is
-resolved as a database reference, or means the current database if there's only
-one part.
+What comes back is a description of the object. For a table, that includes its
+columns (with types, nullability, comments, defaults, and generated
+expressions), its file format, location, partition columns, bucketing, sort
+order, properties, and whether it's external. A saved view comes back as its SQL
+text and columns. A temporary view comes back as a logical plan. The resolver
+then uses a table's format and location to ask the matching table format for a
+reader (see [07](07-plan-resolver.md) and [12](12-data-sources-and-formats.md)).
 
-**Lookup order** for "get table or view", which is what reads use:
+## Temporary views and other session objects
 
-1. A **one-part** name: check **temporary views** first.
-2. If the qualifier is the global temporary database (`global_temp.v`), check
-   **global temporary views**.
-3. Ask the provider for a **table**.
-4. Ask the provider for a **view**.
-5. If nothing is found: `[TABLE_OR_VIEW_NOT_FOUND] Table or view not found: …`.
+`df.createOrReplaceTempView("v")` stores the DataFrame's plan in the session, and
+`createGlobalTempView` stores it under global_temp. The manager also holds
+objects that external catalogs can't: Python UDFs registered in the session
+(which the resolver checks before built-in functions; see
+[15](15-functions-and-python-udfs.md)), and functions and plans that Spark
+Connect clients register and later refer to by ID.
 
-### 3.3 What a table lookup returns
+## Wrapping remote catalogs: threads and caches
 
-A lookup returns a **table status** describing the object:
+Every remote catalog gets two layers around it, and both exist for practical
+reasons.
 
-| Kind | Contents |
-|------|----------|
-| **Table** | Columns (name, type, nullable, comment, default, generated expression, partition, bucket, and cluster flags), constraints, format (for example `parquet`, `delta`, `iceberg`), location, partition columns, sort order, bucketing, properties, and whether it's external |
-| **View** | The SQL definition text, columns, and properties |
-| **Temporary view** / **global temporary view** | A logical plan |
+The first runs every catalog call on Sail's I/O thread pool (see
+[02](02-entry-points-and-server.md)). A slow metastore then can't tie up the
+threads that execute queries, and the client libraries for Glue, Iceberg REST,
+and others get the runtime they expect.
 
-The resolver uses the format and location to ask the matching table format for
-a reader (see [07](07-plan-resolver.md) and
-[12](12-data-sources-and-formats.md)).
-
-### 3.4 Temporary views and tracked objects
-
-- `df.createOrReplaceTempView("v")` stores the DataFrame's **logical plan** in
-  the session's temporary view manager. Global temporary views live under
-  `global_temp`.
-- Spark Connect clients can register functions and plans that later requests
-  refer to by ID. The manager's **tracker** gives them internal IDs.
-- Registered **Python UDFs** are kept as session functions, which the resolver
-  checks before built-in functions (see [15](15-functions-and-python-udfs.md)).
-
-### 3.5 Catalog commands
-
-DDL and metadata commands are resolved into a **catalog command** (about 60
-kinds) wrapped in a logical node (see [07](07-plan-resolver.md)). When the plan
-runs, the operator calls the command's `execute`, which uses the manager and
-providers and returns a small Arrow table formatted like Spark's output for
-`SHOW TABLES`, `DESCRIBE`, and so on. Commands run on the **driver** in cluster
-mode, because only the driver has the session's catalog state.
-
-### 3.6 Providers in brief
-
-| Provider | Notes |
-|----------|-------|
-| **Memory** | Kept inside the session's catalog manager. Metadata is **per session** and lost when the session ends (the data files themselves stay). Good for development and tests. |
-| **System** | Read-only `system.*` tables generated from Sail's runtime state |
-| **AWS Glue** | Uses the AWS SDK. Maps Glue databases and tables to Sail status (Hive-style formats, Iceberg tables). Credentials come from the standard AWS chain. |
-| **Hive Metastore** | A Thrift client, with optional SASL/Kerberos (GSSAPI). Maps Hive storage descriptors (input/output formats, SerDe) to and from Sail formats. |
-| **Iceberg REST** | A client for the Iceberg REST catalog API (separate `apis` and `models` modules), with nested namespaces and OAuth or bearer tokens |
-| **Unity Catalog** | A REST client with token or credential configuration. `default_catalog` selects the Unity catalog. |
-| **OneLake** | Microsoft Fabric's OneLake Delta table API. Uses a bearer token or gets one from the Azure CLI. |
-
----
-
-## 4. Examples
-
-### 4.1 Working with multiple catalogs
-
-```python
-spark.sql("SHOW CATALOGS").show()                    # sail, glue, ice, system
-spark.sql("USE glue.analytics")
-spark.table("events").limit(5).show()                # glue.analytics.events
-spark.table("ice.marketing.campaigns").show()        # three-part name
-spark.sql("CREATE TABLE sail.default.tmp USING parquet AS SELECT 1 AS x")
-```
-
-### 4.2 Temporary views
-
-```python
-df.createOrReplaceTempView("recent")
-spark.sql("SELECT count(*) FROM recent").show()      # temporary view wins for one-part names
-df.createGlobalTempView("shared")
-spark.sql("SELECT * FROM global_temp.shared").show()
-```
-
-### 4.3 Caching a slow metastore
+The second is a cache. Planning a query can involve several catalog calls, and
+going to a remote metastore each time adds latency. The cache remembers
+databases, tables, and views, with configurable size and expiry for each. When
+you change something through Sail, with ALTER TABLE or DROP TABLE for example,
+the affected entries are invalidated immediately. When another system changes a
+table, say Spark or Athena writing to the same Glue catalog, Sail keeps serving
+the cached version until it expires. Choose the expiry with that trade-off in
+mind:
 
 ```bash
 export SAIL_CATALOG__LIST='[{name="hms", type="hms", uris=["thrift://metastore:9083"],
   table_cache_type="global", table_cache_ttl_secs=60}]'
 ```
 
-### 4.4 Name resolution, worked out
+## Catalog commands
 
-Setup: catalogs `sail` (default, memory) and `glue`. The current database is
-`default`.
+DDL and metadata commands such as CREATE, DROP, SHOW TABLES, DESCRIBE, and USE
+become catalog commands, about sixty kinds in all. The resolver wraps them in a
+plan node, and when the plan runs, the command uses the manager and the
+providers to do its work and returns a small table shaped like Spark's output.
+In cluster mode these commands always run on the driver, because only the driver
+holds the session's catalog state.
 
-| You write | Catalog | Namespace | Object | Notes |
-|-----------|---------|-----------|--------|-------|
-| `orders` | `sail` | `default` | `orders` | Temporary view `orders` wins if one exists |
-| `sales.orders` | `sail` | `sales` | `orders` | `sales` isn't a catalog, so it's a database |
-| `glue.sales.orders` | `glue` | `sales` | `orders` | First part matches a catalog |
-| `glue.orders` | `glue` | (empty) | `orders` | **Error: "empty namespace"**, because a catalog was named without a database |
-| `global_temp.v` | (none) | | `v` | Global temporary view |
-| `a.b.c.t` with catalog `a` | `a` | `b.c` | `t` | Multi-level namespace |
+## The providers in brief
 
-After `USE glue.sales`, the bare name `orders` resolves to `glue.sales.orders`.
+The **memory** catalog lives inside the session's catalog manager. Its metadata
+lasts only as long as the session, though any data files it wrote remain. That
+makes it good for development and tests, and a surprise if you expect tables to
+persist. The **system** catalog serves read-only tables generated from Sail's
+runtime state (see [06](06-session-and-runtime.md)). **AWS Glue** uses the AWS
+SDK with the standard credential chain, and understands Hive-style tables and
+Iceberg tables. **Hive Metastore** speaks Thrift, optionally with Kerberos, and
+translates Hive storage descriptors (input format, output format, SerDe) to and
+from Sail's formats. **Iceberg REST** implements the Iceberg REST catalog API,
+including nested namespaces and token authentication. **Unity Catalog** is a
+REST client configured with a token. **OneLake** talks to Microsoft Fabric's
+OneLake Delta table API.
 
-### 4.5 How the cache stays correct
+## Following one lookup
 
-| Action | Cache effect |
-|--------|--------------|
-| `spark.table("glue.sales.orders")` (miss) | Calls Glue, stores the table status |
-| Same call again within the TTL | Served from cache, no Glue call |
-| `ALTER TABLE glue.sales.orders …` or `DROP TABLE …` through Sail | Entry invalidated |
-| Table changed by **another** system (for example Spark or Athena) | Sail sees the old metadata until the TTL expires |
-
----
-
-## 5. End-to-End: `spark.table("glue.analytics.events")`
-
-| # | Component | What happens |
-|---|-----------|--------------|
-| 1 | Spark Connect | Creates a read of the named table `["glue", "analytics", "events"]`. |
-| 2 | Resolver | Isn't a `format.path` shortcut or a CTE, so it asks the catalog manager for the table or view. |
-| 3 | Catalog manager | Three parts, so it isn't a temporary view. `glue` is a registered catalog, so catalog = `glue`, namespace = `analytics`, object = `events`. |
-| 4 | Cache wrapper | Checks the table cache. On a miss, it calls the wrapped provider. |
-| 5 | Runtime wrapper | Runs the call on the io runtime. |
-| 6 | Glue provider | Calls Glue `GetTable` and converts columns, format (for example Parquet), location, and partition keys into a table status. |
-| 7 | Resolver | Builds source info and asks the Parquet table format for a source (see [12](12-data-sources-and-formats.md)). |
-| 8 | Planner and execution | Scan, prune, and read (see [07](07-plan-resolver.md), [09](09-local-and-cluster-execution.md)). |
+Take `spark.table("glue.analytics.events")`. Spark Connect produces a read of the
+named table glue.analytics.events. The resolver checks that it isn't a file-path
+shortcut or a WITH-clause name, then asks the catalog manager. Because the name
+has three parts, it can't be a temporary view. glue is a registered catalog, so
+the catalog is glue, the namespace analytics, and the object events. The cache
+layer looks for the table, and on a miss passes the request to the thread layer,
+which runs the Glue call on the I/O pool. The Glue provider fetches the table
+definition and translates its columns, format, location, and partition keys.
+The resolver builds a description of the source and asks the Parquet format for
+a reader, and planning continues.
 
 ---
 
-## 6. Common Problems
+## Common problems
 
-| Symptom | Cause | Fix |
-|---------|-------|-----|
-| "cannot infer default catalog when multiple catalogs are defined" | Several catalogs without `catalog.default_catalog` | Set `SAIL_CATALOG__DEFAULT_CATALOG`. |
-| `TABLE_OR_VIEW_NOT_FOUND` for a table you just created | Different session (memory catalogs are per session), or a stale cache | Use a persistent catalog, or lower cache TTLs. |
-| "cannot define catalog with reserved name: system" | A catalog named `system` in `catalog.list` | Rename it. |
-| Name resolves to the wrong catalog | The first name part matches a catalog name | Fully qualify the name, or rename the catalog or database. |
-| Queries stall on metadata calls | A slow metastore | Turn on catalog caching. Check network and authentication. |
+"Cannot infer default catalog when multiple catalogs are defined" means
+catalog.default_catalog needs to be set. A table you just created that can't be
+found was probably created in an in-memory catalog in a different session, or is
+hidden behind a stale cache. "Cannot define catalog with reserved name: system"
+means a configured catalog is called system. A name that resolves to the wrong
+catalog happens when a database shares its name with a catalog; qualify the name
+fully. And queries that stall on metadata usually point at a slow metastore;
+turn on caching and check the network and credentials.
 
----
+## Where to look in the code
 
-## 7. Where to Look
-
-| Topic | Location |
-|-------|----------|
-| Provider interface | `crates/sail-catalog/src/provider/mod.rs` |
-| Namespaces, options | `crates/sail-catalog/src/provider/namespace.rs`, `options.rs` |
-| Caching and runtime wrappers | `crates/sail-catalog/src/provider/cache.rs`, `runtime.rs` |
-| Catalog manager (name resolution) | `crates/sail-catalog/src/manager/` (`mod.rs`, `table.rs`, `view.rs`, `database.rs`, `function.rs`, `tracker.rs`) |
-| Temporary views | `crates/sail-catalog/src/temp_view.rs` |
-| Catalog commands | `crates/sail-catalog/src/command.rs` |
-| Hive storage formats | `crates/sail-catalog/src/hive_format.rs` |
-| Table status types | `crates/sail-common-datafusion/src/catalog/` |
-| Wiring catalogs into sessions | `crates/sail-session/src/catalog.rs` |
-| Catalog configuration | `crates/sail-common/src/config/application.rs` (catalog types), `application.yaml` (`catalog.*`) |
-| Providers | `crates/sail-catalog-{memory,system,glue,hms,iceberg,unity,onelake}/` |
+The provider interface is in crates/sail-catalog/src/provider/mod.rs, with
+namespaces and options alongside it, and the caching and thread layers in
+provider/cache.rs and provider/runtime.rs. The catalog manager and its name
+resolution are under src/manager/, temporary views in src/temp_view.rs, catalog
+commands in src/command.rs, and Hive storage format mapping in src/hive_format.rs.
+The shape of a table description is defined in crates/sail-common-datafusion
+under src/catalog/. Catalogs are created for each session in
+crates/sail-session/src/catalog.rs, from the settings defined in
+crates/sail-common/src/config. Each provider has its own crate:
+sail-catalog-memory, -system, -glue, -hms, -iceberg, -unity, and -onelake.

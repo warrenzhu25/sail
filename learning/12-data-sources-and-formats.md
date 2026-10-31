@@ -1,287 +1,129 @@
 # 12 · Data Sources and File Formats
 
-> **You'll learn:** how Sail reads and writes files (Parquet, CSV, JSON, Avro,
-> Arrow, text, binary) and streaming test sources; the table format interface
-> that all formats implement; how options are defined, layered, and checked;
-> how paths, globs, and partition directories are discovered; and how Python
-> data sources plug in.
->
-> **Crates:** `sail-data-source` (built-in formats, listing, options, URLs,
-> Python data sources), the table format interface in
-> `sail-common-datafusion/src/datasource.rs`
->
-> Lakehouse formats (Delta Lake, Iceberg) are in
-> [13](13-lakehouse-delta-and-iceberg.md), and storage access (S3, GCS, …) is in
-> [14](14-object-storage.md).
-
-
-## In One Minute
-
-- Every read and write goes through a **table format** plugin, looked up by name
-  (`parquet`, `csv`, `delta`, …) in the session's registry.
-- File formats are built on DataFusion's **listing table**: parallel scans,
-  pruning, projection and filter pushdown, partition directories.
-- Sail adds Spark behavior: Hadoop-style globs, hidden-file filtering
-  (`_SUCCESS`, `.crc`), partition inference, and Spark option names.
-- About 250 **options** are defined in YAML files and turned into typed structs
-  at build time. Options are applied in **layers** (table properties, then query
-  options).
-- Plain file writers currently **append only**. Lakehouse formats support
-  overwrite, replace-where, and row-level changes.
+Every time Sail reads or writes data, it goes through a **table format**: a named
+plugin that knows how to read and write one kind of data. Parquet, CSV, JSON,
+Avro, Arrow, plain text, and binary files each have one, as do Delta Lake and
+Iceberg tables, a few streaming test sources, and any data source a user writes
+in Python. This doc explains the table format interface, how file formats find
+files and work out schemas, how options are defined and combined, how writing
+works, and how Python data sources plug in. Lakehouse formats get their own doc
+([13](13-lakehouse-delta-and-iceberg.md)), and so does storage access
+([14](14-object-storage.md)).
 
 ---
 
-## 1. What This Component Does
+## One interface for every format
 
-Whenever Sail reads data, through `spark.read…`, `spark.table(…)` on a file
-table, or `SELECT * FROM parquet.`path``, or writes it, through `df.write…`,
-`INSERT`, or CTAS, it goes through a **table format**. A table format is a
-named plugin that knows how to:
+The resolver doesn't know whether it's reading Parquet or Iceberg, and it
+shouldn't have to. When it needs to read a table, it builds a neutral
+description: the paths, the schema if one is known, the partition columns,
+bucketing and sort information from the catalog, and the options. Then it asks
+the session's format registry for the format by name and hands over the
+description. The format returns a table source that DataFusion can scan with the
+usual optimizations: reading only the needed columns, pushing filters down, and
+stopping early for limits.
 
-| Capability | Called for |
-|------------|------------|
-| **Create a source** | Reads: returns a DataFusion table source the planner can scan (with projection, filter, and limit pushdown) |
-| **Infer a schema** | Planning when no schema was given |
-| **Create a writer** | Writes: returns a physical plan that consumes the input and writes files |
-| Create a row-level writer (optional) | `DELETE`, `UPDATE`, `MERGE` (lakehouse formats only) |
-| Alter table properties or column types (optional) | `ALTER TABLE` on formats that support it |
-| Merge strategy (optional) | Whether row-level changes are copy-on-write (*eager*) or merge-on-read |
+Writing works the same way. The resolver describes the write: the plan producing
+the rows, the mode (append, overwrite, overwrite matching a condition, overwrite
+partitions, error if the target exists, or ignore if it exists), the partition
+columns, the options, and the output path. The format returns a plan that
+consumes the rows and writes them.
 
-All formats live in a **registry** keyed by lowercase name and attached to each
-session (see [06](06-session-and-runtime.md)):
+Lakehouse formats implement a few extra capabilities: writers for DELETE,
+UPDATE, and MERGE, a choice between rewriting files and recording deletions
+separately, and changes to table properties and column types. Plain file formats
+don't need these.
 
-| Name | Kind | Read | Write |
-|------|------|------|-------|
-| `parquet` | File | Yes, with row-group and page pruning, filter pushdown, bloom filters | Yes |
-| `csv` | File | Yes, with header handling and schema inference | Yes |
-| `json` | File | Yes (newline-delimited) | Yes |
-| `avro` | File | Yes | Yes |
-| `arrow` | File (Arrow IPC) | Yes | Yes |
-| `text` | File (one string column per line) | Yes | Yes |
-| `binary` | File (path, modification time, length, content) | Yes | No |
-| `delta`, `iceberg` | Lakehouse | See [13](13-lakehouse-delta-and-iceberg.md) | |
-| `rate`, `socket` | Streaming test sources | Yes | No |
-| `console` | Streaming sink | No | Yes |
-| *Python data sources* | User-defined, in Python | Yes | Yes |
+The payoff of this design is that adding a format means implementing the
+interface and registering it. Nothing else in the planner changes.
 
----
+## File formats are built on DataFusion's listing table
 
-## 2. Why It's Built This Way
+DataFusion already has a capable "listing table" for directories of files. It
+splits files into partitions for parallel scanning, uses file statistics,
+applies projection and filter pushdown, prunes partition directories, and
+writes files in parallel. Sail's file formats are built on it, and add the
+behavior Spark users expect: Hadoop-style path patterns, hidden-file handling,
+partition inference rules, Spark's option names and defaults, and Spark-style
+output file names.
 
-**One interface for every format.** The resolver doesn't know whether it's
-reading Parquet or Iceberg. It builds a neutral description (paths, schema,
-partitioning, options) and asks the registry. Adding a format means
-implementing the interface and registering it. Nothing else in the planner
-changes.
+The built-in formats are Parquet (with row-group pruning, page-index filtering,
+filter pushdown, and bloom filters), CSV, newline-delimited JSON, Avro, Arrow IPC,
+text (one string column per line), and binary (one row per file, with the path,
+modification time, length, and content; it can't be written). There are also
+three streaming helpers: rate generates rows at a steady pace, socket reads lines
+from a TCP connection, and console prints streaming results.
 
-**Reuse DataFusion's file machinery.** File formats are built on DataFusion's
-**listing table**, which already handles splitting files into partitions,
-parallel scans, statistics, projection and filter pushdown, partition-column
-pruning, and parallel writes. Sail adds Spark's behavior on top: option names
-and defaults, Hadoop-style globs, partition inference rules, hidden-file
-handling, and output file naming.
+## Finding files
 
-**Spark-compatible options, defined as data.** Spark has dozens of options per
-format, with aliases (`sep`/`delimiter`), table-property forms
-(`option.delimiter`), defaults, and scopes (read, write, or both). Sail defines
-each format's options in a **YAML file**, about 250 options in total, and a
-build script generates typed Rust structs and parsers from them. Option
-handling stays consistent and self-documenting, and an option marked
-unsupported can produce a clear error instead of being silently ignored.
+Reading `s3://lake/events/` starts with working out which files that means. Sail
+parses the path with its own URL parser, because Spark uses **Hadoop's glob
+syntax**, which differs from shell globs in small ways: alternatives are written
+`{a,b}`, a negated character class is `[^x]` rather than `[!x]`, and `*` and `?`
+work as usual. A pattern such as `logs/{2024,2025}/*/app-[^t]*.json` is split
+into a fixed base path and a pattern, and the alternatives are expanded.
 
-**Options keep track of where they came from.** An option can come from catalog
-table properties, the operation (`.option(…)`, `OPTIONS (…)`), the table
-location, or time travel. These are passed as ordered **option layers** (later
-layers override earlier ones), so a format can tell a table default apart from a
-per-query override.
+The files are then listed through the storage registry, using the listing cache
+if it's turned on. When you point at a directory without your own pattern,
+files whose names start with a dot or an underscore are skipped, just as in
+Spark, so bookkeeping files like _SUCCESS and .crc checksums never get read as
+data.
 
----
+## Working out the schema and partitions
 
-## 3. How It Works
+Data lakes usually organize files in directories named after column values:
 
-### 3.1 Describing a read and a write
-
-**Read description (source info):**
-
-| Field | Meaning |
-|-------|---------|
-| Paths | One or more paths or URLs, which may contain globs |
-| Schema | Optional user or catalog schema, including partition columns |
-| Constraints | Primary key and similar constraints, if any |
-| Partition by | Partition column names (Hive-style `col=value` directories) |
-| Bucket by, sort order | Bucketing and sort metadata from the catalog |
-| Options | Option layers |
-
-**Write description (sink info):**
-
-| Field | Meaning |
-|-------|---------|
-| Input | The physical plan producing the rows |
-| Mode | Error if exists, ignore if exists, append, overwrite, overwrite where *condition*, overwrite partitions |
-| Partition by | Partition columns (with optional transforms, for lakehouse formats) |
-| Bucket by, sort order | |
-| Options | Option layers. The output path is the `path` option. |
-| Logical schema | The input schema with field metadata, for example Delta generated-column expressions |
-
-### 3.2 Paths, globs, and listing
-
-1. **Parse the URL.** Sail's own URL parser understands **Hadoop glob syntax**,
-   which differs from typical shell globs: `{a,b}` alternation, `[^x]` negated
-   classes, `*`, `?`. Each glob is split into a fixed base path and a pattern,
-   and alternations are expanded.
-2. **List files** through the object store registry (see
-   [14](14-object-storage.md)), optionally using the file listing cache. Hidden
-   files and directories (starting with `_` or `.`, such as `_SUCCESS` or
-   `.crc`) are excluded by default, as in Spark.
-3. **Infer partitions.** If no partition columns were given, `col=value`
-   directory names are discovered from the paths and become columns. Their types
-   are inferred.
-4. **Infer the schema** if none was given, using the format's inference: Parquet
-   footers, sampling CSV and JSON rows, Avro schemas, and so on. Some formats
-   handle options such as CSV `inferSchema=false` (all columns become strings).
-5. **Build a listing table** with the files, schema, partition columns, target
-   partitions (`execution.default_parallelism`), and constraints, then return it
-   as a table source.
-
-### 3.3 Reading
-
-During planning and execution, the listing table:
-
-- groups files (and Parquet row groups) into **partitions** to read in parallel,
-- applies **projection pushdown** (read only the needed columns),
-- applies **filter pushdown**: for Parquet, row-group statistics, page indexes,
-  bloom filters, and late materialization (`parquet.pushdown_filters`,
-  `parquet.pruning`, `parquet.enable_page_index`, …), plus partition pruning
-  from directory values,
-- uses the **file statistics and metadata caches** (see
-  [06](06-session-and-runtime.md)) to avoid rereading Parquet footers.
-
-In cluster mode the scan is serialized into the task plan (see
-[09](09-local-and-cluster-execution.md)), and each worker reads its assigned
-files directly from storage.
-
-### 3.4 Writing
-
-For plain file formats, the writer:
-
-1. checks the input isn't a streaming plan (streams can't be written to plain
-   file tables),
-2. rejects features plain files don't support: **bucketing** and **partition
-   transforms**,
-3. treats the path as a **directory** and always writes multiple files,
-4. picks the file extension, including the compression codec for Parquet (for
-   example `.zstd.parquet`),
-5. builds DataFusion's file sink with Hive-style **partition directories**
-   (partition columns aren't stored inside the files) and runs it in parallel.
-
-At the writer level, plain file formats only **append**: the sink mode is
-currently ignored by the listing writer, which is marked as a TODO in the code.
-Table-level checks (does the table exist, create it if needed, error or ignore
-modes) are done by the resolver as **preconditions** in the barrier node (see
-[07](07-plan-resolver.md), [08](08-logical-physical-plans-and-optimizers.md)).
-Lakehouse formats implement the full set of modes transactionally.
-
-Parquet writing honors about 20 `parquet.*` settings: compression, dictionary,
-statistics, row group size, page size, bloom filters, writer version, and so
-on.
-
-### 3.5 Options
-
-Each format's options are listed in `src/options/data/<format>.yaml`:
-
-```yaml
-- key: delimiter
-  description: Sets a single character separator for each field and value.
-  default: { value: ",", parser: parse_char }
-  supported: true
-  rust_type: char
-  scopes: [read, write]
-  origins:
-    - type: option          # .option("sep", ";") or .option("delimiter", ";")
-      keys: [delimiter, sep]
-    - type: table_property  # TBLPROPERTIES ('option.sep' = ';')
-      keys: [option.delimiter, option.sep]
+```text
+s3://lake/events/date=2024-01-01/country=US/part-0.parquet
+s3://lake/events/date=2024-01-01/country=DE/part-1.parquet
+s3://lake/events/date=2024-01-02/country=US/part-2.parquet
+s3://lake/events/_SUCCESS
 ```
 
-At build time this becomes a typed struct per format and scope (for example,
-CSV read options) with parsers. At run time, option layers are applied in order
-and each key is matched case-insensitively against its aliases.
+If you don't name the partition columns, Sail discovers them from directory names
+like these and adds them to the schema. Reading the directory above produces the
+columns stored in the files plus date and country. A filter like country = 'DE'
+then opens only part-1.parquet, because the other directories can't match.
 
-| Format | Approximate number of options |
-|--------|-------------------------------|
-| CSV | 42 |
-| Parquet | 34 |
-| JSON | 27 |
-| Delta | 37 |
-| Iceberg | 103 |
-| Text, socket, rate, binary | A few each |
+If you don't supply a schema, the format infers one. Parquet reads it from file
+footers, CSV and JSON sample rows, and Avro uses the schema in the file. Some
+formats honor options that change this, such as CSV's inferSchema=false, which
+makes every column a string.
 
-### 3.6 Streaming test sources and sinks
+## Reading efficiently
 
-- **`rate`**: generates `(timestamp, value)` rows at a configured rate.
-- **`socket`**: reads text lines from a TCP socket.
-- **`console`**: prints micro-batch results.
+During execution, the listing table groups files, and for Parquet even row
+groups within files, into partitions that are read in parallel. It reads only
+the columns the query needs. For Parquet, it uses each row group's statistics and
+the page index to skip data that can't match a filter, can apply filters while
+decoding, and can check bloom filters. These behaviors are controlled by the
+parquet.* settings. It also prunes whole partition directories using their
+values. The file statistics and metadata caches (see
+[06](06-session-and-runtime.md)) keep repeated queries from re-reading footers.
+In cluster mode, the scan description travels inside each task's plan, and every
+worker reads its assigned files directly from storage.
 
-These support Structured Streaming examples and tests (see the streaming notes
-in [08](08-logical-physical-plans-and-optimizers.md)).
+## Options, defined as data
 
-### 3.7 Python data sources
+Spark has dozens of options per format, many with several names (sep and
+delimiter mean the same thing for CSV), forms that can be stored as table
+properties (option.sep), defaults, and rules about whether they apply to
+reading, writing, or both. Hand-written parsing for all of this would be
+repetitive and easy to get subtly wrong.
 
-PySpark 4's **Python Data Source API** lets users write readers and writers in
-Python. Sail supports it in two ways:
+So Sail describes each format's options in a YAML file, about 250 options in
+total. CSV alone has about 40, Parquet about 35, and Iceberg about 100. Each
+entry gives the option's names, its default, whether it applies to reading,
+writing, or both, the type it should become, and whether Sail supports it yet. At
+build time, these files become typed Rust structures with parsers. Option
+handling is therefore consistent, the YAML doubles as documentation, and an
+option marked unsupported can produce a clear error instead of silently doing
+nothing.
 
-- **Session registration**: `spark.dataSource.register(MySource)` sends the
-  pickled class to Sail, which creates a Python table format for that session.
-- **Entry-point discovery**: at startup, Sail looks for installed Python
-  packages that advertise data sources through `importlib.metadata` entry
-  points and registers them globally.
-
-When read, Sail calls the source's `schema()`, plans **partitions** with the
-reader's `partitions()`, and runs `read(partition)` for each one in its embedded
-Python interpreter, converting the results to Arrow batches. Simple filters can
-be pushed into the reader. Writes run the Python writer for each partition, then
-a **commit** step that calls the writer's commit or abort with the per-partition
-messages. Settings `python.data_source_*` control the write channel capacity
-and slow-operation warnings.
-
----
-
-## 4. Examples
-
-```python
-# Parquet with partition discovery: /data/events/date=2024-01-01/part-0.parquet …
-df = spark.read.parquet("s3://lake/events/")            # gains a `date` column
-df.filter("date = '2024-01-01'").count()                # prunes other date directories
-
-# CSV with options
-spark.read.option("header", True).option("sep", ";").csv("/data/*.csv")
-
-# Hadoop-style glob with alternation
-spark.read.json("gs://bucket/logs/{2024,2025}/*/app-[^t]*.json")
-
-# Write partitioned Parquet
-df.write.partitionBy("country").parquet("/out/by_country/")
-
-# Query a path directly in SQL
-spark.sql("SELECT count(*) FROM parquet.`s3://lake/events/`").show()
-
-# Python data source
-from pyspark.sql.datasource import DataSource, DataSourceReader
-class Counter(DataSource):
-    @classmethod
-    def name(cls): return "counter"
-    def schema(self): return "n INT"
-    def reader(self, schema): return CounterReader()
-class CounterReader(DataSourceReader):
-    def read(self, partition):
-        for i in range(3): yield (i,)
-spark.dataSource.register(Counter)
-spark.read.format("counter").load().show()
-```
-
-### 4.1 Option layering, worked out
-
-A CSV table is created with a table property, then read with a query option:
+Options can come from several places for one read, and they're applied in
+**layers**, with later layers winning key by key. Here's an example. A CSV table
+is created with table properties saying the separator is a semicolon and the
+files have a header row, and then a query overrides the separator:
 
 ```sql
 CREATE TABLE raw_events (id INT, msg STRING) USING csv
@@ -292,68 +134,102 @@ CREATE TABLE raw_events (id INT, msg STRING) USING csv
 spark.read.option("sep", "|").table("raw_events")
 ```
 
-| Layer (applied in order) | `sep` | `header` |
-|--------------------------|-------|----------|
-| Default (from `csv.yaml`) | `,` | `false` |
-| Table properties (`option.sep`, `option.header`) | `;` | `true` |
-| Query options (`.option("sep", "|")`) | **`\|`** | (not set) |
-| **Effective value** | **`\|`** | **`true`** |
+The defaults say the separator is a comma and there's no header. The table
+properties change that to a semicolon with a header. The query option then
+changes the separator to a pipe, and doesn't mention the header. So the read
+uses a pipe separator and a header row. Names match without regard to case, and
+aliases count as the same option.
 
-Later layers win, key by key. Aliases (`sep` and `delimiter`) match the same
-option, and matching is case-insensitive.
+## Writing files
 
-### 4.2 What partition inference produces
+When writing, a plain file format first rejects things it can't do. It can't
+write a streaming query to a plain file path, apply bucketing, or apply
+partition transforms. It then treats the output path as a directory and always
+writes several files. It chooses file extensions, including the compression
+codec for Parquet (for example .zstd.parquet), and writes in parallel, putting
+partition columns in directory names rather than inside the files. Parquet
+writing honors about twenty parquet.* settings such as compression, dictionary
+encoding, statistics, row group size, page size, bloom filters, and writer
+version.
 
-```text
-s3://lake/events/date=2024-01-01/country=US/part-0.parquet
-s3://lake/events/date=2024-01-01/country=DE/part-1.parquet
-s3://lake/events/date=2024-01-02/country=US/part-2.parquet
-s3://lake/events/_SUCCESS                      ← hidden, skipped
+One limitation is worth knowing. The plain file writer currently **only
+appends**: it ignores the write mode, a known gap marked in the code. The checks
+that happen before writing to a *table*, such as whether it exists, creating it,
+and refusing or skipping because of the mode, are done by the resolver, as
+preconditions that run before the write (see [07](07-plan-resolver.md) and
+[08](08-logical-physical-plans-and-optimizers.md)). But writing to an existing
+directory of plain files adds files rather than replacing them. Lakehouse formats
+implement every mode properly, as transactions.
+
+## Python data sources
+
+PySpark 4 lets users write data sources in Python, and Sail supports them in two
+ways. A program can register one for its session with
+`spark.dataSource.register(MySource)`, which sends the pickled class to Sail.
+And at startup, Sail looks for installed Python packages that advertise data
+sources through Python's standard entry-point mechanism, and registers those for
+everyone.
+
+When such a source is read, Sail calls its schema method, asks its reader to
+split the work into partitions, and runs the reader's read method for each
+partition in the embedded Python interpreter, converting the rows it yields
+into Arrow batches. Simple filters can be passed to the reader. Writing runs the
+Python writer for each partition, then a commit step that calls the writer's
+commit or abort with the messages each partition returned:
+
+```python
+from pyspark.sql.datasource import DataSource, DataSourceReader
+
+class Counter(DataSource):
+    @classmethod
+    def name(cls): return "counter"
+    def schema(self): return "n INT"
+    def reader(self, schema): return CounterReader()
+
+class CounterReader(DataSourceReader):
+    def read(self, partition):
+        for i in range(3): yield (i,)
+
+spark.dataSource.register(Counter)
+spark.read.format("counter").load().show()
 ```
 
-`spark.read.parquet("s3://lake/events/")` yields the file columns plus
-**`date`** and **`country`**, taken from the directory names. A filter such as
-`country = 'DE'` opens only `part-1.parquet`.
+## Following one read
+
+Take `spark.read.parquet("s3://lake/events/").filter("date = '2024-01-01'").count()`.
+Spark Connect produces a read of format parquet with one path and no schema. The
+resolver asks the registry for the Parquet format and passes it the description.
+The format parses the path, finds no pattern, and lists the directory through
+the S3 client, skipping _SUCCESS. It discovers the date directories and adds a
+date partition column, reads one footer (possibly from cache) to get the file
+schema, and builds a listing table. The optimizer turns the filter into a
+partition filter, and because count needs no columns, row counts can come from
+file metadata. At execution, only the files under date=2024-01-01 are opened.
 
 ---
 
-## 5. End-to-End: `spark.read.parquet("s3://lake/events/").filter("date='2024-01-01'").count()`
+## Common problems
 
-| # | Component | What happens |
-|---|-----------|--------------|
-| 1 | Spark Connect | A data source read: format `parquet`, paths `["s3://lake/events/"]`, no schema. |
-| 2 | Resolver | Asks the registry for `parquet` and passes source info with an empty schema and the option layers. |
-| 3 | URL resolution | Parses the path, finds no globs, and lists files under `s3://lake/events/` through the S3 client from the object store registry (see [14](14-object-storage.md)). Skips `_SUCCESS`. |
-| 4 | Partition inference | Finds `date=…` directories and adds a `date` partition column. |
-| 5 | Schema inference | Reads one Parquet footer, which may be cached. The schema is the file schema plus `date`. |
-| 6 | Listing table | Created with files, schema, partitions, and target partitions. |
-| 7 | Optimizer | The filter `date = '2024-01-01'` becomes a **partition filter**. `count(*)` needs no columns, so it may be answered from statistics. |
-| 8 | Execution | Only files under `date=2024-01-01/` are opened. Row counts come from Parquet metadata where possible. |
+"Bucketing for writing listing table format" means bucketBy was used with a
+plain file format, which isn't supported. "Cannot write streaming data to listing
+table" means a streaming query tried to write to a plain file path. If a write to
+an existing path added files instead of replacing them, that's the append-only
+behavior described above; write to a table or a lakehouse format, or clear the
+path first. An unexpected extra column usually comes from partition inference
+finding col=value directories; pass an explicit schema to control it. An option
+that seems to do nothing may be misspelled, unsupported, or meant for the other
+direction; the format's YAML file says which. And a glob that doesn't match may be
+using shell syntax; remember `[^x]` and `{a,b}`.
 
----
+## Where to look in the code
 
-## 6. Common Problems
-
-| Symptom | Cause |
-|---------|-------|
-| "bucketing for writing listing table format" not implemented | `bucketBy` with a plain file format isn't supported |
-| "cannot write streaming data to listing table" | A streaming query writing to a plain file path. Use a supported sink. |
-| A write to an existing path adds files instead of replacing them | The listing writer appends. Use a table, a lakehouse format, or clear the path first. |
-| Unexpected extra column from directories | Partition inference found `col=value` directories. Pass an explicit schema to control it. |
-| Option has no effect | Misspelled, not supported, or only valid for the other scope (read vs. write). Check `options/data/<format>.yaml`. |
-| Glob doesn't match | Hadoop glob syntax: use `[^x]`, not `[!x]`, and `{a,b}` for alternatives |
-
----
-
-## 7. Where to Look
-
-| Topic | Location |
-|-------|----------|
-| Table format interface, source and sink info, option layers, sink modes | `crates/sail-common-datafusion/src/datasource.rs` |
-| Format registration | `crates/sail-session/src/formats.rs` |
-| Listing-based table format (read and write) | `crates/sail-data-source/src/listing/` |
-| Built-in formats | `crates/sail-data-source/src/formats/` (`parquet/`, `csv/`, `json/`, `avro/`, `arrow/`, `text/`, `binary/`, `rate/`, `socket/`, `console/`) |
-| Option definitions (YAML) and parsers | `crates/sail-data-source/src/options/` (`data/*.yaml`, `parsers.rs`), `build.rs` |
-| URL and glob parsing | `crates/sail-data-source/src/url.rs` |
-| Python data sources | `crates/sail-data-source/src/formats/python/` |
-| File write planning | `crates/sail-physical-plan/src/file_write.rs` |
+The table format interface, with the read and write descriptions, option layers,
+and write modes, is in crates/sail-common-datafusion/src/datasource.rs, and the
+formats are registered for each session in crates/sail-session/src/formats.rs.
+The listing-based reading and writing shared by file formats is in
+crates/sail-data-source/src/listing/. Each built-in format has a directory under
+src/formats/ (parquet, csv, json, avro, arrow, text, binary, rate, socket,
+console), and Python data sources are under src/formats/python/. Option
+definitions are the YAML files in src/options/data/, turned into code by the
+crate's build.rs, and path and glob parsing is in src/url.rs. Write planning is in
+crates/sail-physical-plan/src/file_write.rs.

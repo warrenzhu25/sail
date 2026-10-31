@@ -1,282 +1,216 @@
 # 06 · Sessions and the Runtime Environment
 
-> **You'll learn:** what a Sail session contains, how it's assembled, how
-> sessions are created, tracked, timed out, and deleted, and how memory,
-> spilling, caches, and storage access are configured for each session.
->
-> **Crates:** `sail-session`, `sail-cache`, and the session parts of
-> `sail-common-datafusion`
-
-
-## In One Minute
-
-- A **session** is a DataFusion `SessionContext` with Sail's services attached
-  as typed **extensions**: catalogs, table formats, the job runner, system
-  tables, and an activity tracker.
-- Server sessions serve clients. Worker sessions only run tasks.
-- Each session has its **own job runner**. In cluster mode that means its own
-  driver and workers.
-- The **runtime environment** sets the memory pool (unbounded by default!),
-  spill directories, file caches, and the object store registry.
-- Idle sessions are deleted after a timeout (15 minutes for Spark Connect).
-  Their history stays visible in `system.*` tables.
+A session is everything Sail keeps on behalf of one client: settings, catalogs,
+temporary views, the machinery that runs its queries, and the resources those
+queries may use. This doc explains what goes into a session, why it's assembled
+the way it is, how sessions are created and cleaned up, and how the runtime
+environment controls memory, spilling, caches, and storage access.
 
 ---
 
-## 1. What This Component Does
+## A session is a DataFusion context with Sail's services attached
 
-Sail builds on Apache DataFusion, whose central object is the
-**`SessionContext`**: configuration, a runtime environment (memory, disk,
-storage), optimizer rules, a query planner, and registered functions. Sail
-creates one per client session and customizes it heavily.
+Sail builds on Apache DataFusion, whose central object is the SessionContext. It
+holds configuration, a runtime environment, optimizer rules, a query planner,
+and registered functions. Sail creates one SessionContext per client session and
+customizes it heavily.
 
-This component:
+The key to that customization is a DataFusion feature called *extensions*. A
+session's configuration can carry arbitrary typed objects, and any code holding
+the session can fetch one by type. Sail attaches its services this way: a
+catalog manager that knows about databases and tables, a registry of table
+formats (Parquet, CSV, Delta, Iceberg, and so on), a job service that runs
+queries, an activity tracker used for idle timeouts, a service that answers
+queries on the system tables, and a cache for Delta table state. The Spark
+Connect front end adds one more: a Spark session extension holding the client's
+IDs and Spark settings.
 
-1. **assembles** a session context with everything Sail needs (catalogs, table
-   formats, the job runner, the planner, optimizer rules, and Spark-compatible
-   settings),
-2. **manages** session lifecycles (create on first use, reuse, time out, delete,
-   and remember history),
-3. **builds the runtime environment**: the memory pool, temporary-file
-   (spill) directories, file metadata caches, and the object store registry.
+Why extensions rather than wrapping DataFusion's types in Sail's own? Because
+wrapping would mean forking or re-exporting large parts of DataFusion's API, and
+every new service would change function signatures throughout the codebase.
+With extensions, a function that needs the catalog manager simply asks the
+session for it.
 
----
+## Sail turns DataFusion's defaults off
 
-## 2. Why It's Built This Way
+A session built by Sail deliberately leaves out DataFusion's built-in catalog,
+its information schema, its built-in table formats, and its built-in functions.
+Sail provides all of these itself, because Spark's behavior differs. For
+example, Spark's concat returns NULL when any argument is NULL, while
+DataFusion's ignores NULL arguments. Leaving DataFusion's version registered
+would make it too easy for the wrong one to be used.
 
-**Extensions instead of wrappers.** DataFusion's session configuration can hold
-arbitrary typed **extensions**. Sail attaches its own services there, and any
-code holding the session can get one by type:
-`ctx.extension::<CatalogManager>()`. That means Sail doesn't have to wrap or
-fork DataFusion's types, and new services can be added without changing
-function signatures across the codebase.
+There's one exception that shows how tightly the pieces fit. One of
+DataFusion's optimizer rules quietly assumes that a function called first_value
+is registered. Sail registers that one function explicitly so the rule keeps
+working.
 
-**Sail turns off DataFusion's defaults.** Server sessions are created
-*without* DataFusion's default catalog, information schema, built-in table
-formats, or built-in functions. Sail manages all of these itself, for Spark
-compatibility. For example, Spark's `concat` with a NULL argument returns NULL,
-unlike DataFusion's version. One DataFusion function, `first_value`, is
-registered explicitly because one of DataFusion's optimizer rules quietly
-depends on it.
+The session also receives Sail's optimizer rules (with lakehouse rules placed
+ahead of DataFusion's own; see [08](08-logical-physical-plans-and-optimizers.md)),
+Sail's query planner, and execution settings copied from configuration: the
+batch size (8,192 rows by default), the number of partitions to target (by
+default one per CPU core), statistics collection, and about thirty Parquet read
+and write settings.
 
-**Two factories for two jobs.** Client-facing sessions and worker sessions need
-different things. A worker only has to *run* plan fragments, so it doesn't need
-catalogs, user state, or a job runner, but it does need every function and
-format available to decode the plan it receives.
+## Server sessions and worker sessions
 
-**One job runner per session.** Each server session creates its own job runner.
-In cluster mode, that means **each session gets its own driver**, with its own
-workers. Sessions are isolated: one user's job can't take over another
-session's workers.
+Sail builds two kinds of session, and the difference explains a whole class of
+bugs.
 
-**An actor for the session lifecycle.** Requests for the same session can
-arrive concurrently. Creation, idle checks, and deletion are messages handled
-one at a time by a session manager actor, so they can't race.
+A **server session** serves a client. It owns user-visible state such as
+temporary views and settings, can submit jobs, and resolves plans. It has
+everything described above.
 
----
+A **worker session** exists on cluster workers and only runs pieces of plans it
+receives from the driver. It needs no catalogs, no user state, and no job
+runner. It does need a runtime environment for memory and storage, and it keeps
+DataFusion's default functions, because when a worker decodes a plan fragment,
+every function the fragment mentions must be found by name.
 
-## 3. How It Works
+So if a query works in local mode but fails only on a cluster, a good first
+question is whether something was set up in the server session but not in the
+worker session.
 
-### 3.1 What a server session contains
+## Each session gets its own job runner
 
-| Extension | Purpose | Read more |
-|-----------|---------|-----------|
-| Table format registry | Parquet, CSV, JSON, Avro, Arrow, text, binary, socket, rate, console, Delta, Iceberg, and Python data sources | [12](12-data-sources-and-formats.md), [13](13-lakehouse-delta-and-iceberg.md) |
-| Catalog manager | Catalogs, databases, tables, views, temporary objects, name resolution | [11](11-catalogs.md) |
-| Activity tracker | Time of last activity, used for idle timeout | below |
-| Job service | Wraps the job runner (local or cluster) | [09](09-local-and-cluster-execution.md) |
-| System table service | Lets `system.*` tables see sessions, jobs, stages, tasks, and workers | below |
-| Delta table cache | Caches loaded Delta table state within the session | [13](13-lakehouse-delta-and-iceberg.md) |
-| Spark session | Added by the Spark Connect front end: IDs, Spark settings, executors, streaming queries | [03](03-spark-connect.md) |
+When a server session is built, it creates a new job runner according to the
+mode setting: an in-process runner for local mode, or a cluster runner with its
+own driver for local-cluster and Kubernetes modes (see
+[09](09-local-and-cluster-execution.md)). In cluster mode, this means **every
+session gets its own driver and its own workers**. One user's heavy job can't
+take over another session's workers, and shutting down a session cleanly shuts
+down everything it started.
 
-The session state also includes:
+## The runtime environment: memory, spilling, caches, storage
 
-- **analyzer and optimizer rules**: Sail's logical rules. Lakehouse rules (such
-  as expanding row-level operations) run **first**, ahead of DataFusion's
-  built-in rules,
-- **physical optimizer rules**: Sail's list, with optional cost-based join
-  reordering (`optimizer.enable_join_reorder`, off by default) (see
-  [08](08-logical-physical-plans-and-optimizers.md)),
-- **the query planner**: Sail's extension planner, which knows how to plan Sail's
-  custom nodes,
-- **DataFusion execution settings** copied from Sail configuration: batch size
-  (8,192 rows by default), target partitions (`execution.default_parallelism`;
-  0 means one per CPU core), statistics collection, and about 30 Parquet read and
-  write settings (page index, pruning, filter pushdown, compression, row group
-  size, bloom filters, and so on).
+Each session also has a DataFusion *runtime environment*, which controls the
+physical resources its queries use.
 
-### 3.2 The runtime environment
+**Memory.** Operators such as sorts, joins, and aggregations ask a memory pool
+before using large amounts of memory. Sail offers three pools, chosen with
+runtime.memory_pool.type. The **unbounded** pool, which is the default, never
+says no. The **greedy** pool hands out memory first come, first served, up to a
+maximum. The **fair** pool shares a maximum among operators that are able to
+spill, so no single operator can starve the others.
 
-The runtime environment controls the physical resources a session uses:
+The difference matters a lot in practice. Suppose you use the fair pool with an
+8 GiB limit, and a query runs two sorts and a hash aggregation at the same time.
+While only the aggregation is running, it can use the full 8 GiB. Once all three
+are running, each spillable operator's share is about a third. When a sort
+exceeds its share, it writes sorted runs to disk and carries on with less memory.
+With the default unbounded pool, none of this happens: operators keep allocating
+until the process hits the machine's or container's limit and is killed. For
+anything beyond development, choose a bounded pool.
 
-| Resource | Setting | Behavior |
-|----------|---------|----------|
-| **Memory pool** | `runtime.memory_pool.type` | `unbounded` (default): no limit. `greedy`: first come, first served up to `max_size`. `fair`: `max_size` shared fairly among operators that can spill. Only bounded pools make operators **spill** instead of growing without limit. |
-| **Spill files** | `runtime.temporary_files.paths`, `.max_size` | A max size of 0 turns spilling off. No paths means the OS temporary directory. Otherwise spills go to the listed directories. The default limit is 64 GiB. |
-| **Object stores** | (see [14](14-object-storage.md)) | A dynamic registry that creates S3, GCS, Azure, HTTP, HDFS, or local clients on demand. |
-| **File listing cache** | `execution.file_listing_cache.*` | Caches directory listings. Off by default. |
-| **File statistics cache** | `parquet.file_statistics_cache.*` | Caches per-file statistics. Global by default. |
-| **File metadata cache** | `parquet.file_metadata_cache.*` | Caches Parquet footers. Global by default. |
+**Spilling.** Spill files go to the directories listed in
+runtime.temporary_files.paths, or to the operating system's temporary directory
+if none are listed. The total is capped by runtime.temporary_files.max_size,
+64 GiB by default, and setting that cap to zero disables spilling entirely. In
+that case, an operator that runs out of memory fails with a "resources
+exhausted" error instead of spilling.
 
-Each cache has a **scope**: `none`, `global` (one cache shared by every
-session in the process), or `session` (a new cache per session). Caches are
-built on `moka` with a time-to-live and a size or entry limit.
+**Storage.** Each runtime environment gets a dynamic object store registry,
+which creates S3, GCS, Azure, HTTP, or local file clients on demand the first
+time a path uses them (see [14](14-object-storage.md)).
 
-| Scope | Good for | Watch out for |
-|-------|----------|---------------|
-| Global | Many sessions reading the same tables | Changes made outside Sail are seen only after the TTL expires. |
-| Session | Isolation between users | Each session pays to warm its own cache. |
-| None | Data that changes constantly | Every query lists files and reads footers again. |
+**Caches.** Listing a large directory or reading Parquet footers can dominate
+query time on big tables, so Sail can cache three things: directory listings,
+per-file statistics, and Parquet metadata. Each cache can be turned off, shared
+by every session in the process (global), or kept separately for each session.
+Global caching makes repeated queries over stable tables much faster, at the
+cost that files changed by other systems are only noticed when cached entries
+expire. Per-session caching isolates users from each other. No caching means
+every query sees the latest files and pays to list them again. By default, the
+statistics and metadata caches are global and the listing cache is off. A
+dashboard over stable tables benefits from turning the listing cache on with a
+short expiry. An ingestion pipeline that writes every minute should leave it off.
 
-### 3.3 Worker sessions
-
-A worker session is minimal: a runtime environment (the same memory, spill, and
-storage setup), a Delta table cache, and DataFusion's **default features**
-(built-in functions and formats). The defaults are needed because when a worker
-decodes a plan fragment, every function the plan refers to must be resolvable
-by name.
-
-### 3.4 Session lifecycle
-
-```text
-                GetOrCreateSession
-   (none) ────────────────────────────► Running ──DeleteSession──► Deleting ──► Deleted (history kept)
-                                          │
-                                          └── creation or stop failed ──► Failed
-```
-
-1. **Get or create.** The front end sends *get or create (session ID, user ID)*.
-   If the session is running, the existing context is returned. Otherwise the
-   factory builds a new one.
-2. **Track activity and schedule a probe.** Every *get or create* call records
-   "active now" in the session's activity tracker and schedules a *probe idle
-   session* message, carrying that timestamp, for after the timeout
-   (`spark.session_timeout_secs`, 15 minutes by default, or
-   `flight.session_timeout_secs`, 1 hour, for Flight SQL).
-3. **Check the probe.** When a probe arrives, the actor compares the session's
-   last activity with the probe's timestamp. If nothing has happened since,
-   the session is idle and is deleted. If there was activity, that later
-   request already scheduled its own probe, so this one is ignored.
-4. **Delete.** The job runner is stopped. In cluster mode this shuts down the
-   session's driver and its workers. The job runner returns a **history**
-   (jobs, stages, tasks, workers), which is kept in the *Deleted* state so
-   system tables can still report on finished sessions.
-
-### 3.5 System tables
-
-Sail exposes its own runtime state as read-only SQL tables in a catalog named
-`system`:
-
-| Table | Shows |
-|-------|-------|
-| `system.session.sessions` | Sessions and their status |
-| `system.session.options` | Session settings |
-| `system.execution.jobs` | Jobs per session: ID, status, start and stop times |
-| `system.execution.stages` | Stages: partitions, inputs, mode, distribution, placement, status |
-| `system.execution.tasks` | Tasks: stage, partition, attempt, status, times |
-| `system.cluster.workers` | Workers: ID, host, port, status, times |
-
-The table definitions are generated at build time from a YAML file. Queries on
-them are answered by asking the session manager actor, which asks each session's
-job runner (or its saved history).
-
----
-
-## 4. Examples
-
-### 4.1 Bound memory and send spills to a fast disk
+Here's a configuration that bounds memory and sends spills to a fast disk:
 
 ```bash
 export SAIL_RUNTIME__MEMORY_POOL__TYPE=fair
 export SAIL_RUNTIME__MEMORY_POOL__FAIR__MAX_SIZE=17179869184      # 16 GiB
 export SAIL_RUNTIME__TEMPORARY_FILES__PATHS='["/mnt/nvme/sail-spill"]'
-sail spark server
 ```
 
-A large sort or hash aggregation now writes sorted runs to `/mnt/nvme/sail-spill`
-once it reaches its share of the 16 GiB, instead of growing until the operating
-system kills the process.
+## How sessions come and go
 
-### 4.2 Cache directory listings for a read-heavy dashboard
+Requests for the same session can arrive at the same time, for example from
+several threads of one PySpark program. Creating, checking, and deleting
+sessions is therefore handled by a session manager **actor** (see
+[02](02-entry-points-and-server.md)), which processes these events one at a time
+so they can't race.
 
-```bash
-export SAIL_EXECUTION__FILE_LISTING_CACHE__TYPE=global
-export SAIL_EXECUTION__FILE_LISTING_CACHE__TTL=300   # seconds
-```
+When a request arrives, the manager either returns the existing session or
+asks the factory to build a new one. Either way, it records the time of this
+activity and schedules a reminder to check the session again after the timeout:
+15 minutes for Spark Connect, one hour for Flight SQL. When a reminder arrives,
+the manager compares the session's last activity with the time the reminder was
+set. If there's been activity since, a newer reminder already exists, and this
+one is ignored. If not, the session has been idle for the whole timeout and is
+deleted.
 
-### 4.3 See what's running
+Deleting a session stops its job runner. In cluster mode, that shuts down the
+session's driver and its workers. The runner hands back a history of the jobs,
+stages, tasks, and workers it ran, and the manager keeps that history so the
+system tables can still report on finished sessions.
+
+## System tables: Sail describing itself
+
+Sail exposes its own runtime state as read-only tables in a catalog called
+system. You can list sessions and their settings (system.session.sessions and
+system.session.options), jobs, stages, and tasks (system.execution.jobs, stages,
+and tasks), and cluster workers (system.cluster.workers). They answer questions
+like "what's running right now?" and "which task attempts failed?" with ordinary
+SQL:
 
 ```python
 spark.sql("SELECT * FROM system.execution.jobs").show()
 spark.sql("SELECT stage, status, count(*) FROM system.execution.tasks GROUP BY 1, 2").show()
 ```
 
-### 4.4 Memory pools with numbers
+The table definitions are generated at build time from a YAML file. A query on
+them is answered by asking the session manager, which asks each session's job
+runner, or its saved history for sessions that have ended.
 
-Suppose `runtime.memory_pool.type=fair` with `max_size=8 GiB`, and a query
-runs two sorts and one hash aggregation at the same time, all able to spill:
+## Following one new client
 
-| Moment | What the pool allows |
-|--------|----------------------|
-| Only the hash aggregation is running | It can use up to the full 8 GiB |
-| All three are running | Each spillable operator gets about 8 / 3 ≈ 2.7 GiB |
-| A sort needs more than its share | That sort **spills** sorted runs to `temporary_files.paths` and continues with less memory |
-| Spilling is disabled (`temporary_files.max_size=0`) | The sort fails with a "resources exhausted" error instead |
-
-With the default **unbounded** pool, none of this happens. Operators keep
-allocating until the process hits the machine or container limit and is killed.
-For anything beyond development, set a bounded pool.
-
-### 4.5 Which cache scope should I use?
-
-| Workload | Recommended setting | Reason |
-|----------|---------------------|--------|
-| BI dashboard over stable tables, many sessions | `parquet.file_metadata_cache.type=global`, listing cache `global` with a TTL of a few minutes | Footers and listings are reused across users |
-| Ingestion pipeline writing every minute | Listing cache `none` | New files must be visible immediately |
-| Multi-tenant server | `session` scope | No cross-tenant sharing of cached metadata |
+When a PySpark client connects for the first time, its first request carries a
+new session ID. The front end asks the session manager for that session, and the
+manager asks the server session factory to build it. The factory creates the
+table format registry (including any Python data sources), the catalog manager
+from the configured catalog list, the activity tracker, a new job runner for the
+configured mode, the system table service, and the Delta cache. It builds the
+runtime environment with the memory pool, spill directories, caches, and storage
+registry. It assembles the session state without DataFusion's defaults, adds
+Sail's rules and planner, and registers first_value. The Spark Connect front end
+then adds its own extension and sets the default time zone. The manager stores
+the session, records the activity, and schedules the first idle check. Every
+later request reuses the same context and pushes the idle deadline forward.
 
 ---
 
-## 5. End-to-End: A New PySpark Client Connects
+## Common problems
 
-| # | What happens |
-|---|--------------|
-| 1 | The first request arrives with a new session ID. |
-| 2 | The front end asks the session manager actor to *get or create* it. |
-| 3 | The actor calls the server session factory, which builds the extensions (table formats including Python data sources, catalogs from `catalog.list`, activity tracker, a new job runner for `mode`, system tables, Delta cache). |
-| 4 | It builds the runtime environment: memory pool, disk manager, caches, and object store registry. |
-| 5 | It builds the session state without DataFusion's defaults, adding Sail's analyzer, optimizer, and physical rules and the extension planner. It registers `first_value`. |
-| 6 | The Spark Connect hook adds the Spark session extension and sets the default time zone. |
-| 7 | The actor stores the session as *Running*, records the activity time, and schedules an idle probe. |
-| 8 | Later requests reuse the context. Each one updates the activity time and schedules its own probe. |
-| 9 | When a probe finds no activity since it was scheduled (15 minutes by default), the session is deleted, its job runner is stopped, and its history is kept. |
+A process killed for running out of memory during big joins or sorts almost
+always means the memory pool was left unbounded; switch to the fair pool with a
+limit below the container's memory. "Resources exhausted" errors mean the pool
+is too small or spilling is disabled. If newly written files don't show up, a
+global cache with a long expiry is serving old listings or statistics; shorten
+the expiry, use session scope, or run REFRESH TABLE. A function that works
+locally but fails on workers is usually missing from the worker session. And if
+temporary views disappear, the session was idle longer than its timeout.
 
----
+## Where to look in the code
 
-## 6. Common Problems
-
-| Symptom | Cause | Fix |
-|---------|-------|-----|
-| Process killed for running out of memory on big joins or sorts | Default `unbounded` memory pool | Use `fair` with a `max_size` below the container limit. |
-| "Resources exhausted" errors | Pool too small, or the operator can't spill | Raise `max_size`, or make sure spilling isn't disabled (`temporary_files.max_size` > 0). |
-| New files in a table aren't picked up | A global listing or statistics cache with a long TTL | Lower the TTL, use `session` scope, or run `REFRESH TABLE`. |
-| A function works locally but fails on workers | The function isn't available in the worker session | Check that it's registered somewhere the worker can decode it. |
-| Temporary views disappear | Session idle timeout | Raise `spark.session_timeout_secs`. |
-
----
-
-## 7. Where to Look
-
-| Topic | Location |
-|-------|----------|
-| Server session factory | `crates/sail-session/src/session_factory/server.rs` |
-| Worker session factory | `crates/sail-session/src/session_factory/worker.rs` |
-| Runtime environment (memory, spill, caches) | `crates/sail-session/src/runtime.rs` |
-| Caches | `crates/sail-cache/src/` |
-| Session manager actor | `crates/sail-session/src/session_manager/` |
-| Table format registration | `crates/sail-session/src/formats.rs` |
-| Catalog setup | `crates/sail-session/src/catalog.rs` |
-| Optimizer rule lists | `crates/sail-session/src/optimizer.rs` |
-| Extension planner | `crates/sail-session/src/planner.rs` |
-| Extension trait, job runner trait, activity tracker | `crates/sail-common-datafusion/src/extension.rs`, `session/` |
-| System table definitions | `crates/sail-common-datafusion/data/system/databases.yaml`, `crates/sail-catalog-system/` |
+The two session factories are in crates/sail-session/src/session_factory/
+(server.rs and worker.rs). The runtime environment, with the memory pool, spill
+settings, and caches, is built in src/runtime.rs, and the cache implementations
+live in crates/sail-cache. The session manager actor is under
+src/session_manager/. Table format registration is in src/formats.rs, catalog
+setup in src/catalog.rs, the optimizer rule lists in src/optimizer.rs, and the
+extension planner in src/planner.rs. The extension mechanism, the job runner
+interface, and the activity tracker are defined in crates/sail-common-datafusion
+(extension.rs and session/). The system table definitions are in
+crates/sail-common-datafusion/data/system/databases.yaml, with the system catalog
+in crates/sail-catalog-system.

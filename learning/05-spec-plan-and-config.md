@@ -1,202 +1,96 @@
-# 05 · The Spec Plan Model (and Shared Foundations)
+# 05 · The Spec Plan: Sail's Neutral Description of a Query
 
-> **You'll learn:** what Sail's intermediate representation, the *spec plan*,
-> looks like, why it exists, how its pieces fit together, and what else lives in
-> the shared `sail-common` crate.
->
-> **Crate:** `sail-common` (`spec`, `config`, `error`, `runtime`, `object`,
-> `datetime`, `string`)
+Every request that reaches Sail, whether it's a PySpark DataFrame, a SQL string,
+or a Flight SQL statement, is first turned into the same thing: a **spec plan**.
+The spec plan is the common language between Sail's front ends and its planner.
+This doc explains what it looks like, why it exists, and a few of its less
+obvious features. It also covers the rest of sail-common, the small crate of
+foundations shared by everything else.
 
-
-## In One Minute
-
-- The **spec plan** is the one format every front end produces and the resolver
-  consumes.
-- It's plain data (Rust enums and structs) that can be printed and serialized,
-  and it records **intent**: names are not yet resolved.
-- A plan is a **query** (returns rows) or a **command** (has a side effect).
-  About 70 query node types and 60 command types exist.
-- Some types are deliberately left "configured" (string width, timestamp time
-  zone) because they depend on session settings known only at resolution.
-- `sail-common` also holds configuration, runtimes, error types, and small
-  shared helpers.
-
----
-
-## 1. What This Component Does
-
-The spec plan is the **common language** between Sail's front ends and its
-planner. Every request ends up as a spec plan:
-
-```
+```text
 PySpark DataFrame ──(Spark Connect translator)──┐
-spark.sql("…")    ──(SQL parser + analyzer)─────┼──► spec::Plan ──► Plan resolver ──► DataFusion
+spark.sql("…")    ──(SQL parser + analyzer)─────┼──► spec plan ──► resolver ──► DataFusion
 Flight SQL query  ──(SQL parser + analyzer)─────┘
 ```
 
-A spec plan is a tree of plain Rust data (enums and structs) that can be
-serialized with serde. It records **what the user asked for**, with names still
-unresolved:
-
-- Table names are just names (`["sales", "orders"]`), not table handles.
-- Columns are *unresolved attributes*: a name and, optionally, the ID of the
-  DataFrame it came from.
-- Functions are *unresolved functions*: a name, arguments, and flags such as
-  `DISTINCT` or `IGNORE NULLS`.
-- Types are Sail's own data types, which closely follow Arrow types plus a few
-  Spark-only ones.
-
 ---
 
-## 2. Why It Exists
+## What a spec plan is
 
-| Reason | What it means in practice |
-|--------|---------------------------|
-| **One resolver for every protocol** | SQL and DataFrame code both become spec plans, so the complicated resolution logic is written once. Adding a protocol means writing one translator. |
-| **Resolve later** | Translators don't need a session, catalogs, or functions. They can be pure and simple to test. |
-| **Normalization** | `df.filter(col("x") > 5)` and `WHERE x > 5` become the same filter node. The resolver handles one form, not two. |
-| **Spark-only features** | Pandas UDFs, `mapInPandas`, streaming watermarks, `na.fill`, `stat.crosstab`, and similar features have spec nodes even though DataFusion has no equivalent. |
-| **Inspectable** | Spec plans implement `Debug` and serde. When a result is wrong, print the spec plan to see whether the bug is in translation or later. |
+A spec plan is a tree of plain Rust data: enums and structs, with nothing
+clever inside. It can be printed for debugging and serialized. What makes it
+special is what it *doesn't* contain: it records what the user asked for,
+without having checked any of it.
 
----
+Table names are just names, like ["sales", "orders"]. Columns are *unresolved
+attributes*: a name, plus optionally the ID of the DataFrame the reference came
+from. Functions are *unresolved functions*: a name, its arguments, and flags such
+as DISTINCT or IGNORE NULLS. Even the comparison `>` is, at this stage, just a
+call to a function named ">". Turning these names into real tables, columns, and
+functions is the resolver's job (see [07](07-plan-resolver.md)).
 
-## 3. What's in a Spec Plan
+At the top level, a spec plan is either a **query**, which produces rows, or a
+**command**, which does something, such as creating a table or writing data,
+and may return a small result.
 
-### 3.1 Top level
+## Why have a separate representation at all?
 
-A **plan** is either:
+It would be possible to go straight from Spark protobuf or SQL syntax trees to
+DataFusion plans. Sail adds this middle step for several reasons, and the most
+important is avoiding duplicate work. Resolution is the hardest part of
+planning: catalogs, schemas, functions, Spark's naming rules. With a shared spec
+plan, that logic is written once. Supporting a new protocol means writing one
+translator, not a second resolver.
 
-- a **query plan**, which produces rows, or
-- a **command plan**, which has a side effect and may produce a small result.
+The second reason is that translators stay simple. Because the spec plan doesn't
+require anything to be looked up, the SQL analyzer and the Spark Connect
+translator need no session, no catalogs, and no function registry. They're pure
+functions from input to output, which makes them easy to test.
 
-Both carry an optional **plan ID**. Spark Connect assigns an ID to each
-DataFrame. When you write `df1["id"]`, the column reference carries `df1`'s
-plan ID, so the resolver can tell `df1.id` from `df2.id` in a self-join, even
-though both are named `id`.
+Third, it normalizes. A DataFrame call like `df.filter(col("x") > 5)` and the SQL
+`WHERE x > 5` become the same filter node, so the resolver handles one form, not
+two.
 
-### 3.2 Query nodes
+Fourth, it has room for things DataFusion doesn't. pandas UDFs, `mapInPandas`,
+streaming watermarks, `df.na.fill`, `df.stat.crosstab` and other Spark-only
+features all have spec nodes, even though DataFusion has no equivalent.
 
-About 70 query node types, grouped by purpose:
+Finally, because the spec plan is plain data, you can print it. When a query
+returns a wrong result, printing the spec plan tells you quickly whether the
+problem is in translation or later.
 
-| Group | Nodes |
-|-------|-------|
-| Reading | Read (named table, data source with format/paths/options, table function, dynamic table), LocalRelation (inline data), Values, Range, Empty, CachedLocalRelation |
-| Relational | Project, Filter, Join, LateralJoin, Aggregate, Sort, Limit (with optional offset), Tail, Deduplicate, SetOperation (union, intersect, except), SubqueryAlias, TableAlias |
-| Columns | WithColumns, WithColumnsRenamed, Drop, ToDf, ToSchema |
-| Reshaping | Pivot, Unpivot, LateralView (generators like `explode`) |
-| Partitioning | Repartition, RepartitionByExpression, Hint |
-| Sampling | Sample, TableSample |
-| Python | MapPartitions (`mapInPandas`/`mapInArrow`), GroupMap (`applyInPandas`), CoGroupMap, ApplyInPandasWithState, user-defined table functions |
-| Streaming | WithWatermark |
-| DataFrame helpers | FillNa, DropNa, Replace, StatSummary, StatDescribe, StatCrosstab, StatCov, StatCorr, StatApproxQuantile, StatFreqItems, StatSampleBy, CollectMetrics, Parse (`from_json`/`from_csv` on a DataFrame) |
-| SQL structure | WithCtes (`WITH`), WithParameters (bound `?`/`:name` parameters), WithRelations |
+## What's inside
 
-### 3.3 Command nodes
+There are about 70 kinds of query steps. They cover reading (named tables, files
+with a format and options, table functions, inline data, ranges), the usual
+relational operations (projection, filter, join, aggregate, sort, limit,
+distinct, union and friends, aliases), column operations (adding, renaming, and
+dropping columns), reshaping (pivot, unpivot, and generators like explode),
+repartitioning, sampling, Python operations (map in pandas, grouped and
+co-grouped pandas functions, Python table functions), streaming watermarks, the
+DataFrame helpers for missing values and statistics, and SQL structure such as
+WITH clauses and bound parameters.
 
-About 60 command types:
+There are about 60 kinds of commands. They manage catalogs, databases, tables,
+views, and functions; write data (`df.write`, `df.writeTo`, streaming writes,
+INSERT, LOAD DATA); change rows (MERGE, UPDATE, DELETE); manage caching; and
+display things (`df.show()`, notebook HTML, EXPLAIN, DESCRIBE).
 
-| Group | Commands |
-|-------|----------|
-| Catalogs and databases | CurrentCatalog, SetCurrentCatalog, CreateCatalog, CurrentDatabase, SetCurrentDatabase, CreateDatabase, DropDatabase, ListCatalogs, ListDatabases, GetDatabase, DatabaseExists, DescribeCatalog, DescribeDatabase |
-| Tables | CreateTable, CreateTableAsSelect, AlterTable, DropTable, RefreshTable, RefreshByPath, RecoverPartitions, ListTables, ShowTables, ShowTableExtended, GetTable, TableExists, ListColumns, DescribeTable, AnalyzeTable(s) |
-| Views | CreateView, AlterView, DropView, CreateTemporaryView, DropTemporaryView, ListViews |
-| Functions | RegisterFunction, RegisterTableFunction, RefreshFunction, DropFunction, ListFunctions, GetFunction, FunctionExists, DescribeFunction |
-| Writes | Write (v1 `df.write`), WriteTo (v2 `df.writeTo`), WriteStream, InsertInto, InsertOverwriteDirectory, LoadData |
-| Row-level | MergeInto, Update, Delete |
-| Caching | CacheTable, UncacheTable, ClearCache, IsCached |
-| Display | ShowString (`df.show()`), HtmlString (notebooks), Explain, DescribeQuery |
-| Other | SetVariable, CommentOn… |
+Expressions include literals, column references, function calls, stars (with
+Spark 4's options such as `SELECT * EXCEPT (a)`), aliases, casts, sort orders,
+window specifications, lambdas for higher-order functions, struct field updates,
+subqueries, grouping sets, inline Python UDF definitions, and parameter
+placeholders.
 
-### 3.4 Expressions
+Data types closely follow Arrow's: integers of every width, floats, decimals,
+dates, times, timestamps, intervals, binary and string types, lists, structs,
+maps, and so on. Literals carry their exact type, down to timestamp precision.
 
-| Expression | Meaning | Example source |
-|------------|---------|----------------|
-| Literal | A typed constant | `5`, `'abc'`, `DATE '2024-01-01'` |
-| UnresolvedAttribute | A column reference by name (plus an optional plan ID, and whether it's a metadata column) | `amount`, `t.amount`, `df["amount"]` |
-| UnresolvedFunction | A function call by name, with positional and named arguments, `DISTINCT`, `IGNORE NULLS`, `FILTER (WHERE …)`, and `ORDER BY` inside aggregates | `count(DISTINCT x)`, `percentile_cont(0.5) WITHIN GROUP (ORDER BY x)` |
-| UnresolvedStar | `*` or `t.*`, optionally with exclusions | `SELECT * EXCEPT (a)` |
-| UnresolvedRegex | Columns selected by regular expression | `` df.colRegex("`a.*`") `` |
-| UnresolvedExtractValue | Field, index, or key access | `s.field`, `arr[0]`, `m['k']` |
-| Alias, Cast, SortOrder, Window | What the names say | `x AS y`, `CAST(x AS INT)`, `ORDER BY x DESC NULLS LAST`, `OVER (…)` |
-| LambdaFunction, UnresolvedNamedLambdaVariable | Higher-order functions | `transform(arr, x -> x + 1)` |
-| UpdateFields | Change struct fields | `withField`, `dropFields` |
-| Subqueries | ScalarSubquery, InSubquery, Exists | `WHERE x IN (SELECT …)` |
-| Grouping | Rollup, Cube, GroupingSets | `GROUP BY ROLLUP(a, b)` |
-| CommonInlineUserDefinedFunction | An inline Python UDF definition | `@udf` functions |
-| Placeholder, NamedArgument, CallFunction | Parameters, `f(arg => value)`, `call_function("name", …)` | |
+## Why DataFrame IDs matter: the self-join
 
-### 3.5 Data types
-
-Spec data types follow Arrow closely: integers (signed and unsigned, 8–64
-bits), floats (16, 32, 64), decimals (128 and 256), dates, times, timestamps,
-durations, intervals, binary and string types (regular, large, and view
-variants), lists, structs, maps, unions, and dictionaries. A few types aren't
-in Arrow:
-
-| Type | Why |
-|------|-----|
-| **ConfiguredUtf8 / ConfiguredBinary** | Spark's `STRING` and `BINARY`. Whether they become 32-bit or 64-bit-offset Arrow types depends on `spark.sql.execution.arrow.useLargeVarTypes`, which isn't known until resolution. |
-| **Timestamp with "configured" time zone** | Spark's plain `TIMESTAMP` means LTZ or NTZ depending on `spark.sql.timestampType`, also decided at resolution. |
-| **UserDefined** | Spark UDTs, which keep their JVM/Python class names and an underlying SQL type. |
-| **Variant** | Spark 4's semi-structured `VARIANT`. |
-| **Geometry / Geography** | Spatial types with a spatial reference ID (Spark 4.1). |
-
-Deciding these "configured" types late is a good example of why resolution is
-a separate step: the same SQL text can produce different Arrow types in
-different sessions.
-
-### 3.6 Literals
-
-Literals carry their exact type: every integer width, floats, decimals with
-precision and scale, timestamps at each precision (second to nanosecond) with an
-optional time zone, dates, times, intervals (year-month, day-time,
-month-day-nanosecond), binary, strings, and nested arrays, maps, and structs.
-
----
-
-## 4. Other Shared Foundations in `sail-common`
-
-| Module | What it provides |
-|--------|------------------|
-| `config` | The application configuration: a YAML schema compiled into the binary, plus `SAIL_*` environment variable overrides (see [02](02-entry-points-and-server.md)). Also the internal CLI configuration. |
-| `runtime` | The primary and io Tokio runtimes and the handle passed around to reach them. |
-| `error` | Common error kinds: missing argument, invalid argument, not supported, internal error. Each crate wraps these in its own error type. |
-| `object` | Helpers that let trait objects be compared, hashed, and ordered. DataFusion needs this for Sail's custom plan nodes and UDFs. |
-| `datetime` | Time zone and timestamp helpers shared by functions and planning. |
-| `string` | String helpers, such as case-insensitive comparison. |
-
----
-
-## 5. Example: The Same Query From Two Front Ends
-
-**DataFrame:**
-
-```python
-orders = spark.table("sales.orders")
-orders.filter(orders["amount"] > 100).select("region", "amount").limit(5)
-```
-
-**SQL:**
-
-```sql
-SELECT region, amount FROM sales.orders WHERE amount > 100 LIMIT 5
-```
-
-Both produce essentially this spec plan (shown as an indented tree):
-
-```text
-Query: Limit(5)
-  Project [ UnresolvedAttribute(region), UnresolvedAttribute(amount) ]
-    Filter UnresolvedFunction(">", [UnresolvedAttribute(amount), Literal(Int32 100)])
-      Read NamedTable(name = ["sales", "orders"])
-```
-
-The only difference: in the DataFrame version, the `amount` reference in the
-filter carries the plan ID of `orders`. Note that `>` is just a function named
-`>` at this stage. Operators become real comparison expressions during
-resolution.
-
-### 5.1 Why plan IDs matter: the self-join example
+Each DataFrame in PySpark carries a plan ID, and every column reference made
+through a DataFrame remembers it. This sounds like a detail until you join a
+table to itself:
 
 ```python
 people = spark.table("people")
@@ -205,71 +99,89 @@ pairs = people.join(managers, people["manager_id"] == managers["id"])
 pairs.select(people["name"], managers["name"]).show()
 ```
 
-Both sides have columns named `name` and `id`. In the spec plan, the column
-references are:
+Both sides of the join have columns called name and id. In the spec plan,
+`people["name"]` is "the column called name, from the DataFrame people", and
+`managers["name"]` is "the column called name, from the DataFrame managers". The
+resolver uses these IDs to pick the right column on each side. A plain SQL
+reference to name, with no ID, would be ambiguous here and fail with "ambiguous
+attribute", which is exactly what Spark does.
 
-| Reference | Name | Plan ID |
-|-----------|------|---------|
-| `people["manager_id"]` | `manager_id` | ID of `people` |
-| `managers["id"]` | `id` | ID of `managers` |
-| `people["name"]` | `name` | ID of `people` |
-| `managers["name"]` | `name` | ID of `managers` |
+## Types that wait for the session
 
-The plan IDs let the resolver pick the right `name` on each side. A plain SQL
-reference like `name` (no plan ID) would be ambiguous here and fail with
-*ambiguous attribute*.
+A few spec types are deliberately left undecided, because their final form
+depends on session settings that the translators don't know.
 
-### 5.2 How a "configured" type becomes concrete
+Spark's STRING type is a good example. In Arrow it could be a regular string
+array, with 32-bit offsets, or a large string array, with 64-bit offsets that
+allow more than 2 GB of text per batch. Which one Sail uses depends on the
+session setting spark.sql.execution.arrow.useLargeVarTypes. So the spec plan
+records a "configured string" type, and the resolver picks the concrete Arrow
+type once it can see the session. Spark's plain TIMESTAMP works the same way: it
+means "with local time zone" or "without time zone" depending on
+spark.sql.timestampType.
 
-The SQL type `STRING` becomes **ConfiguredUtf8** in the spec. During resolution:
+This is a small but clear example of why resolution is a separate step. The
+same SQL text can legitimately produce different Arrow types in two different
+sessions, so the decision can't be made while parsing.
 
-| `spark.sql.execution.arrow.useLargeVarTypes` | Arrow type chosen |
-|----------------------------------------------|-------------------|
-| `false` (default) | `Utf8` (32-bit offsets) |
-| `true` | `LargeUtf8` (64-bit offsets, for values over 2 GB per batch) |
+A few other types exist that Arrow doesn't have: user-defined types that carry
+their Java or Python class names, Spark 4's VARIANT for semi-structured data, and
+geometry and geography types for spatial data.
 
-Likewise, `TIMESTAMP` becomes `Timestamp(µs, session time zone)` (LTZ) or
-`Timestamp(µs, no time zone)` (NTZ) depending on `spark.sql.timestampType`. The
-same SQL text can produce different Arrow types in different sessions, so the
-decision can't be made at parse time.
+## One query, two front ends
 
----
+The DataFrame code
 
-## 6. End-to-End: Life of a Spec Plan
+```python
+orders = spark.table("sales.orders")
+orders.filter(orders["amount"] > 100).select("region", "amount").limit(5)
+```
 
-| # | Stage | What happens to the spec plan |
-|---|-------|-------------------------------|
-| 1 | Front end | Built from protobuf or SQL. Pure data, no session needed. |
-| 2 | Debugging (optional) | Can be printed (`{:?}`) or serialized. |
-| 3 | Resolver | Walked top-down and bottom-up. Names are looked up, types are fixed using the session's plan config, and the result is a DataFusion logical plan (see [07](07-plan-resolver.md)). |
-| 4 | After resolution | No longer used. Everything downstream works on DataFusion plans. |
+and the SQL
 
----
+```sql
+SELECT region, amount FROM sales.orders WHERE amount > 100 LIMIT 5
+```
 
-## 7. Extending the Spec
+produce essentially the same spec plan:
 
-Add a new spec node when a feature can't be expressed with existing nodes:
+```text
+Query: Limit(5)
+  Project [ column region, column amount ]
+    Filter function ">"(column amount, literal Int32 100)
+      Read named table ["sales", "orders"]
+```
 
-1. Add the variant to the query node, command node, or expression enum, with
-   fields that capture **intent**, not implementation. Use spec expressions and
-   object names, never DataFusion types.
-2. Produce it from every front end that supports the feature: Spark Connect
-   (`proto/plan.rs`) and, if there's SQL syntax for it, the SQL analyzer.
-3. Resolve it in `sail-plan` (see [07](07-plan-resolver.md)).
-4. Keep the field order and serde names stable. The spec is used in tests and
-   logs.
+The only difference is that, in the DataFrame version, the amount reference in
+the filter also carries the plan ID of orders. After this point, Sail can't tell
+which front end the query came from.
 
----
+## The rest of sail-common
 
-## 8. Where to Look
+Besides the spec plan, sail-common holds the foundations everything else relies
+on. The configuration module defines Sail's settings in a YAML file compiled
+into the binary and loads environment variable overrides (see
+[02](02-entry-points-and-server.md)). The runtime module creates the two thread
+pools, one for query work and one for I/O. The error module defines the basic
+error kinds (missing argument, invalid argument, not supported, internal error)
+that each crate wraps in its own error type. A small object module makes trait
+objects comparable and hashable, which DataFusion needs for Sail's custom plan
+nodes and functions. There are also helpers for dates, times, and strings.
 
-| Topic | Location |
-|-------|----------|
-| Plans, query nodes, command nodes | `crates/sail-common/src/spec/plan.rs` |
-| Expressions, object names, identifiers | `crates/sail-common/src/spec/expression.rs` |
-| Data types | `crates/sail-common/src/spec/data_type.rs` |
-| Literals | `crates/sail-common/src/spec/literal.rs` |
-| Configuration | `crates/sail-common/src/config/` |
-| Runtimes | `crates/sail-common/src/runtime.rs` |
-| Errors | `crates/sail-common/src/error.rs` |
-| Settings that affect resolution (plan config) | `crates/sail-plan/src/config.rs` |
+## Extending the spec
+
+Add a spec node when a feature can't be expressed with the existing ones. Give
+it fields that capture what the user *meant*, using spec expressions and names
+rather than DataFusion types. Produce it from every front end that supports the
+feature: the Spark Connect translator and, if there's SQL syntax for it, the SQL
+analyzer. Then teach the resolver to handle it. Keep field names stable, because
+spec plans appear in tests and logs.
+
+## Where to look in the code
+
+The spec plan lives in crates/sail-common/src/spec/: plan.rs defines plans,
+query steps, and commands, expression.rs defines expressions and names,
+data_type.rs the data types, and literal.rs the literals. Configuration is under
+src/config/, the runtimes in src/runtime.rs, and the error types in src/error.rs.
+The session settings that affect resolution, the plan config, are defined in
+crates/sail-plan/src/config.rs.
