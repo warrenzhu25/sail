@@ -14,6 +14,21 @@
 > [13](13-lakehouse-delta-and-iceberg.md), and storage access (S3, GCS, …) is in
 > [14](14-object-storage.md).
 
+
+## In One Minute
+
+- Every read and write goes through a **table format** plugin, looked up by name
+  (`parquet`, `csv`, `delta`, …) in the session's registry.
+- File formats are built on DataFusion's **listing table**: parallel scans,
+  pruning, projection and filter pushdown, partition directories.
+- Sail adds Spark behavior: Hadoop-style globs, hidden-file filtering
+  (`_SUCCESS`, `.crc`), partition inference, and Spark option names.
+- About 250 **options** are defined in YAML files and turned into typed structs
+  at build time. Options are applied in **layers** (table properties, then query
+  options).
+- Plain file writers currently **append only**. Lakehouse formats support
+  overwrite, replace-where, and row-level changes.
+
 ---
 
 ## 1. What This Component Does
@@ -263,6 +278,42 @@ class CounterReader(DataSourceReader):
 spark.dataSource.register(Counter)
 spark.read.format("counter").load().show()
 ```
+
+### 4.1 Option layering, worked out
+
+A CSV table is created with a table property, then read with a query option:
+
+```sql
+CREATE TABLE raw_events (id INT, msg STRING) USING csv
+  LOCATION 's3://lake/raw/' TBLPROPERTIES ('option.sep' = ';', 'option.header' = 'true');
+```
+
+```python
+spark.read.option("sep", "|").table("raw_events")
+```
+
+| Layer (applied in order) | `sep` | `header` |
+|--------------------------|-------|----------|
+| Default (from `csv.yaml`) | `,` | `false` |
+| Table properties (`option.sep`, `option.header`) | `;` | `true` |
+| Query options (`.option("sep", "|")`) | **`\|`** | (not set) |
+| **Effective value** | **`\|`** | **`true`** |
+
+Later layers win, key by key. Aliases (`sep` and `delimiter`) match the same
+option, and matching is case-insensitive.
+
+### 4.2 What partition inference produces
+
+```text
+s3://lake/events/date=2024-01-01/country=US/part-0.parquet
+s3://lake/events/date=2024-01-01/country=DE/part-1.parquet
+s3://lake/events/date=2024-01-02/country=US/part-2.parquet
+s3://lake/events/_SUCCESS                      ← hidden, skipped
+```
+
+`spark.read.parquet("s3://lake/events/")` yields the file columns plus
+**`date`** and **`country`**, taken from the directory names. A filter such as
+`country = 'DE'` opens only `part-1.parquet`.
 
 ---
 

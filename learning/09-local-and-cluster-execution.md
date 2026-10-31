@@ -11,6 +11,19 @@
 > The data exchange between tasks (streams and shuffle) is covered in
 > [10 · Shuffle and Streams](10-shuffle-and-streams.md).
 
+
+## In One Minute
+
+- **Local mode** runs the physical plan in-process with DataFusion.
+  **Cluster mode** sends it to a **driver**, which runs it on **workers**.
+- The plan is cut into **stages** wherever data must be exchanged (repartition,
+  coalesce, sort-preserving merge). Each stage has one **task** per partition.
+- In the default pipelined mode, connected stages run **together** as one
+  **region**. A region needs about as many slots as its widest stage.
+- Workers start on demand (4 initially, then as needed) and stop after 60
+  seconds idle. Lost workers are detected by missing heartbeats (120 seconds).
+- A failed task reruns its whole region, up to 3 attempts.
+
 ---
 
 ## 1. What This Component Does
@@ -275,6 +288,38 @@ workers. With `WORKER_TASK_SLOTS=2`, the assigner would ask for two more workers
 spark.sql("SELECT * FROM system.execution.stages").show(truncate=False)
 spark.sql("SELECT * FROM system.cluster.workers").show()
 ```
+
+### 4.4 A failure, step by step
+
+A two-stage pipelined job is running when task (stage 1, partition 3) fails
+with an error:
+
+```text
+t0  task (s1, p3, attempt 0) reports FAILED
+t0  scheduler: region R0 has a failed task with 1 attempt < 3  → region not failed yet
+t0  scheduler: create attempt 1 for every task in R0 (both stages, all partitions)
+t0  assigner: queue R0's task sets again with the new attempts
+t1  new attempts run; streams use new keys (attempt = 1), so no data mixes with attempt 0
+t2  all tasks of attempt 1 succeed → region succeeded → job succeeded
+```
+
+If the same task fails on attempts 0, 1, and 2, the region is marked failed and
+the job fails with the last error.
+
+### 4.5 A lost worker, step by step
+
+```text
+t=0s     worker W3 sends its last heartbeat, then its pod is evicted
+t=120s   heartbeat timeout probe fires: no heartbeat since t=0s → W3 is LOST
+         - W3 is stopped and removed from the slot pool
+         - every task assigned to W3 is marked FAILED ("task failed for lost worker")
+         - affected jobs are refreshed → their regions are rescheduled with new attempts
+         - the assigner asks for a replacement worker if slots are now short
+```
+
+On this branch, a lost worker counts as a normal task failure (toward the 3
+attempts). The `disk-shuffle-hardening` branch treats it as recoverable instead
+(see [10](10-shuffle-and-streams.md)).
 
 ---
 

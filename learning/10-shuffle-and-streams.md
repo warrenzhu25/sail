@@ -8,6 +8,21 @@
 > **Crate:** `sail-execution` (`plan/` shuffle operators, `stream/`,
 > `stream_manager/`, `stream_accessor/`, `stream_service/`)
 
+
+## In One Minute
+
+- Every exchanged piece of data is a **stream** of Arrow batches named by
+  **(job, stage, partition, attempt, channel)**.
+- Upstream tasks end with **shuffle write** (split batches into channels).
+  Downstream tasks start with **shuffle read** (open and merge the channels
+  they need).
+- Streams live in memory by default, with bounded buffers that apply
+  **backpressure**. Workers fetch remote streams with **Arrow Flight**.
+- A reader may ask for a stream before it exists. It's parked as *pending* until
+  the producer appears, or until a timeout.
+- Disk-based (blocking) shuffle exists but can't be turned on from
+  configuration on this branch.
+
 ---
 
 ## 1. What This Component Does
@@ -197,6 +212,36 @@ Suppose stage 0 has 3 partitions (P0, P1, P2), and stage 1 has 2 partitions
   p ∈ {0,1,2} and c ∈ {0,1}.
 - If P1 and Q0 run on the same worker, Q0 reads P1's stream directly from memory.
   P0's and P2's streams come over Flight from their workers.
+
+### 4.1 Reader before writer: the pending state
+
+Pipelined stages start together, so a consumer can ask for a stream before its
+producer has created it:
+
+```text
+t=0ms   consumer asks worker A for key K           → A has no stream K: create PENDING(K), park the reader
+t=0ms   A schedules a check for K after task_stream_creation_timeout_secs
+t=40ms  producer on A publishes stream K            → PENDING becomes CREATED; the parked reader is connected
+t=41ms  batches start flowing to the consumer
+```
+
+If the producer never appears (for example, its task crashed before starting),
+the timed check fires, the pending reader gets an error, and the consumer task
+fails, which triggers a region retry (see [09](09-local-and-cluster-execution.md)).
+
+### 4.2 Backpressure in practice
+
+Each in-memory stream holds at most `cluster.task_stream_buffer` (16) batches.
+With the default batch size of 8,192 rows:
+
+| Situation | What happens |
+|-----------|--------------|
+| Consumer keeps up | Producer writes freely, and the buffer stays nearly empty |
+| Consumer is slow | Buffer fills to 16 batches (≈ 130K rows), then the producer's next write **waits** |
+| Consumer stops (`LIMIT` satisfied) | Its channel reports *closed*. The producer skips it, and stops early if every channel is closed. |
+
+Memory per stream is bounded, so a slow consumer slows the pipeline down
+instead of exhausting memory.
 
 ---
 

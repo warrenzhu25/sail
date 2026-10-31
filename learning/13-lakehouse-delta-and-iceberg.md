@@ -8,6 +8,21 @@
 >
 > **Crates:** `sail-delta-lake`, `sail-iceberg`, `sail-plan-lakehouse`
 
+
+## In One Minute
+
+- Lakehouse formats record **exactly which files form each table version**,
+  which enables atomic writes, time travel, schema evolution, and row-level
+  changes.
+- Sail implements **Delta Lake and Iceberg natively in Rust**, and runs
+  metadata work (log replay, manifest scans) as ordinary parallel plans.
+- Reads: pick a version, list its files from the log or manifests, prune by
+  statistics, scan Parquet, then apply deletion vectors or delete files.
+- Writes: write Parquet files, then publish a new version atomically. Delta
+  checks conflicts with concurrent writers.
+- `DELETE`, `UPDATE`, `MERGE` on Delta use copy-on-write, or deletion vectors when
+  enabled. Iceberg row-level writes aren't implemented yet.
+
 ---
 
 ## 1. What This Component Does
@@ -186,6 +201,40 @@ WHEN NOT MATCHED THEN INSERT *;
 SELECT * FROM ice.db.events VERSION AS OF 123456789;
 SELECT * FROM ice.db.events TIMESTAMP AS OF '2024-06-01 00:00:00';
 ```
+
+### 5.1 Delta log replay, worked out
+
+A table's `_delta_log/` contains three commits (simplified):
+
+```text
+00000000000000000000.json   add(part-a)  add(part-b)
+00000000000000000001.json   add(part-c)
+00000000000000000002.json   remove(part-a)  add(part-d)      ← e.g. an UPDATE rewrote part-a as part-d
+```
+
+| Read | Replay result (active files) |
+|------|------------------------------|
+| Latest (version 2) | `part-b`, `part-c`, `part-d` |
+| `versionAsOf=1` | `part-a`, `part-b`, `part-c` |
+| `versionAsOf=0` | `part-a`, `part-b` |
+
+Replay keeps the **newest action per file**. `part-a`'s newest action at
+version 2 is `remove`, so it drops out. Older versions stop replay earlier,
+which is all time travel is. After a checkpoint is written (for example at
+version 10, controlled by the table's checkpoint interval), replay starts from
+the checkpoint instead of version 0.
+
+### 5.2 Copy-on-write vs. deletion vectors, with numbers
+
+Deleting 10 rows from a 1 GB file of 10 million rows:
+
+| Strategy | Data written | Readers afterwards |
+|----------|--------------|--------------------|
+| Copy-on-write | A new ≈ 1 GB file without the 10 rows | Read the new file normally |
+| Deletion vector | A tiny bitmap file marking 10 row positions | Read the old file and skip the 10 marked rows |
+
+Deletion vectors make small deletes cheap. The cost moves to readers, which is
+why tables are periodically compacted.
 
 ---
 

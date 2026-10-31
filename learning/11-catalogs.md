@@ -10,6 +10,20 @@
 > `sail-catalog-hms`, `sail-catalog-iceberg`, `sail-catalog-unity`,
 > `sail-catalog-onelake`
 
+
+## In One Minute
+
+- **Catalog providers** store metadata: in-memory, Glue, Hive Metastore, Iceberg
+  REST, Unity, OneLake, and the read-only `system` catalog.
+- The per-session **catalog manager** interprets names (one-, two-, and
+  three-part, with the current catalog and database) and holds temporary views.
+- Lookup order for reads: **temporary view → global temporary view → table →
+  view**.
+- Remote providers are wrapped with a **cache** (TTL and size limits,
+  invalidated on DDL) and a **runtime** layer (calls run on the io thread pool).
+- Catalogs are configured in `catalog.list`. The in-memory catalog's metadata
+  lasts **only as long as the session**.
+
 ---
 
 ## 1. What This Component Does
@@ -195,6 +209,31 @@ spark.sql("SELECT * FROM global_temp.shared").show()
 export SAIL_CATALOG__LIST='[{name="hms", type="hms", uris=["thrift://metastore:9083"],
   table_cache_type="global", table_cache_ttl_secs=60}]'
 ```
+
+### 4.4 Name resolution, worked out
+
+Setup: catalogs `sail` (default, memory) and `glue`. The current database is
+`default`.
+
+| You write | Catalog | Namespace | Object | Notes |
+|-----------|---------|-----------|--------|-------|
+| `orders` | `sail` | `default` | `orders` | Temporary view `orders` wins if one exists |
+| `sales.orders` | `sail` | `sales` | `orders` | `sales` isn't a catalog, so it's a database |
+| `glue.sales.orders` | `glue` | `sales` | `orders` | First part matches a catalog |
+| `glue.orders` | `glue` | (empty) | `orders` | **Error: "empty namespace"**, because a catalog was named without a database |
+| `global_temp.v` | (none) | | `v` | Global temporary view |
+| `a.b.c.t` with catalog `a` | `a` | `b.c` | `t` | Multi-level namespace |
+
+After `USE glue.sales`, the bare name `orders` resolves to `glue.sales.orders`.
+
+### 4.5 How the cache stays correct
+
+| Action | Cache effect |
+|--------|--------------|
+| `spark.table("glue.sales.orders")` (miss) | Calls Glue, stores the table status |
+| Same call again within the TTL | Served from cache, no Glue call |
+| `ALTER TABLE glue.sales.orders …` or `DROP TABLE …` through Sail | Entry invalidated |
+| Table changed by **another** system (for example Spark or Athena) | Sail sees the old metadata until the TTL expires |
 
 ---
 

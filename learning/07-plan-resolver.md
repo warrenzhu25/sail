@@ -7,6 +7,22 @@
 > **Crate:** `sail-plan` (resolver, function mapping, catalog command node,
 > explain, result formatting, streaming rewrite)
 
+
+## In One Minute
+
+- The resolver turns a spec plan into a DataFusion plan that **behaves like
+  Spark**: case-insensitive names, duplicate column names, aliases in
+  `GROUP BY`, `ORDER BY` on columns not in `SELECT`, and about 500 functions
+  with Spark semantics.
+- Every column gets an **internal ID** (`#0`, `#1`, …), which removes ambiguity.
+  User-facing names are restored at the end.
+- Table names are looked up in order: `format.path` shortcut, CTE, then catalog
+  (temporary view, table, or view).
+- Functions are looked up in order: session UDFs, then built-in scalar or
+  generator functions, then aggregates.
+- Commands (DDL, writes, `SHOW`) also become logical plans, so they go through
+  the same pipeline and job runner.
+
 ---
 
 ## 1. What This Component Does
@@ -230,6 +246,47 @@ Projection: #3, #4
 Parquet scan (row-group pruning and page-index filtering), the aggregate is
 split into partial and final stages around a hash repartition on `region`, and
 the output columns are renamed to `region` and `n`.
+
+### 4.1 Hidden columns, step by step
+
+```sql
+SELECT name FROM people ORDER BY age
+```
+
+`age` isn't in the `SELECT` list, but Spark allows sorting by it.
+
+| Step | Plan | Columns (internal → user) |
+|------|------|---------------------------|
+| Read `people` | Scan | `#0→name`, `#1→age` |
+| Project `name` | Projection keeps `#0` **and** `#1`, with `#1` marked **hidden** | `#0→name`, `#1→age (hidden)` |
+| Sort by `age` | `age` matches hidden `#1` | |
+| Remove hidden columns | Final projection keeps only `#0` | `#0→name` |
+| Rename | Output column named `name` | |
+
+Without hidden columns, the projection would drop `age` before the sort could
+use it.
+
+### 4.2 Why internal IDs: duplicate names
+
+```sql
+SELECT a, a FROM t
+```
+
+DataFusion doesn't allow two output columns with the same name. Sail produces
+`#5→a` and `#6→a`. They're distinct internally and renamed to `a`, `a` only at
+the very end, which matches Spark's output.
+
+### 4.3 Function lookup, three cases
+
+| Call | Found in | Result |
+|------|----------|--------|
+| `my_udf(x)` after `spark.udf.register("my_udf", ...)` | Session functions (checked first) | Python UDF expression |
+| `upper(x)` | Built-in scalar table | DataFusion `upper` with Spark handling |
+| `percentile_cont(0.5) WITHIN GROUP (ORDER BY x)` | Built-in aggregate table | Ordered-set aggregate |
+| `uppr(x)` (typo) | Nowhere | `AnalysisException: unknown function: uppr` |
+
+A session UDF with the same name as a built-in (for example, `upper`)
+**overrides** the built-in, because session functions are checked first.
 
 ---
 

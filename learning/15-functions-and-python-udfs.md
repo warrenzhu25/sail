@@ -9,6 +9,19 @@
 > `sail-plan/src/function` (the name → builder tables), `sail-python-udf`
 > (Python UDF execution), `sail-python` (the `pysail` bindings)
 
+
+## In One Minute
+
+- About 500 Spark functions are listed in **tables** that map each name to a
+  **builder**. The builder turns resolved arguments into a DataFusion expression.
+- Where Spark differs from DataFusion (NULL handling, date formats, ANSI mode),
+  Sail provides its own implementation in `sail-function`.
+- Python UDFs run **in the Sail process** through embedded CPython (PyO3). No
+  separate Python workers or sockets are involved.
+- Prefer **pandas or Arrow UDFs** (one call per batch) over plain `@udf` (one
+  call per row).
+- In cluster mode, every worker needs the same Python packages installed.
+
 ---
 
 ## 1. What This Component Does
@@ -185,6 +198,35 @@ df.mapInPandas(keep_positive, schema=df.schema)
 spark.udf.register("plus_one", plus_one)
 spark.sql("SELECT plus_one(id) FROM range(3)").show()
 ```
+
+### 4.1 Spark semantics vs. "plain SQL" semantics
+
+| Expression | Spark (and Sail) | A typical SQL engine |
+|------------|------------------|----------------------|
+| `concat('a', NULL)` | `NULL` | Some return `'a'` |
+| `date_format(ts, 'yyyy-MM-dd')` | Java-style pattern | strftime-style `'%Y-%m-%d'` |
+| `element_at(array(10, 20), 1)` | `10` (1-based) | `arr[0]` style (0-based) |
+| `1 / 0` (ANSI off) | `NULL` | Error |
+| `1 / 0` (ANSI on) | `ArithmeticException` | Error |
+| `CAST('abc' AS INT)` (ANSI off) | `NULL` | Error |
+
+These differences are why each function goes through a builder that can pick a
+Spark-compatible implementation and read the session's ANSI setting.
+
+### 4.2 UDF styles and their cost
+
+For a column of 10 million rows, in batches of 8,192 rows:
+
+| Style | Python calls | Data conversion |
+|-------|--------------|-----------------|
+| `@udf` (row-at-a-time) | ≈ 10,000,000 | Each value is converted to a Python object and back |
+| `@udf(useArrow=True)` | ≈ 1,220 | Batch-level Arrow conversion |
+| `@pandas_udf` | ≈ 1,220 | Arrow → `pandas.Series` → Arrow, vectorized |
+| Arrow UDF (Spark 4) | ≈ 1,220 | Arrow arrays directly |
+
+Vectorized styles make about 8,000× fewer Python calls, and they spend most of
+their time in native code (pandas, NumPy, Arrow) that doesn't hold Python's
+interpreter lock.
 
 ---
 

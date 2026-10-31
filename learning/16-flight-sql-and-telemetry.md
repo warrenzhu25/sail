@@ -7,6 +7,21 @@
 > **Crates:** `sail-flight`, `sail-telemetry`, plus the system tables from
 > [06](06-session-and-runtime.md)
 
+
+## In One Minute
+
+- **Flight SQL** lets SQL tools query Sail over gRPC and get Arrow results. It
+  reuses the same parser, planner, and engine as Spark Connect.
+- Flight SQL runs a query in two steps: *GetFlightInfo* (plan and start) returns
+  a ticket, then *DoGet* streams the results (readable once).
+- All Flight clients currently share **one session**, and there's no built-in
+  authentication.
+- **Telemetry** is OpenTelemetry-based: logs (stderr and span events), traces
+  (every operator), and metrics (rows, bytes, time, memory, spills, joins). It's
+  all **off by default**.
+- Spans and metrics carry the same labels (job, stage, partition, attempt,
+  operator), so you can slice by query or stage.
+
 ---
 
 ## Part A: Arrow Flight SQL
@@ -63,6 +78,27 @@ cur = conn.cursor()
 cur.execute("SELECT region, count(*) FROM parquet.`/data/orders` GROUP BY region")
 print(cur.fetch_arrow_table())
 ```
+
+### A.5 What a trace looks like
+
+A simplified trace for one Spark Connect query in local mode:
+
+```text
+ExecutePlan (gRPC server span)                                   210 ms
+├─ handle_execute_plan
+│  ├─ resolve_and_execute_plan                                    18 ms
+│  └─ JobRunner::execute                                           2 ms
+└─ ExecutorTaskContext::next (stream)                            188 ms
+   └─ job 7
+      ├─ ProjectionExec        rows=10   compute=0.1 ms
+      ├─ AggregateExec(final)  rows=10   compute=3 ms
+      ├─ RepartitionExec       rows=80   compute=1 ms
+      ├─ AggregateExec(partial)rows=80   compute=40 ms
+      └─ DataSourceExec parquet rows=2.1M bytes=48 MB compute=120 ms
+```
+
+Read it top-down to see where time went. Here most of it is in the scan, so
+pruning (filters on partition columns or sorted columns) would help most.
 
 ---
 

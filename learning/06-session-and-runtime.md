@@ -7,6 +7,20 @@
 > **Crates:** `sail-session`, `sail-cache`, and the session parts of
 > `sail-common-datafusion`
 
+
+## In One Minute
+
+- A **session** is a DataFusion `SessionContext` with Sail's services attached
+  as typed **extensions**: catalogs, table formats, the job runner, system
+  tables, and an activity tracker.
+- Server sessions serve clients. Worker sessions only run tasks.
+- Each session has its **own job runner**. In cluster mode that means its own
+  driver and workers.
+- The **runtime environment** sets the memory pool (unbounded by default!),
+  spill directories, file caches, and the object store registry.
+- Idle sessions are deleted after a timeout (15 minutes for Spark Connect).
+  Their history stays visible in `system.*` tables.
+
 ---
 
 ## 1. What This Component Does
@@ -196,6 +210,30 @@ export SAIL_EXECUTION__FILE_LISTING_CACHE__TTL=300   # seconds
 spark.sql("SELECT * FROM system.execution.jobs").show()
 spark.sql("SELECT stage, status, count(*) FROM system.execution.tasks GROUP BY 1, 2").show()
 ```
+
+### 4.4 Memory pools with numbers
+
+Suppose `runtime.memory_pool.type=fair` with `max_size=8 GiB`, and a query
+runs two sorts and one hash aggregation at the same time, all able to spill:
+
+| Moment | What the pool allows |
+|--------|----------------------|
+| Only the hash aggregation is running | It can use up to the full 8 GiB |
+| All three are running | Each spillable operator gets about 8 / 3 ≈ 2.7 GiB |
+| A sort needs more than its share | That sort **spills** sorted runs to `temporary_files.paths` and continues with less memory |
+| Spilling is disabled (`temporary_files.max_size=0`) | The sort fails with a "resources exhausted" error instead |
+
+With the default **unbounded** pool, none of this happens. Operators keep
+allocating until the process hits the machine or container limit and is killed.
+For anything beyond development, set a bounded pool.
+
+### 4.5 Which cache scope should I use?
+
+| Workload | Recommended setting | Reason |
+|----------|---------------------|--------|
+| BI dashboard over stable tables, many sessions | `parquet.file_metadata_cache.type=global`, listing cache `global` with a TTL of a few minutes | Footers and listings are reused across users |
+| Ingestion pipeline writing every minute | Listing cache `none` | New files must be visible immediately |
+| Multi-tenant server | `session` scope | No cross-tenant sharing of cached metadata |
 
 ---
 

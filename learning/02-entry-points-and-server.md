@@ -7,6 +7,21 @@
 > **Crates:** `sail-cli`, `sail-python`, `sail-server`, `sail-common`
 > (configuration and runtime)
 
+
+## In One Minute
+
+- There's **one binary**, `sail`. Its subcommand picks the role: Spark Connect
+  server, shell, script runner, MCP server, Flight SQL server, or cluster
+  worker.
+- **Configuration** = YAML defaults compiled into the binary, overridden by
+  `SAIL_*` environment variables (`__` becomes `.`).
+- Every process has two thread pools: **primary** (queries, RPC) and **io**
+  (storage, catalogs).
+- Long-lived coordinators (driver, workers, session manager) are **actors**:
+  one message at a time, no shared locks.
+- All gRPC services are built with one shared **server builder** (health
+  checks, reflection, tracing, keep-alives).
+
 ---
 
 ## 1. What This Component Does
@@ -221,6 +236,45 @@ sail spark server
 ```bash
 sail spark run -f etl_job.py
 ```
+
+### 4.5 How configuration is resolved: a worked example
+
+Suppose the YAML default for `execution.batch_size` is `8192`, and you start
+Sail like this:
+
+```bash
+export SAIL_EXECUTION__BATCH_SIZE=4096
+export SAIL_CATALOG__DEFAULT_DATABASE='["analytics"]'
+export SAIL_MODE=local-cluster
+sail spark server
+```
+
+| Key | YAML default | Environment | Final value |
+|-----|--------------|-------------|-------------|
+| `execution.batch_size` | `8192` | `4096` | **4096** |
+| `catalog.default_database` | `["default"]` | `["analytics"]` | **["analytics"]** (arrays use inline TOML-style syntax) |
+| `mode` | `local` | `local-cluster` | **local-cluster** |
+| `cluster.worker_task_slots` | `8` | (unset) | **8** |
+
+A misspelled variable like `SAIL_EXECUTION__BATCHSIZE=4096` doesn't fail
+silently. Unknown fields are rejected and the server refuses to start, so typos
+surface right away.
+
+### 4.6 How an actor handles a timeout: a worked example
+
+Actors never sleep or block. To act later, they **send themselves a message
+with a delay**. Here's how the session manager detects an idle session (see
+[06](06-session-and-runtime.md)):
+
+```text
+t=0s     request arrives      → actor records "active at 0s", schedules Probe(at=0s) for t=900s
+t=300s   request arrives      → actor records "active at 300s", schedules Probe(at=300s) for t=1200s
+t=900s   Probe(at=0s)  fires  → last active (300s) is later than 0s → ignore
+t=1200s  Probe(at=300s) fires → last active (300s) is not later → session is idle → delete it
+```
+
+The same pattern is used for worker heartbeats, task launch timeouts, and stream
+creation timeouts in the driver (see [09](09-local-and-cluster-execution.md)).
 
 ---
 

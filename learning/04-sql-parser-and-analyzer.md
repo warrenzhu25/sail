@@ -8,6 +8,19 @@
 > (derive macros that generate the parser), `sail-sql-analyzer` (AST → spec
 > plan)
 
+
+## In One Minute
+
+- SQL goes through three steps: **lexer** (text → tokens), **parser** (tokens →
+  syntax tree), **analyzer** (syntax tree → spec plan).
+- The grammar is written as **Rust types**. A derive macro generates the parser,
+  so adding syntax usually means adding a field or variant.
+- About 360 keywords live in a text file, and code for them is generated at
+  build time.
+- Nothing is looked up during parsing or analysis. Unknown tables and columns
+  are only detected later, by the resolver.
+- The same entry functions serve Spark Connect, Flight SQL, and view expansion.
+
 ---
 
 ## 1. What This Component Does
@@ -232,6 +245,40 @@ spark.table("db.t")                                          # parse_object_name
 `EXPLAIN` and the analyzer's tests print the AST and spec plans. Many tests
 check a **round trip**: parse the SQL, turn it back into text, and compare it
 with the expected normalized form.
+
+### 4.4 Precedence in action
+
+| SQL expression | How it's grouped | Why |
+|----------------|------------------|-----|
+| `1 + 2 * 3` | `1 + (2 * 3)` = 7 | `*` (24) binds tighter than `+` (23) |
+| `a = 1 OR b = 2 AND c = 3` | `a = 1 OR (b = 2 AND c = 3)` | `AND` (14) binds tighter than `OR` (13) |
+| `NOT a = b` | `NOT (a = b)` | Comparison (18) binds tighter than `NOT` |
+| `x \|\| 'a' = 'ba'` | `(x \|\| 'a') = 'ba'` | String concatenation is at the `+` level, above comparison |
+| `-a.b[0]` | `-((a.b)[0])` | Postfix access binds tightest |
+
+When in doubt, add parentheses. The parser preserves them in the AST.
+
+### 4.5 Syntax errors
+
+A malformed statement fails in the parser, before anything else runs:
+
+```python
+>>> spark.sql("SELECT * FORM t")
+pyspark.errors.exceptions.connect.ParseException: ... (points at the unexpected token "FORM")
+```
+
+The error carries the position (from the token's span) and what was expected
+(from the parser's labels), and reaches PySpark as `ParseException`.
+
+### 4.6 What "nothing is looked up" means in practice
+
+```python
+spark.sql("SELECT x FROM table_that_does_not_exist")   # no error yet (lazy query)
+_.show()                                                # now: TABLE_OR_VIEW_NOT_FOUND
+```
+
+The first line parses and analyzes successfully, because the shape is valid
+SQL. The table is only looked up when the plan is resolved for execution.
 
 ---
 

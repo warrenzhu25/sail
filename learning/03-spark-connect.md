@@ -6,6 +6,20 @@
 >
 > **Crate:** `sail-spark-connect`
 
+
+## In One Minute
+
+- PySpark builds a **plan** in the client and sends it over gRPC. Sail is the
+  server that runs it, so existing PySpark code works unchanged.
+- Each request is translated **once** into Sail's spec plan, and nothing deeper
+  in Sail sees Spark protobuf.
+- Results stream back as Arrow batches, with **heartbeats** (every 15 seconds)
+  and **reattach** support for dropped connections.
+- `spark.sql("SELECT …")` is lazy, but `spark.sql("CREATE …")` runs immediately,
+  just like in Spark.
+- Errors come back as the Spark exception class PySpark expects
+  (`AnalysisException`, `ParseException`, …).
+
 ---
 
 ## 1. What This Component Does
@@ -231,6 +245,47 @@ spark.addTag("nightly")
 # ... start long-running queries in other threads ...
 spark.interruptTag("nightly")
 ```
+
+### 4.5 What travels over the wire for one `collect()`
+
+Simplified message sequence for a query that returns two batches:
+
+```text
+Client → Server   ExecutePlan(session=S, operation=O, plan=Root(...), reattachable=true)
+Server → Client   ExecutePlanResponse(response_id=r1, schema=<id: long, name: string>)
+Server → Client   ExecutePlanResponse(response_id=r2, arrow_batch=<rows 0..8191>)
+Client → Server   ReleaseExecute(operation=O, until=r2)        # server can drop r1, r2
+Server → Client   ExecutePlanResponse(response_id=r3, arrow_batch=<rows 8192..9999>)
+Server → Client   ExecutePlanResponse(response_id=r4, result_complete)
+Client → Server   ReleaseExecute(operation=O, all)
+```
+
+If the connection breaks after `r2`, the client sends
+`ReattachExecute(operation=O, last_response_id=r2)` and Sail replays `r3`, `r4`
+from its buffer, then keeps streaming.
+
+### 4.6 What an error looks like to the user
+
+```python
+>>> spark.sql("SELECT no_such_column FROM range(1)").show()
+pyspark.errors.exceptions.connect.AnalysisException: ... cannot resolve attribute ...
+```
+
+Behind the scenes: the resolver fails, the error is classified as an analysis
+error, and Sail sends gRPC status `INTERNAL` with error details naming
+`org.apache.spark.sql.AnalysisException`. PySpark reads the class name and
+raises the matching Python exception, which is why `except AnalysisException:`
+blocks in existing code keep working.
+
+### 4.7 Lazy vs. eager, side by side
+
+| Call | When Sail does the work | What the client gets back immediately |
+|------|-------------------------|----------------------------------------|
+| `df = spark.table("t").filter(...)` | Never (client-side only) | Nothing is sent |
+| `df.count()` | Now | The count |
+| `df2 = spark.sql("SELECT * FROM t")` | Only parsing and translation now. Execution later. | A relation describing the query |
+| `spark.sql("CREATE TABLE t2 (x INT)")` | Now, the table is created | An empty result |
+| `df.write.parquet(path)` | Now | Completion |
 
 ---
 

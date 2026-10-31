@@ -47,6 +47,8 @@ workers.
 > Where the `disk-shuffle-hardening` branch changes behavior (blocking shuffle,
 > stage retry), the docs say so explicitly.
 
+**How each document is laid out.** Each starts with **In One Minute**, five bullets you can read on their own. Then come *What* (what the component does), *Why* (design reasons), *How* (step by step), worked **examples** with concrete inputs and outputs, an **end-to-end** walkthrough, **common problems**, and **Where to Look** (concept → file).
+
 ---
 
 ## Reading Order
@@ -181,6 +183,17 @@ the commit message.
 > client to Parquet files on S3 and back, touching every component once. Read
 > this first, then dive into the component docs it links to.
 
+
+## In One Minute
+
+- A query goes through seven stages: **connect → build the DataFrame (client
+  only) → send → resolve → plan → execute → stream back**.
+- Nothing runs on the server until an **action** (`show`, `collect`, `count`,
+  a write) is called.
+- The same planning pipeline serves local and cluster mode. Only the *execute*
+  stage differs.
+- Each step below links to the doc that explains it in depth.
+
 ---
 
 ## The Scenario
@@ -285,6 +298,21 @@ ShowStringExec
 | 23 | Tasks report *succeeded*. The region and job succeed. Streams are cleaned up. Telemetry records spans and metrics for every operator, labeled by job, stage, partition, and attempt. `system.execution.jobs` now lists the job. | [09](#doc-09-local-and-cluster-execution), [16](#doc-16-flight-sql-and-telemetry) |
 | 24 | After 60 seconds without tasks, idle workers are stopped. After 15 minutes without requests, the session is removed, its driver shuts down, and its history is kept. | [09](#doc-09-local-and-cluster-execution), [06](#doc-06-session-and-runtime) |
 
+## The Whole Journey on One Line Per Component
+
+| Component | Input | Output |
+|-----------|-------|--------|
+| PySpark client | Your Python code | A protobuf relation tree |
+| Spark Connect (03) | Protobuf relation | Spec plan |
+| Session manager (06) | Session ID | Session (catalogs, formats, job runner, runtime) |
+| Resolver (07) | Spec plan + plan config | DataFusion logical plan + user names |
+| Catalog (11) + table format (12) + object store (14) | Table name | Table source over a list of files |
+| Optimizers (08) | Logical plan | Optimized physical plan |
+| Job graph builder (09) | Physical plan | Stages and tasks |
+| Driver + workers (09) | Tasks | Running operators on workers |
+| Shuffle (10) | Partial results | Results regrouped by key |
+| Spark Connect executor (03) | Arrow batches | Responses sent to the client |
+
 ---
 
 ## The Same Query in Local Mode
@@ -334,6 +362,21 @@ that is the same.
 >
 > **Crates:** `sail-cli`, `sail-python`, `sail-server`, `sail-common`
 > (configuration and runtime)
+
+
+## In One Minute
+
+- There's **one binary**, `sail`. Its subcommand picks the role: Spark Connect
+  server, shell, script runner, MCP server, Flight SQL server, or cluster
+  worker.
+- **Configuration** = YAML defaults compiled into the binary, overridden by
+  `SAIL_*` environment variables (`__` becomes `.`).
+- Every process has two thread pools: **primary** (queries, RPC) and **io**
+  (storage, catalogs).
+- Long-lived coordinators (driver, workers, session manager) are **actors**:
+  one message at a time, no shared locks.
+- All gRPC services are built with one shared **server builder** (health
+  checks, reflection, tracing, keep-alives).
 
 ---
 
@@ -550,6 +593,45 @@ sail spark server
 sail spark run -f etl_job.py
 ```
 
+### 4.5 How configuration is resolved: a worked example
+
+Suppose the YAML default for `execution.batch_size` is `8192`, and you start
+Sail like this:
+
+```bash
+export SAIL_EXECUTION__BATCH_SIZE=4096
+export SAIL_CATALOG__DEFAULT_DATABASE='["analytics"]'
+export SAIL_MODE=local-cluster
+sail spark server
+```
+
+| Key | YAML default | Environment | Final value |
+|-----|--------------|-------------|-------------|
+| `execution.batch_size` | `8192` | `4096` | **4096** |
+| `catalog.default_database` | `["default"]` | `["analytics"]` | **["analytics"]** (arrays use inline TOML-style syntax) |
+| `mode` | `local` | `local-cluster` | **local-cluster** |
+| `cluster.worker_task_slots` | `8` | (unset) | **8** |
+
+A misspelled variable like `SAIL_EXECUTION__BATCHSIZE=4096` doesn't fail
+silently. Unknown fields are rejected and the server refuses to start, so typos
+surface right away.
+
+### 4.6 How an actor handles a timeout: a worked example
+
+Actors never sleep or block. To act later, they **send themselves a message
+with a delay**. Here's how the session manager detects an idle session (see
+[06](#doc-06-session-and-runtime)):
+
+```text
+t=0s     request arrives      → actor records "active at 0s", schedules Probe(at=0s) for t=900s
+t=300s   request arrives      → actor records "active at 300s", schedules Probe(at=300s) for t=1200s
+t=900s   Probe(at=0s)  fires  → last active (300s) is later than 0s → ignore
+t=1200s  Probe(at=300s) fires → last active (300s) is not later → session is idle → delete it
+```
+
+The same pattern is used for worker heartbeats, task launch timeouts, and stream
+creation timeouts in the driver (see [09](#doc-09-local-and-cluster-execution)).
+
 ---
 
 ## 5. End-to-End: What Happens When You Type `sail spark shell`
@@ -605,6 +687,20 @@ sail spark run -f etl_job.py
 > configuration, errors, reconnection, and cancellation work.
 >
 > **Crate:** `sail-spark-connect`
+
+
+## In One Minute
+
+- PySpark builds a **plan** in the client and sends it over gRPC. Sail is the
+  server that runs it, so existing PySpark code works unchanged.
+- Each request is translated **once** into Sail's spec plan, and nothing deeper
+  in Sail sees Spark protobuf.
+- Results stream back as Arrow batches, with **heartbeats** (every 15 seconds)
+  and **reattach** support for dropped connections.
+- `spark.sql("SELECT …")` is lazy, but `spark.sql("CREATE …")` runs immediately,
+  just like in Spark.
+- Errors come back as the Spark exception class PySpark expects
+  (`AnalysisException`, `ParseException`, …).
 
 ---
 
@@ -832,6 +928,47 @@ spark.addTag("nightly")
 spark.interruptTag("nightly")
 ```
 
+### 4.5 What travels over the wire for one `collect()`
+
+Simplified message sequence for a query that returns two batches:
+
+```text
+Client → Server   ExecutePlan(session=S, operation=O, plan=Root(...), reattachable=true)
+Server → Client   ExecutePlanResponse(response_id=r1, schema=<id: long, name: string>)
+Server → Client   ExecutePlanResponse(response_id=r2, arrow_batch=<rows 0..8191>)
+Client → Server   ReleaseExecute(operation=O, until=r2)        # server can drop r1, r2
+Server → Client   ExecutePlanResponse(response_id=r3, arrow_batch=<rows 8192..9999>)
+Server → Client   ExecutePlanResponse(response_id=r4, result_complete)
+Client → Server   ReleaseExecute(operation=O, all)
+```
+
+If the connection breaks after `r2`, the client sends
+`ReattachExecute(operation=O, last_response_id=r2)` and Sail replays `r3`, `r4`
+from its buffer, then keeps streaming.
+
+### 4.6 What an error looks like to the user
+
+```python
+>>> spark.sql("SELECT no_such_column FROM range(1)").show()
+pyspark.errors.exceptions.connect.AnalysisException: ... cannot resolve attribute ...
+```
+
+Behind the scenes: the resolver fails, the error is classified as an analysis
+error, and Sail sends gRPC status `INTERNAL` with error details naming
+`org.apache.spark.sql.AnalysisException`. PySpark reads the class name and
+raises the matching Python exception, which is why `except AnalysisException:`
+blocks in existing code keep working.
+
+### 4.7 Lazy vs. eager, side by side
+
+| Call | When Sail does the work | What the client gets back immediately |
+|------|-------------------------|----------------------------------------|
+| `df = spark.table("t").filter(...)` | Never (client-side only) | Nothing is sent |
+| `df.count()` | Now | The count |
+| `df2 = spark.sql("SELECT * FROM t")` | Only parsing and translation now. Execution later. | A relation describing the query |
+| `spark.sql("CREATE TABLE t2 (x INT)")` | Now, the table is created | An empty result |
+| `df.write.parquet(path)` | Now | Completion |
+
 ---
 
 ## 5. End-to-End: One `df.collect()`
@@ -902,6 +1039,19 @@ the bug is in this crate. If not, look at resolution.
 > **Crates:** `sail-sql-parser` (lexer, AST, parser), `sail-sql-macro`
 > (derive macros that generate the parser), `sail-sql-analyzer` (AST → spec
 > plan)
+
+
+## In One Minute
+
+- SQL goes through three steps: **lexer** (text → tokens), **parser** (tokens →
+  syntax tree), **analyzer** (syntax tree → spec plan).
+- The grammar is written as **Rust types**. A derive macro generates the parser,
+  so adding syntax usually means adding a field or variant.
+- About 360 keywords live in a text file, and code for them is generated at
+  build time.
+- Nothing is looked up during parsing or analysis. Unknown tables and columns
+  are only detected later, by the resolver.
+- The same entry functions serve Spark Connect, Flight SQL, and view expansion.
 
 ---
 
@@ -1128,6 +1278,40 @@ spark.table("db.t")                                          # parse_object_name
 check a **round trip**: parse the SQL, turn it back into text, and compare it
 with the expected normalized form.
 
+### 4.4 Precedence in action
+
+| SQL expression | How it's grouped | Why |
+|----------------|------------------|-----|
+| `1 + 2 * 3` | `1 + (2 * 3)` = 7 | `*` (24) binds tighter than `+` (23) |
+| `a = 1 OR b = 2 AND c = 3` | `a = 1 OR (b = 2 AND c = 3)` | `AND` (14) binds tighter than `OR` (13) |
+| `NOT a = b` | `NOT (a = b)` | Comparison (18) binds tighter than `NOT` |
+| `x \|\| 'a' = 'ba'` | `(x \|\| 'a') = 'ba'` | String concatenation is at the `+` level, above comparison |
+| `-a.b[0]` | `-((a.b)[0])` | Postfix access binds tightest |
+
+When in doubt, add parentheses. The parser preserves them in the AST.
+
+### 4.5 Syntax errors
+
+A malformed statement fails in the parser, before anything else runs:
+
+```python
+>>> spark.sql("SELECT * FORM t")
+pyspark.errors.exceptions.connect.ParseException: ... (points at the unexpected token "FORM")
+```
+
+The error carries the position (from the token's span) and what was expected
+(from the parser's labels), and reaches PySpark as `ParseException`.
+
+### 4.6 What "nothing is looked up" means in practice
+
+```python
+spark.sql("SELECT x FROM table_that_does_not_exist")   # no error yet (lazy query)
+_.show()                                                # now: TABLE_OR_VIEW_NOT_FOUND
+```
+
+The first line parses and analyzes successfully, because the shape is valid
+SQL. The table is only looked up when the plan is resolved for execution.
+
 ---
 
 ## 5. End-to-End: `spark.sql("CREATE TABLE t (id INT) USING parquet")`
@@ -1197,6 +1381,20 @@ with the expected normalized form.
 >
 > **Crate:** `sail-common` (`spec`, `config`, `error`, `runtime`, `object`,
 > `datetime`, `string`)
+
+
+## In One Minute
+
+- The **spec plan** is the one format every front end produces and the resolver
+  consumes.
+- It's plain data (Rust enums and structs) that can be printed and serialized,
+  and it records **intent**: names are not yet resolved.
+- A plan is a **query** (returns rows) or a **command** (has a side effect).
+  About 70 query node types and 60 command types exist.
+- Some types are deliberately left "configured" (string width, timestamp time
+  zone) because they depend on session settings known only at resolution.
+- `sail-common` also holds configuration, runtimes, error types, and small
+  shared helpers.
 
 ---
 
@@ -1373,6 +1571,43 @@ filter carries the plan ID of `orders`. Note that `>` is just a function named
 `>` at this stage. Operators become real comparison expressions during
 resolution.
 
+### 5.1 Why plan IDs matter: the self-join example
+
+```python
+people = spark.table("people")
+managers = people.alias("m")
+pairs = people.join(managers, people["manager_id"] == managers["id"])
+pairs.select(people["name"], managers["name"]).show()
+```
+
+Both sides have columns named `name` and `id`. In the spec plan, the column
+references are:
+
+| Reference | Name | Plan ID |
+|-----------|------|---------|
+| `people["manager_id"]` | `manager_id` | ID of `people` |
+| `managers["id"]` | `id` | ID of `managers` |
+| `people["name"]` | `name` | ID of `people` |
+| `managers["name"]` | `name` | ID of `managers` |
+
+The plan IDs let the resolver pick the right `name` on each side. A plain SQL
+reference like `name` (no plan ID) would be ambiguous here and fail with
+*ambiguous attribute*.
+
+### 5.2 How a "configured" type becomes concrete
+
+The SQL type `STRING` becomes **ConfiguredUtf8** in the spec. During resolution:
+
+| `spark.sql.execution.arrow.useLargeVarTypes` | Arrow type chosen |
+|----------------------------------------------|-------------------|
+| `false` (default) | `Utf8` (32-bit offsets) |
+| `true` | `LargeUtf8` (64-bit offsets, for values over 2 GB per batch) |
+
+Likewise, `TIMESTAMP` becomes `Timestamp(µs, session time zone)` (LTZ) or
+`Timestamp(µs, no time zone)` (NTZ) depending on `spark.sql.timestampType`. The
+same SQL text can produce different Arrow types in different sessions, so the
+decision can't be made at parse time.
+
 ---
 
 ## 6. End-to-End: Life of a Spec Plan
@@ -1427,6 +1662,20 @@ Add a new spec node when a feature can't be expressed with existing nodes:
 >
 > **Crates:** `sail-session`, `sail-cache`, and the session parts of
 > `sail-common-datafusion`
+
+
+## In One Minute
+
+- A **session** is a DataFusion `SessionContext` with Sail's services attached
+  as typed **extensions**: catalogs, table formats, the job runner, system
+  tables, and an activity tracker.
+- Server sessions serve clients. Worker sessions only run tasks.
+- Each session has its **own job runner**. In cluster mode that means its own
+  driver and workers.
+- The **runtime environment** sets the memory pool (unbounded by default!),
+  spill directories, file caches, and the object store registry.
+- Idle sessions are deleted after a timeout (15 minutes for Spark Connect).
+  Their history stays visible in `system.*` tables.
 
 ---
 
@@ -1618,6 +1867,30 @@ spark.sql("SELECT * FROM system.execution.jobs").show()
 spark.sql("SELECT stage, status, count(*) FROM system.execution.tasks GROUP BY 1, 2").show()
 ```
 
+### 4.4 Memory pools with numbers
+
+Suppose `runtime.memory_pool.type=fair` with `max_size=8 GiB`, and a query
+runs two sorts and one hash aggregation at the same time, all able to spill:
+
+| Moment | What the pool allows |
+|--------|----------------------|
+| Only the hash aggregation is running | It can use up to the full 8 GiB |
+| All three are running | Each spillable operator gets about 8 / 3 ≈ 2.7 GiB |
+| A sort needs more than its share | That sort **spills** sorted runs to `temporary_files.paths` and continues with less memory |
+| Spilling is disabled (`temporary_files.max_size=0`) | The sort fails with a "resources exhausted" error instead |
+
+With the default **unbounded** pool, none of this happens. Operators keep
+allocating until the process hits the machine or container limit and is killed.
+For anything beyond development, set a bounded pool.
+
+### 4.5 Which cache scope should I use?
+
+| Workload | Recommended setting | Reason |
+|----------|---------------------|--------|
+| BI dashboard over stable tables, many sessions | `parquet.file_metadata_cache.type=global`, listing cache `global` with a TTL of a few minutes | Footers and listings are reused across users |
+| Ingestion pipeline writing every minute | Listing cache `none` | New files must be visible immediately |
+| Multi-tenant server | `session` scope | No cross-tenant sharing of cached metadata |
+
 ---
 
 ## 5. End-to-End: A New PySpark Client Connects
@@ -1677,6 +1950,22 @@ spark.sql("SELECT stage, status, count(*) FROM system.execution.tasks GROUP BY 1
 >
 > **Crate:** `sail-plan` (resolver, function mapping, catalog command node,
 > explain, result formatting, streaming rewrite)
+
+
+## In One Minute
+
+- The resolver turns a spec plan into a DataFusion plan that **behaves like
+  Spark**: case-insensitive names, duplicate column names, aliases in
+  `GROUP BY`, `ORDER BY` on columns not in `SELECT`, and about 500 functions
+  with Spark semantics.
+- Every column gets an **internal ID** (`#0`, `#1`, …), which removes ambiguity.
+  User-facing names are restored at the end.
+- Table names are looked up in order: `format.path` shortcut, CTE, then catalog
+  (temporary view, table, or view).
+- Functions are looked up in order: session UDFs, then built-in scalar or
+  generator functions, then aggregates.
+- Commands (DDL, writes, `SHOW`) also become logical plans, so they go through
+  the same pipeline and job runner.
 
 ---
 
@@ -1902,6 +2191,47 @@ Parquet scan (row-group pruning and page-index filtering), the aggregate is
 split into partial and final stages around a hash repartition on `region`, and
 the output columns are renamed to `region` and `n`.
 
+### 4.1 Hidden columns, step by step
+
+```sql
+SELECT name FROM people ORDER BY age
+```
+
+`age` isn't in the `SELECT` list, but Spark allows sorting by it.
+
+| Step | Plan | Columns (internal → user) |
+|------|------|---------------------------|
+| Read `people` | Scan | `#0→name`, `#1→age` |
+| Project `name` | Projection keeps `#0` **and** `#1`, with `#1` marked **hidden** | `#0→name`, `#1→age (hidden)` |
+| Sort by `age` | `age` matches hidden `#1` | |
+| Remove hidden columns | Final projection keeps only `#0` | `#0→name` |
+| Rename | Output column named `name` | |
+
+Without hidden columns, the projection would drop `age` before the sort could
+use it.
+
+### 4.2 Why internal IDs: duplicate names
+
+```sql
+SELECT a, a FROM t
+```
+
+DataFusion doesn't allow two output columns with the same name. Sail produces
+`#5→a` and `#6→a`. They're distinct internally and renamed to `a`, `a` only at
+the very end, which matches Spark's output.
+
+### 4.3 Function lookup, three cases
+
+| Call | Found in | Result |
+|------|----------|--------|
+| `my_udf(x)` after `spark.udf.register("my_udf", ...)` | Session functions (checked first) | Python UDF expression |
+| `upper(x)` | Built-in scalar table | DataFusion `upper` with Spark handling |
+| `percentile_cont(0.5) WITHIN GROUP (ORDER BY x)` | Built-in aggregate table | Ordered-set aggregate |
+| `uppr(x)` (typo) | Nowhere | `AnalysisException: unknown function: uppr` |
+
+A session UDF with the same name as a built-in (for example, `upper`)
+**overrides** the built-in, because session functions are checked first.
+
 ---
 
 ## 5. End-to-End: Where the Resolver Sits
@@ -1983,6 +2313,22 @@ that this pipeline records.
 > **Crates:** `sail-logical-plan`, `sail-physical-plan`,
 > `sail-logical-optimizer`, `sail-physical-optimizer`, plus the extension
 > planner in `sail-session/src/planner.rs`
+
+
+## In One Minute
+
+- DataFusion provides most operators. Sail adds about 15 **extension nodes** for
+  Spark-only behavior: `range`, `show`, Python `mapInPandas`,
+  `monotonically_increasing_id`, writes, deletes, merge, catalog commands,
+  barriers, and streaming.
+- Each logical extension node has a physical operator, connected by the
+  **extension planner**.
+- Side effects only happen during **execution**, never while planning. The
+  **barrier** node makes "create the table, then write" safe.
+- Sail keeps **all** of DataFusion's physical optimizer rules, in order, and
+  adds a few of its own.
+- Optional **cost-based join reordering** picks a good join order for many-table
+  queries.
 
 ---
 
@@ -2179,6 +2525,41 @@ export SAIL_OPTIMIZER__ENABLE_JOIN_REORDER=true
 Then compare `EXPLAIN` output for a five-table star join with the setting off
 and on.
 
+### 4.5 Join reordering with numbers
+
+A star query joins a large fact table with two dimensions:
+
+| Relation | Rows after filters |
+|----------|--------------------|
+| `sales` (fact) | 1,000,000,000 |
+| `stores` (filtered to one region) | 10 |
+| `products` | 100,000 |
+
+Assume each join shrinks or keeps rows as follows: `sales ⋈ stores` keeps the
+sales for 10 stores, about **5,000,000** rows. Joining that with `products` (a
+lookup) keeps 5,000,000.
+
+| Order | Intermediate result | Cost = sum of intermediate sizes |
+|-------|---------------------|----------------------------------|
+| (`sales` ⋈ `products`) ⋈ `stores` | 1,000,000,000 rows first | ≈ 1,005,000,000 |
+| (`sales` ⋈ `stores`) ⋈ `products` | 5,000,000 rows first | ≈ 10,000,000 |
+
+The cost model (cost of children + size of the join result) picks the second
+order, joining the selective dimension first. That's the decision a human
+would make, and the optimizer makes it automatically when
+`optimizer.enable_join_reorder=true`.
+
+### 4.6 Why a barrier instead of "just run the catalog command first"
+
+If the resolver created the table while planning, then:
+
+- `EXPLAIN CREATE TABLE … AS SELECT …` would create the table.
+- A planning error *after* the create would leave an empty, orphaned table.
+
+With a barrier, planning has no side effects. At execution time the barrier
+runs the create command to completion, then starts the write, and both appear
+in one plan you can inspect with `EXPLAIN`.
+
 ---
 
 ## 5. End-to-End: A Logical Node's Journey
@@ -2245,6 +2626,19 @@ Take `spark.range(1_000_000).selectExpr("id % 10 AS k").groupBy("k").count().sho
 >
 > The data exchange between tasks (streams and shuffle) is covered in
 > [10 · Shuffle and Streams](#doc-10-shuffle-and-streams).
+
+
+## In One Minute
+
+- **Local mode** runs the physical plan in-process with DataFusion.
+  **Cluster mode** sends it to a **driver**, which runs it on **workers**.
+- The plan is cut into **stages** wherever data must be exchanged (repartition,
+  coalesce, sort-preserving merge). Each stage has one **task** per partition.
+- In the default pipelined mode, connected stages run **together** as one
+  **region**. A region needs about as many slots as its widest stage.
+- Workers start on demand (4 initially, then as needed) and stop after 60
+  seconds idle. Lost workers are detected by missing heartbeats (120 seconds).
+- A failed task reruns its whole region, up to 3 attempts.
 
 ---
 
@@ -2511,6 +2905,38 @@ spark.sql("SELECT * FROM system.execution.stages").show(truncate=False)
 spark.sql("SELECT * FROM system.cluster.workers").show()
 ```
 
+### 4.4 A failure, step by step
+
+A two-stage pipelined job is running when task (stage 1, partition 3) fails
+with an error:
+
+```text
+t0  task (s1, p3, attempt 0) reports FAILED
+t0  scheduler: region R0 has a failed task with 1 attempt < 3  → region not failed yet
+t0  scheduler: create attempt 1 for every task in R0 (both stages, all partitions)
+t0  assigner: queue R0's task sets again with the new attempts
+t1  new attempts run; streams use new keys (attempt = 1), so no data mixes with attempt 0
+t2  all tasks of attempt 1 succeed → region succeeded → job succeeded
+```
+
+If the same task fails on attempts 0, 1, and 2, the region is marked failed and
+the job fails with the last error.
+
+### 4.5 A lost worker, step by step
+
+```text
+t=0s     worker W3 sends its last heartbeat, then its pod is evicted
+t=120s   heartbeat timeout probe fires: no heartbeat since t=0s → W3 is LOST
+         - W3 is stopped and removed from the slot pool
+         - every task assigned to W3 is marked FAILED ("task failed for lost worker")
+         - affected jobs are refreshed → their regions are rescheduled with new attempts
+         - the assigner asks for a replacement worker if slots are now short
+```
+
+On this branch, a lost worker counts as a normal task failure (toward the 3
+attempts). The `disk-shuffle-hardening` branch treats it as recoverable instead
+(see [10](#doc-10-shuffle-and-streams)).
+
 ---
 
 ## 5. End-to-End: One Query in Cluster Mode
@@ -2575,6 +3001,21 @@ spark.sql("SELECT * FROM system.cluster.workers").show()
 >
 > **Crate:** `sail-execution` (`plan/` shuffle operators, `stream/`,
 > `stream_manager/`, `stream_accessor/`, `stream_service/`)
+
+
+## In One Minute
+
+- Every exchanged piece of data is a **stream** of Arrow batches named by
+  **(job, stage, partition, attempt, channel)**.
+- Upstream tasks end with **shuffle write** (split batches into channels).
+  Downstream tasks start with **shuffle read** (open and merge the channels
+  they need).
+- Streams live in memory by default, with bounded buffers that apply
+  **backpressure**. Workers fetch remote streams with **Arrow Flight**.
+- A reader may ask for a stream before it exists. It's parked as *pending* until
+  the producer appears, or until a timeout.
+- Disk-based (blocking) shuffle exists but can't be turned on from
+  configuration on this branch.
 
 ---
 
@@ -2766,6 +3207,36 @@ Suppose stage 0 has 3 partitions (P0, P1, P2), and stage 1 has 2 partitions
 - If P1 and Q0 run on the same worker, Q0 reads P1's stream directly from memory.
   P0's and P2's streams come over Flight from their workers.
 
+### 4.1 Reader before writer: the pending state
+
+Pipelined stages start together, so a consumer can ask for a stream before its
+producer has created it:
+
+```text
+t=0ms   consumer asks worker A for key K           → A has no stream K: create PENDING(K), park the reader
+t=0ms   A schedules a check for K after task_stream_creation_timeout_secs
+t=40ms  producer on A publishes stream K            → PENDING becomes CREATED; the parked reader is connected
+t=41ms  batches start flowing to the consumer
+```
+
+If the producer never appears (for example, its task crashed before starting),
+the timed check fires, the pending reader gets an error, and the consumer task
+fails, which triggers a region retry (see [09](#doc-09-local-and-cluster-execution)).
+
+### 4.2 Backpressure in practice
+
+Each in-memory stream holds at most `cluster.task_stream_buffer` (16) batches.
+With the default batch size of 8,192 rows:
+
+| Situation | What happens |
+|-----------|--------------|
+| Consumer keeps up | Producer writes freely, and the buffer stays nearly empty |
+| Consumer is slow | Buffer fills to 16 batches (≈ 130K rows), then the producer's next write **waits** |
+| Consumer stops (`LIMIT` satisfied) | Its channel reports *closed*. The producer skips it, and stops early if every channel is closed. |
+
+Memory per stream is bounded, so a slow consumer slows the pipeline down
+instead of exhausting memory.
+
 ---
 
 ## 5. End-to-End: Life of One Batch
@@ -2824,6 +3295,20 @@ Suppose stage 0 has 3 partitions (P0, P1, P2), and stage 1 has 2 partitions
 > wrappers), `sail-catalog-memory`, `sail-catalog-system`, `sail-catalog-glue`,
 > `sail-catalog-hms`, `sail-catalog-iceberg`, `sail-catalog-unity`,
 > `sail-catalog-onelake`
+
+
+## In One Minute
+
+- **Catalog providers** store metadata: in-memory, Glue, Hive Metastore, Iceberg
+  REST, Unity, OneLake, and the read-only `system` catalog.
+- The per-session **catalog manager** interprets names (one-, two-, and
+  three-part, with the current catalog and database) and holds temporary views.
+- Lookup order for reads: **temporary view → global temporary view → table →
+  view**.
+- Remote providers are wrapped with a **cache** (TTL and size limits,
+  invalidated on DDL) and a **runtime** layer (calls run on the io thread pool).
+- Catalogs are configured in `catalog.list`. The in-memory catalog's metadata
+  lasts **only as long as the session**.
 
 ---
 
@@ -3011,6 +3496,31 @@ export SAIL_CATALOG__LIST='[{name="hms", type="hms", uris=["thrift://metastore:9
   table_cache_type="global", table_cache_ttl_secs=60}]'
 ```
 
+### 4.4 Name resolution, worked out
+
+Setup: catalogs `sail` (default, memory) and `glue`. The current database is
+`default`.
+
+| You write | Catalog | Namespace | Object | Notes |
+|-----------|---------|-----------|--------|-------|
+| `orders` | `sail` | `default` | `orders` | Temporary view `orders` wins if one exists |
+| `sales.orders` | `sail` | `sales` | `orders` | `sales` isn't a catalog, so it's a database |
+| `glue.sales.orders` | `glue` | `sales` | `orders` | First part matches a catalog |
+| `glue.orders` | `glue` | (empty) | `orders` | **Error: "empty namespace"**, because a catalog was named without a database |
+| `global_temp.v` | (none) | | `v` | Global temporary view |
+| `a.b.c.t` with catalog `a` | `a` | `b.c` | `t` | Multi-level namespace |
+
+After `USE glue.sales`, the bare name `orders` resolves to `glue.sales.orders`.
+
+### 4.5 How the cache stays correct
+
+| Action | Cache effect |
+|--------|--------------|
+| `spark.table("glue.sales.orders")` (miss) | Calls Glue, stores the table status |
+| Same call again within the TTL | Served from cache, no Glue call |
+| `ALTER TABLE glue.sales.orders …` or `DROP TABLE …` through Sail | Entry invalidated |
+| Table changed by **another** system (for example Spark or Athena) | Sail sees the old metadata until the TTL expires |
+
 ---
 
 ## 5. End-to-End: `spark.table("glue.analytics.events")`
@@ -3076,6 +3586,21 @@ export SAIL_CATALOG__LIST='[{name="hms", type="hms", uris=["thrift://metastore:9
 > Lakehouse formats (Delta Lake, Iceberg) are in
 > [13](#doc-13-lakehouse-delta-and-iceberg), and storage access (S3, GCS, …) is in
 > [14](#doc-14-object-storage).
+
+
+## In One Minute
+
+- Every read and write goes through a **table format** plugin, looked up by name
+  (`parquet`, `csv`, `delta`, …) in the session's registry.
+- File formats are built on DataFusion's **listing table**: parallel scans,
+  pruning, projection and filter pushdown, partition directories.
+- Sail adds Spark behavior: Hadoop-style globs, hidden-file filtering
+  (`_SUCCESS`, `.crc`), partition inference, and Spark option names.
+- About 250 **options** are defined in YAML files and turned into typed structs
+  at build time. Options are applied in **layers** (table properties, then query
+  options).
+- Plain file writers currently **append only**. Lakehouse formats support
+  overwrite, replace-where, and row-level changes.
 
 ---
 
@@ -3327,6 +3852,42 @@ spark.dataSource.register(Counter)
 spark.read.format("counter").load().show()
 ```
 
+### 4.1 Option layering, worked out
+
+A CSV table is created with a table property, then read with a query option:
+
+```sql
+CREATE TABLE raw_events (id INT, msg STRING) USING csv
+  LOCATION 's3://lake/raw/' TBLPROPERTIES ('option.sep' = ';', 'option.header' = 'true');
+```
+
+```python
+spark.read.option("sep", "|").table("raw_events")
+```
+
+| Layer (applied in order) | `sep` | `header` |
+|--------------------------|-------|----------|
+| Default (from `csv.yaml`) | `,` | `false` |
+| Table properties (`option.sep`, `option.header`) | `;` | `true` |
+| Query options (`.option("sep", "|")`) | **`\|`** | (not set) |
+| **Effective value** | **`\|`** | **`true`** |
+
+Later layers win, key by key. Aliases (`sep` and `delimiter`) match the same
+option, and matching is case-insensitive.
+
+### 4.2 What partition inference produces
+
+```text
+s3://lake/events/date=2024-01-01/country=US/part-0.parquet
+s3://lake/events/date=2024-01-01/country=DE/part-1.parquet
+s3://lake/events/date=2024-01-02/country=US/part-2.parquet
+s3://lake/events/_SUCCESS                      ← hidden, skipped
+```
+
+`spark.read.parquet("s3://lake/events/")` yields the file columns plus
+**`date`** and **`country`**, taken from the directory names. A filter such as
+`country = 'DE'` opens only `part-1.parquet`.
+
 ---
 
 ## 5. End-to-End: `spark.read.parquet("s3://lake/events/").filter("date='2024-01-01'").count()`
@@ -3384,6 +3945,21 @@ spark.read.format("counter").load().show()
 > are planned.
 >
 > **Crates:** `sail-delta-lake`, `sail-iceberg`, `sail-plan-lakehouse`
+
+
+## In One Minute
+
+- Lakehouse formats record **exactly which files form each table version**,
+  which enables atomic writes, time travel, schema evolution, and row-level
+  changes.
+- Sail implements **Delta Lake and Iceberg natively in Rust**, and runs
+  metadata work (log replay, manifest scans) as ordinary parallel plans.
+- Reads: pick a version, list its files from the log or manifests, prune by
+  statistics, scan Parquet, then apply deletion vectors or delete files.
+- Writes: write Parquet files, then publish a new version atomically. Delta
+  checks conflicts with concurrent writers.
+- `DELETE`, `UPDATE`, `MERGE` on Delta use copy-on-write, or deletion vectors when
+  enabled. Iceberg row-level writes aren't implemented yet.
 
 ---
 
@@ -3564,6 +4140,40 @@ SELECT * FROM ice.db.events VERSION AS OF 123456789;
 SELECT * FROM ice.db.events TIMESTAMP AS OF '2024-06-01 00:00:00';
 ```
 
+### 5.1 Delta log replay, worked out
+
+A table's `_delta_log/` contains three commits (simplified):
+
+```text
+00000000000000000000.json   add(part-a)  add(part-b)
+00000000000000000001.json   add(part-c)
+00000000000000000002.json   remove(part-a)  add(part-d)      ← e.g. an UPDATE rewrote part-a as part-d
+```
+
+| Read | Replay result (active files) |
+|------|------------------------------|
+| Latest (version 2) | `part-b`, `part-c`, `part-d` |
+| `versionAsOf=1` | `part-a`, `part-b`, `part-c` |
+| `versionAsOf=0` | `part-a`, `part-b` |
+
+Replay keeps the **newest action per file**. `part-a`'s newest action at
+version 2 is `remove`, so it drops out. Older versions stop replay earlier,
+which is all time travel is. After a checkpoint is written (for example at
+version 10, controlled by the table's checkpoint interval), replay starts from
+the checkpoint instead of version 0.
+
+### 5.2 Copy-on-write vs. deletion vectors, with numbers
+
+Deleting 10 rows from a 1 GB file of 10 million rows:
+
+| Strategy | Data written | Readers afterwards |
+|----------|--------------|--------------------|
+| Copy-on-write | A new ≈ 1 GB file without the 10 rows | Read the new file normally |
+| Deletion vector | A tiny bitmap file marking 10 row positions | Read the old file and skip the 10 marked rows |
+
+Deletion vectors make small deletes cheap. The cost moves to readers, which is
+why tables are periodically compacted.
+
 ---
 
 ## 6. End-to-End: `DELETE FROM sales.orders WHERE status = 'cancelled'` (Delta)
@@ -3627,6 +4237,20 @@ SELECT * FROM ice.db.events TIMESTAMP AS OF '2024-06-01 00:00:00';
 > store.
 >
 > **Crate:** `sail-object-store`
+
+
+## In One Minute
+
+- All file I/O goes through one **dynamic registry** that creates a storage
+  client the first time it sees a `(scheme, bucket)` pair, then caches it.
+- Supported: local files, S3 (and S3-compatible), GCS, Azure, HTTP, Hugging Face
+  datasets, and HDFS (optional build feature).
+- Clients are created **lazily**, on first actual I/O, and their I/O runs on the
+  dedicated **io** thread pool.
+- S3 credentials come from the AWS default chain. The region is detected
+  automatically if not set.
+- Every storage call can be logged at debug level, so you can see exactly what
+  a query read.
 
 ---
 
@@ -3749,6 +4373,29 @@ spark.read.parquet("hf://datasets/user/dataset/data/*.parquet").show()
 df.write.parquet("s3://output-bucket/results/")    # a different bucket, no extra setup
 ```
 
+### 4.1 Where S3 credentials come from
+
+The AWS default chain is tried in order, and the first match wins:
+
+| Source | Example |
+|--------|---------|
+| Environment variables | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` |
+| Shared config and credentials files | `~/.aws/credentials`, selected by `AWS_PROFILE` |
+| SSO and web identity | `aws sso login`, or EKS IRSA (`AWS_WEB_IDENTITY_TOKEN_FILE`) |
+| Container and instance metadata | ECS task role, EC2 instance profile |
+
+Credentials are cached and refreshed automatically. Temporary credentials keep
+working through long jobs.
+
+### 4.2 How the region is chosen
+
+| Situation | Region used |
+|-----------|-------------|
+| URL is `https://bucket.s3.eu-west-1.amazonaws.com/…` | `eu-west-1`, from the URL |
+| `AWS_REGION=us-east-2` is set | `us-east-2` |
+| AWS profile has a region | That region |
+| None of the above | Sail asks S3 for the bucket's region (one extra request, then cached with the store) |
+
 ---
 
 ## 5. End-to-End: First Read of `s3://analytics/events/`
@@ -3801,6 +4448,19 @@ df.write.parquet("s3://output-bucket/results/")    # a different bucket, no extr
 > **Crates:** `sail-function` (Spark-compatible function implementations),
 > `sail-plan/src/function` (the name → builder tables), `sail-python-udf`
 > (Python UDF execution), `sail-python` (the `pysail` bindings)
+
+
+## In One Minute
+
+- About 500 Spark functions are listed in **tables** that map each name to a
+  **builder**. The builder turns resolved arguments into a DataFusion expression.
+- Where Spark differs from DataFusion (NULL handling, date formats, ANSI mode),
+  Sail provides its own implementation in `sail-function`.
+- Python UDFs run **in the Sail process** through embedded CPython (PyO3). No
+  separate Python workers or sockets are involved.
+- Prefer **pandas or Arrow UDFs** (one call per batch) over plain `@udf` (one
+  call per row).
+- In cluster mode, every worker needs the same Python packages installed.
 
 ---
 
@@ -3979,6 +4639,35 @@ spark.udf.register("plus_one", plus_one)
 spark.sql("SELECT plus_one(id) FROM range(3)").show()
 ```
 
+### 4.1 Spark semantics vs. "plain SQL" semantics
+
+| Expression | Spark (and Sail) | A typical SQL engine |
+|------------|------------------|----------------------|
+| `concat('a', NULL)` | `NULL` | Some return `'a'` |
+| `date_format(ts, 'yyyy-MM-dd')` | Java-style pattern | strftime-style `'%Y-%m-%d'` |
+| `element_at(array(10, 20), 1)` | `10` (1-based) | `arr[0]` style (0-based) |
+| `1 / 0` (ANSI off) | `NULL` | Error |
+| `1 / 0` (ANSI on) | `ArithmeticException` | Error |
+| `CAST('abc' AS INT)` (ANSI off) | `NULL` | Error |
+
+These differences are why each function goes through a builder that can pick a
+Spark-compatible implementation and read the session's ANSI setting.
+
+### 4.2 UDF styles and their cost
+
+For a column of 10 million rows, in batches of 8,192 rows:
+
+| Style | Python calls | Data conversion |
+|-------|--------------|-----------------|
+| `@udf` (row-at-a-time) | ≈ 10,000,000 | Each value is converted to a Python object and back |
+| `@udf(useArrow=True)` | ≈ 1,220 | Batch-level Arrow conversion |
+| `@pandas_udf` | ≈ 1,220 | Arrow → `pandas.Series` → Arrow, vectorized |
+| Arrow UDF (Spark 4) | ≈ 1,220 | Arrow arrays directly |
+
+Vectorized styles make about 8,000× fewer Python calls, and they spend most of
+their time in native code (pandas, NumPy, Arrow) that doesn't hold Python's
+interpreter lock.
+
 ---
 
 ## 5. End-to-End: `df.select(zscore("v"))`
@@ -4038,6 +4727,21 @@ spark.sql("SELECT plus_one(id) FROM range(3)").show()
 > **Crates:** `sail-flight`, `sail-telemetry`, plus the system tables from
 > [06](#doc-06-session-and-runtime)
 
+
+## In One Minute
+
+- **Flight SQL** lets SQL tools query Sail over gRPC and get Arrow results. It
+  reuses the same parser, planner, and engine as Spark Connect.
+- Flight SQL runs a query in two steps: *GetFlightInfo* (plan and start) returns
+  a ticket, then *DoGet* streams the results (readable once).
+- All Flight clients currently share **one session**, and there's no built-in
+  authentication.
+- **Telemetry** is OpenTelemetry-based: logs (stderr and span events), traces
+  (every operator), and metrics (rows, bytes, time, memory, spills, joins). It's
+  all **off by default**.
+- Spans and metrics carry the same labels (job, stage, partition, attempt,
+  operator), so you can slice by query or stage.
+
 ---
 
 ## Part A: Arrow Flight SQL
@@ -4094,6 +4798,27 @@ cur = conn.cursor()
 cur.execute("SELECT region, count(*) FROM parquet.`/data/orders` GROUP BY region")
 print(cur.fetch_arrow_table())
 ```
+
+### A.5 What a trace looks like
+
+A simplified trace for one Spark Connect query in local mode:
+
+```text
+ExecutePlan (gRPC server span)                                   210 ms
+├─ handle_execute_plan
+│  ├─ resolve_and_execute_plan                                    18 ms
+│  └─ JobRunner::execute                                           2 ms
+└─ ExecutorTaskContext::next (stream)                            188 ms
+   └─ job 7
+      ├─ ProjectionExec        rows=10   compute=0.1 ms
+      ├─ AggregateExec(final)  rows=10   compute=3 ms
+      ├─ RepartitionExec       rows=80   compute=1 ms
+      ├─ AggregateExec(partial)rows=80   compute=40 ms
+      └─ DataSourceExec parquet rows=2.1M bytes=48 MB compute=120 ms
+```
+
+Read it top-down to see where time went. Here most of it is in the scan, so
+pruning (filters on partition columns or sorted columns) would help most.
 
 ---
 
@@ -4207,6 +4932,20 @@ span with child spans for each operator (scan, filter, aggregate, repartition,
 > Python), the kinds of tests and when to use each, how gold data and snapshot
 > tests work, how the PySpark test suite is run against Sail, and a practical
 > workflow for making a change.
+
+
+## In One Minute
+
+- Rust code is built with `cargo`. The Python package `pysail` is built with
+  `maturin` inside `hatch` environments.
+- **Gold data** JSON files lock in exact outputs for SQL syntax, expressions, and
+  functions. Regenerate them with `SAIL_UPDATE_GOLD_DATA=1 cargo test` and commit
+  the diff.
+- **Python tests** run real PySpark code against an in-process Sail server.
+- Spark's own test suite and the Ibis test suite are run against Sail to track
+  compatibility.
+- A typical change: reproduce → fix → update gold data → run the area's Python
+  tests → update compatibility data → format and lint.
 
 ---
 
@@ -4338,6 +5077,20 @@ over time. See `docs/development/spark-tests/`.
 3. Look at `system.execution.stages` and `system.execution.tasks`.
 4. If an operator fails to serialize, look at the plan codec
    (`sail-execution/src/codec.rs`).
+
+### 4.1 What a gold data change looks like in review
+
+Fixing `concat` to return NULL when any argument is NULL changes one gold entry:
+
+```diff
+   "input": { "query": "SELECT concat('a', NULL);" },
+-  "output": { "success": { "result": ["a"] } }
++  "output": { "success": { "result": ["NULL"] } }
+```
+
+The reviewer sees exactly which behaviors changed. Unintended changes (for
+example, ten other functions changing output at the same time) are obvious in
+the diff. (The JSON above is simplified to show the shape of the change.)
 
 ---
 

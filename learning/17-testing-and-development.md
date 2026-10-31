@@ -5,6 +5,20 @@
 > tests work, how the PySpark test suite is run against Sail, and a practical
 > workflow for making a change.
 
+
+## In One Minute
+
+- Rust code is built with `cargo`. The Python package `pysail` is built with
+  `maturin` inside `hatch` environments.
+- **Gold data** JSON files lock in exact outputs for SQL syntax, expressions, and
+  functions. Regenerate them with `SAIL_UPDATE_GOLD_DATA=1 cargo test` and commit
+  the diff.
+- **Python tests** run real PySpark code against an in-process Sail server.
+- Spark's own test suite and the Ibis test suite are run against Sail to track
+  compatibility.
+- A typical change: reproduce → fix → update gold data → run the area's Python
+  tests → update compatibility data → format and lint.
+
 ---
 
 ## 1. Repository Map
@@ -135,6 +149,20 @@ over time. See `docs/development/spark-tests/`.
 3. Look at `system.execution.stages` and `system.execution.tasks`.
 4. If an operator fails to serialize, look at the plan codec
    (`sail-execution/src/codec.rs`).
+
+### 4.1 What a gold data change looks like in review
+
+Fixing `concat` to return NULL when any argument is NULL changes one gold entry:
+
+```diff
+   "input": { "query": "SELECT concat('a', NULL);" },
+-  "output": { "success": { "result": ["a"] } }
++  "output": { "success": { "result": ["NULL"] } }
+```
+
+The reviewer sees exactly which behaviors changed. Unintended changes (for
+example, ten other functions changing output at the same time) are obvious in
+the diff. (The JSON above is simplified to show the shape of the change.)
 
 ---
 

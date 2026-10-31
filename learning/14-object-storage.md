@@ -7,6 +7,20 @@
 >
 > **Crate:** `sail-object-store`
 
+
+## In One Minute
+
+- All file I/O goes through one **dynamic registry** that creates a storage
+  client the first time it sees a `(scheme, bucket)` pair, then caches it.
+- Supported: local files, S3 (and S3-compatible), GCS, Azure, HTTP, Hugging Face
+  datasets, and HDFS (optional build feature).
+- Clients are created **lazily**, on first actual I/O, and their I/O runs on the
+  dedicated **io** thread pool.
+- S3 credentials come from the AWS default chain. The region is detected
+  automatically if not set.
+- Every storage call can be logged at debug level, so you can see exactly what
+  a query read.
+
 ---
 
 ## 1. What This Component Does
@@ -127,6 +141,29 @@ spark.read.parquet("abfss://container@account.dfs.core.windows.net/path/").show(
 spark.read.parquet("hf://datasets/user/dataset/data/*.parquet").show()
 df.write.parquet("s3://output-bucket/results/")    # a different bucket, no extra setup
 ```
+
+### 4.1 Where S3 credentials come from
+
+The AWS default chain is tried in order, and the first match wins:
+
+| Source | Example |
+|--------|---------|
+| Environment variables | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` |
+| Shared config and credentials files | `~/.aws/credentials`, selected by `AWS_PROFILE` |
+| SSO and web identity | `aws sso login`, or EKS IRSA (`AWS_WEB_IDENTITY_TOKEN_FILE`) |
+| Container and instance metadata | ECS task role, EC2 instance profile |
+
+Credentials are cached and refreshed automatically. Temporary credentials keep
+working through long jobs.
+
+### 4.2 How the region is chosen
+
+| Situation | Region used |
+|-----------|-------------|
+| URL is `https://bucket.s3.eu-west-1.amazonaws.com/…` | `eu-west-1`, from the URL |
+| `AWS_REGION=us-east-2` is set | `us-east-2` |
+| AWS profile has a region | That region |
+| None of the above | Sail asks S3 for the bucket's region (one extra request, then cached with the store) |
 
 ---
 

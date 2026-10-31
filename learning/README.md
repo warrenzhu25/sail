@@ -15,6 +15,8 @@ workers.
 > Where the `disk-shuffle-hardening` branch changes behavior (blocking shuffle,
 > stage retry), the docs say so explicitly.
 
+**How each document is laid out.** Each starts with **In One Minute**, five bullets you can read on their own. Then come *What* (what the component does), *Why* (design reasons), *How* (step by step), worked **examples** with concrete inputs and outputs, an **end-to-end** walkthrough, **common problems**, and **Where to Look** (concept → file).
+
 Prefer one long page? Read [ALL-IN-ONE.md](ALL-IN-ONE.md), which merges every document below into a single file.
 
 ---

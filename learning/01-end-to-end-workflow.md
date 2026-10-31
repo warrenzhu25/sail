@@ -4,6 +4,17 @@
 > client to Parquet files on S3 and back, touching every component once. Read
 > this first, then dive into the component docs it links to.
 
+
+## In One Minute
+
+- A query goes through seven stages: **connect → build the DataFrame (client
+  only) → send → resolve → plan → execute → stream back**.
+- Nothing runs on the server until an **action** (`show`, `collect`, `count`,
+  a write) is called.
+- The same planning pipeline serves local and cluster mode. Only the *execute*
+  stage differs.
+- Each step below links to the doc that explains it in depth.
+
 ---
 
 ## The Scenario
@@ -107,6 +118,21 @@ ShowStringExec
 | 22 | The Spark Connect **executor** sends a schema message, the Arrow batch containing the formatted table, and "complete", buffering each by response ID (with empty heartbeat batches every 15 seconds if needed). PySpark prints the table. | [03](03-spark-connect.md) |
 | 23 | Tasks report *succeeded*. The region and job succeed. Streams are cleaned up. Telemetry records spans and metrics for every operator, labeled by job, stage, partition, and attempt. `system.execution.jobs` now lists the job. | [09](09-local-and-cluster-execution.md), [16](16-flight-sql-and-telemetry.md) |
 | 24 | After 60 seconds without tasks, idle workers are stopped. After 15 minutes without requests, the session is removed, its driver shuts down, and its history is kept. | [09](09-local-and-cluster-execution.md), [06](06-session-and-runtime.md) |
+
+## The Whole Journey on One Line Per Component
+
+| Component | Input | Output |
+|-----------|-------|--------|
+| PySpark client | Your Python code | A protobuf relation tree |
+| Spark Connect (03) | Protobuf relation | Spec plan |
+| Session manager (06) | Session ID | Session (catalogs, formats, job runner, runtime) |
+| Resolver (07) | Spec plan + plan config | DataFusion logical plan + user names |
+| Catalog (11) + table format (12) + object store (14) | Table name | Table source over a list of files |
+| Optimizers (08) | Logical plan | Optimized physical plan |
+| Job graph builder (09) | Physical plan | Stages and tasks |
+| Driver + workers (09) | Tasks | Running operators on workers |
+| Shuffle (10) | Partial results | Results regrouped by key |
+| Spark Connect executor (03) | Arrow batches | Responses sent to the client |
 
 ---
 

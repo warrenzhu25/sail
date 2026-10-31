@@ -7,6 +7,20 @@
 > **Crate:** `sail-common` (`spec`, `config`, `error`, `runtime`, `object`,
 > `datetime`, `string`)
 
+
+## In One Minute
+
+- The **spec plan** is the one format every front end produces and the resolver
+  consumes.
+- It's plain data (Rust enums and structs) that can be printed and serialized,
+  and it records **intent**: names are not yet resolved.
+- A plan is a **query** (returns rows) or a **command** (has a side effect).
+  About 70 query node types and 60 command types exist.
+- Some types are deliberately left "configured" (string width, timestamp time
+  zone) because they depend on session settings known only at resolution.
+- `sail-common` also holds configuration, runtimes, error types, and small
+  shared helpers.
+
 ---
 
 ## 1. What This Component Does
@@ -181,6 +195,43 @@ The only difference: in the DataFrame version, the `amount` reference in the
 filter carries the plan ID of `orders`. Note that `>` is just a function named
 `>` at this stage. Operators become real comparison expressions during
 resolution.
+
+### 5.1 Why plan IDs matter: the self-join example
+
+```python
+people = spark.table("people")
+managers = people.alias("m")
+pairs = people.join(managers, people["manager_id"] == managers["id"])
+pairs.select(people["name"], managers["name"]).show()
+```
+
+Both sides have columns named `name` and `id`. In the spec plan, the column
+references are:
+
+| Reference | Name | Plan ID |
+|-----------|------|---------|
+| `people["manager_id"]` | `manager_id` | ID of `people` |
+| `managers["id"]` | `id` | ID of `managers` |
+| `people["name"]` | `name` | ID of `people` |
+| `managers["name"]` | `name` | ID of `managers` |
+
+The plan IDs let the resolver pick the right `name` on each side. A plain SQL
+reference like `name` (no plan ID) would be ambiguous here and fail with
+*ambiguous attribute*.
+
+### 5.2 How a "configured" type becomes concrete
+
+The SQL type `STRING` becomes **ConfiguredUtf8** in the spec. During resolution:
+
+| `spark.sql.execution.arrow.useLargeVarTypes` | Arrow type chosen |
+|----------------------------------------------|-------------------|
+| `false` (default) | `Utf8` (32-bit offsets) |
+| `true` | `LargeUtf8` (64-bit offsets, for values over 2 GB per batch) |
+
+Likewise, `TIMESTAMP` becomes `Timestamp(µs, session time zone)` (LTZ) or
+`Timestamp(µs, no time zone)` (NTZ) depending on `spark.sql.timestampType`. The
+same SQL text can produce different Arrow types in different sessions, so the
+decision can't be made at parse time.
 
 ---
 

@@ -8,6 +8,22 @@
 > `sail-logical-optimizer`, `sail-physical-optimizer`, plus the extension
 > planner in `sail-session/src/planner.rs`
 
+
+## In One Minute
+
+- DataFusion provides most operators. Sail adds about 15 **extension nodes** for
+  Spark-only behavior: `range`, `show`, Python `mapInPandas`,
+  `monotonically_increasing_id`, writes, deletes, merge, catalog commands,
+  barriers, and streaming.
+- Each logical extension node has a physical operator, connected by the
+  **extension planner**.
+- Side effects only happen during **execution**, never while planning. The
+  **barrier** node makes "create the table, then write" safe.
+- Sail keeps **all** of DataFusion's physical optimizer rules, in order, and
+  adds a few of its own.
+- Optional **cost-based join reordering** picks a good join order for many-table
+  queries.
+
 ---
 
 ## 1. What This Component Does
@@ -202,6 +218,41 @@ export SAIL_OPTIMIZER__ENABLE_JOIN_REORDER=true
 
 Then compare `EXPLAIN` output for a five-table star join with the setting off
 and on.
+
+### 4.5 Join reordering with numbers
+
+A star query joins a large fact table with two dimensions:
+
+| Relation | Rows after filters |
+|----------|--------------------|
+| `sales` (fact) | 1,000,000,000 |
+| `stores` (filtered to one region) | 10 |
+| `products` | 100,000 |
+
+Assume each join shrinks or keeps rows as follows: `sales ⋈ stores` keeps the
+sales for 10 stores, about **5,000,000** rows. Joining that with `products` (a
+lookup) keeps 5,000,000.
+
+| Order | Intermediate result | Cost = sum of intermediate sizes |
+|-------|---------------------|----------------------------------|
+| (`sales` ⋈ `products`) ⋈ `stores` | 1,000,000,000 rows first | ≈ 1,005,000,000 |
+| (`sales` ⋈ `stores`) ⋈ `products` | 5,000,000 rows first | ≈ 10,000,000 |
+
+The cost model (cost of children + size of the join result) picks the second
+order, joining the selective dimension first. That's the decision a human
+would make, and the optimizer makes it automatically when
+`optimizer.enable_join_reorder=true`.
+
+### 4.6 Why a barrier instead of "just run the catalog command first"
+
+If the resolver created the table while planning, then:
+
+- `EXPLAIN CREATE TABLE … AS SELECT …` would create the table.
+- A planning error *after* the create would leave an empty, orphaned table.
+
+With a barrier, planning has no side effects. At execution time the barrier
+runs the create command to completion, then starts the write, and both appear
+in one plan you can inspect with `EXPLAIN`.
 
 ---
 
