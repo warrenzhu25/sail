@@ -15,6 +15,8 @@ workers.
 > Where the `disk-shuffle-hardening` branch changes behavior (blocking shuffle,
 > stage retry), the docs say so explicitly.
 
+Prefer one long page? Read [ALL-IN-ONE.md](ALL-IN-ONE.md), which merges every document below into a single file.
+
 ---
 
 ## Reading Order
