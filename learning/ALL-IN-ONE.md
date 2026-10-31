@@ -13,7 +13,7 @@ the source. Regenerate this file after editing them.
 - [04 · SQL Parser and Analyzer](#doc-04-sql-parser-and-analyzer)
 - [05 · The Spec Plan Model (and Shared Foundations)](#doc-05-spec-plan-and-config)
 - [06 · Sessions and the Runtime Environment](#doc-06-session-and-runtime)
-- [07 · The Plan Resolver: From Intent to a DataFusion Plan](#doc-07-plan-resolver)
+- [07 · The Plan Resolver: Turning Intent into a Plan](#doc-07-plan-resolver)
 - [08 · Logical and Physical Plans, Extension Nodes, and Optimizers](#doc-08-logical-physical-plans-and-optimizers)
 - [09 · Local and Cluster Execution](#doc-09-local-and-cluster-execution)
 - [10 · Shuffle and Streams: Moving Data Between Tasks](#doc-10-shuffle-and-streams)
@@ -1942,362 +1942,341 @@ For anything beyond development, set a bounded pool.
 
 <a id="doc-07-plan-resolver"></a>
 
-# 07 · The Plan Resolver: From Intent to a DataFusion Plan
+# 07 · The Plan Resolver: Turning Intent into a Plan
 
-> **You'll learn:** how Sail turns a spec plan into an optimized DataFusion
-> physical plan; how names, columns, functions, tables, views, and commands are
-> resolved; and why Sail gives every column an internal ID.
->
-> **Crate:** `sail-plan` (resolver, function mapping, catalog command node,
-> explain, result formatting, streaming rewrite)
+When a query reaches the resolver, Sail knows *what the user asked for* but not
+yet *what any of it means*. The query still talks about "a table called
+sales.orders", "a column called amount", and "a function called count". None of
+these names has been checked. The resolver is the component that gives every
+name its meaning, applies Spark's rules for how names behave, and produces a
+plan that DataFusion can optimize and run. If Sail behaves like Spark, it's
+largely because the resolver makes it so.
 
-
-## In One Minute
-
-- The resolver turns a spec plan into a DataFusion plan that **behaves like
-  Spark**: case-insensitive names, duplicate column names, aliases in
-  `GROUP BY`, `ORDER BY` on columns not in `SELECT`, and about 500 functions
-  with Spark semantics.
-- Every column gets an **internal ID** (`#0`, `#1`, …), which removes ambiguity.
-  User-facing names are restored at the end.
-- Table names are looked up in order: `format.path` shortcut, CTE, then catalog
-  (temporary view, table, or view).
-- Functions are looked up in order: session UDFs, then built-in scalar or
-  generator functions, then aggregates.
-- Commands (DDL, writes, `SHOW`) also become logical plans, so they go through
-  the same pipeline and job runner.
-
----
-
-## 1. What This Component Does
-
-The resolver is the **brain of Sail's Spark compatibility**. It takes the
-protocol-neutral spec plan (see [05](#doc-05-spec-plan-and-config)) and the
-session's plan config (time zone, ANSI mode, timestamp type, …) and produces
-DataFusion plans that behave like Spark.
-
-It owns the whole planning pipeline:
-
-```text
-spec::Plan
-  │ 1. Resolve       → DataFusion LogicalPlan (with internal column IDs) + user-facing names
-  │ 2. Analyze       → DataFusion analyzer rules (type coercion, …)
-  │ 3. Optimize      → Sail and DataFusion logical optimizer rules
-  │ 4. Stream rewrite→ adjustments for streaming plans (if the plan is streaming)
-  │ 5. Physical plan → the extension planner turns logical nodes into operators, then physical optimizer rules run
-  │ 6. Rename        → internal column IDs replaced with the user-facing names
-  ▼
-Arc<dyn ExecutionPlan>  (ready for a job runner)
-```
-
-The entry point is `resolve_and_execute_plan(session, plan_config, spec_plan)`.
-It returns the physical plan plus text renderings of the initial logical,
-final logical, and final physical plans, which `EXPLAIN` uses.
-
----
-
-## 2. Why It's Built This Way
-
-**Spark semantics differ from DataFusion's in many small ways.** Name matching
-is case-insensitive. Duplicate column names are allowed (`SELECT a, a`). Join
-outputs keep both sides' columns even when they share a name. `GROUP BY` can
-refer to aliases. `HAVING` and `ORDER BY` can refer to columns that aren't in the
-`SELECT` list. Hundreds of functions have Spark-specific behavior. The resolver
-handles all of this **before** DataFusion sees the plan, so DataFusion only has
-to execute well-formed plans.
-
-**Every column gets an internal ID.** When the resolver produces a column, it
-names it with an opaque ID like `#7` and records `#7 → "amount"` in its state.
-This solves several problems:
-
-- **Duplicates and ambiguity.** `SELECT a, a` or a self-join produces two columns
-  named `a`. In DataFusion they'd clash. As `#3` and `#9` they don't.
-- **DataFrame references.** A Spark Connect column reference can carry the plan
-  ID of the DataFrame it came from (`df1["id"]`). Each ID records which plan IDs
-  it belongs to, so `df1.id` and `df2.id` resolve to different columns.
-- **Hidden columns.** Some operations need extra columns internally, such as the
-  join keys of both sides of an outer join, or columns used only by `ORDER BY`.
-  These are marked *hidden* and removed from the final output.
-
-At the end, a **named plan** carries the logical plan and the list of
-user-facing names. After physical planning, the output columns are renamed
-from IDs back to those names.
-
-**Functions are a lookup table of builders.** Sail doesn't register its Spark
-functions in DataFusion's registry. It keeps a table that maps each function name
-to a small builder that receives already-resolved arguments and the session
-context, and returns a DataFusion expression. A builder can map directly to a
-DataFusion function (`sqrt`), wrap it with casts, call a Sail-specific UDF
-(`concat` uses Sail's Spark-compatible concat), or do custom logic
-(`upper`, `element_at`). Behavior that depends on the session, such as ANSI mode
-or time zone, is handled here.
-
----
-
-## 3. How It Works
-
-### 3.1 Resolver state
-
-One state object is threaded through the whole resolution of a plan:
-
-| Field | Purpose |
-|-------|---------|
-| Field registry | Maps each internal ID (`#0`, `#1`, …) to a user name, the plan IDs that refer to it, and whether it's hidden |
-| Outer query schema | The schema visible to a correlated subquery from its enclosing query |
-| Aggregate state | Whether we're resolving `GROUP BY` or `HAVING`, and the projections and grouping expressions available, so `HAVING count(*) > 1` can reuse aggregate results |
-| CTEs | `WITH` definitions visible to the current query |
-| Subquery references | Relations attached through Spark Connect's "with relations" mechanism |
-| Parameter values | Bound `?` and `:name` values, so `IDENTIFIER(:tbl)` can be evaluated |
-
-### 3.2 Resolving queries
-
-The query resolver is a big dispatch over spec query nodes. Each node type has a
-focused module: read, project, filter, join, aggregate, sort, limit, set
-operations, pivot, sample, values, lateral views, lateral joins, column operations
-(`withColumns`, rename, drop), NA functions, statistics, UDF and UDTF nodes, time
-travel, and so on.
-
-After resolving each node, the resolver **checks that every output column is
-registered** in its state. If a new code path forgets to register a column, it
-fails right away with a clear error instead of producing a plan with
-unexplained names.
-
-### 3.3 Resolving a named table
-
-When a query reads `sales.orders`, the resolver tries these in order:
-
-1. **`format.path` shortcut.** If the name has two parts and the first is a
-   registered format, as in `` parquet.`s3://bucket/path` ``, it's a direct file
-   read.
-2. **CTE.** If a `WITH` clause defined that name, its plan is used.
-3. **Catalog lookup.** The catalog manager (see [11](#doc-11-catalogs)) returns
-   what the name refers to:
-   - **Table**: its columns, format, location, partitioning, bucketing, sort
-     order, constraints, and properties. The resolver builds a *source info*
-     (paths, schema, partitioning, and layered options: table properties, then
-     query options, then time-travel options) and asks the **table format** for a
-     table source (see [12](#doc-12-data-sources-and-formats)).
-   - **View**: the stored SQL text is **parsed again** and resolved, so the view
-     sees current table definitions.
-   - **Temporary or global temporary view**: the stored logical plan is reused,
-     with fresh column IDs.
-4. **Table sample** (`TABLESAMPLE`) and **time travel** (`VERSION AS OF`,
-   `TIMESTAMP AS OF`) are applied where supported. Time travel isn't allowed on
-   CTEs or views.
-
-### 3.4 Resolving columns
-
-To resolve a column reference like `t.amount` or `df["amount"]`:
-
-1. Generate candidate interpretations. `a.b.c` could be table `a`, column `b`,
-   field `c`, or column `a` with nested fields `b.c`, and so on.
-2. Look for matching fields in the current input schema, comparing names
-   case-insensitively and checking the plan ID if there is one.
-3. In an aggregate context, also look in the aggregate's outputs.
-4. Look at **hidden** fields (for example, sorting by a column that was
-   projected away).
-5. If still not found and we're inside a subquery, look in the **outer**
-   query's schema. That makes it a correlated reference.
-6. Zero matches gives *cannot resolve attribute*. More than one gives
-   *ambiguous attribute*.
-
-### 3.5 Resolving functions
-
-For each unresolved function:
-
-1. Resolve the arguments first.
-2. Check the session's registered **user functions** (Python UDFs, see
-   [15](#doc-15-functions-and-python-udfs)).
-3. Look the name up in the **built-in tables**: scalar, generator (`explode`,
-   `posexplode`, `inline`, `stack`, …), aggregate, window, and table-valued
-   functions (`range`, …).
-4. Call the builder with the arguments and a function context (session time
-   zone, ANSI mode, …). It returns a DataFusion expression.
-5. Unknown names produce *unknown function*, which the client sees as an
-   `AnalysisException`.
-
-Special cases include `count(*)` (rewritten to count a constant), `DISTINCT`
-and `FILTER (WHERE …)` on aggregates, `IGNORE NULLS`, ordered-set aggregates
-(`percentile_cont … WITHIN GROUP`), named arguments, and lambda functions
-(`transform`, `filter`, `aggregate`).
-
-### 3.6 Aggregation
-
-Resolving an aggregate query happens in three steps:
-
-1. Resolve the **grouping expressions** (which may refer to `SELECT` aliases)
-   and the **projections**, pulling out the aggregate calls.
-2. Resolve `HAVING` with access to both, so `HAVING count(*) > 10` reuses the
-   same aggregate.
-3. Rewrite into DataFusion's form: an aggregate node with grouping and
-   aggregate expressions, an optional filter for `HAVING`, and a projection on
-   top. `ROLLUP`, `CUBE`, and `GROUPING SETS` become grouping-set expressions,
-   with `grouping()` and `grouping_id()` support.
-
-### 3.7 Resolving commands
-
-Commands become logical plans too, so they go through the same pipeline and job
-runner as queries:
-
-| Command kind | Logical plan produced | Executed by |
-|--------------|-----------------------|-------------|
-| Catalog commands (create, drop, alter, list, describe, `USE`, …) | A **catalog command node** wrapping a catalog command | A catalog command operator that calls the catalog manager and returns a small result table |
-| Writes (`df.write`, `writeTo`, `INSERT`, CTAS, `INSERT OVERWRITE DIRECTORY`) | A **file write node** with sink info (mode, partitioning, bucketing, options) | The table format's writer (see [12](#doc-12-data-sources-and-formats)) |
-| `DELETE`, `UPDATE`, `MERGE INTO` | **File delete** and **merge into** nodes | Lakehouse planners (see [13](#doc-13-lakehouse-delta-and-iceberg)) |
-| `df.show()`, notebook HTML | A **show string** node | Formats rows as a text table, Spark style |
-| `EXPLAIN` | Runs the pipeline in explain mode (simple, extended, codegen, cost, formatted, verbose, analyze) | Returns the plan text |
-| Register UDF/UDTF, `SET` variable | Updates the session | Returns an empty result |
-| Streaming write | A streaming plan, rewritten for streaming execution | A streaming query in the session |
-
-Other Sail logical nodes the resolver produces: range, monotonically increasing
-ID, Spark partition ID, explicit repartition, sort within partitions, map
-partitions (Python), and barrier. See
-[08](#doc-08-logical-physical-plans-and-optimizers).
-
----
-
-## 4. Example: Resolving a Query Step by Step
+This doc follows one query from start to finish:
 
 ```sql
 SELECT region, count(*) AS n
 FROM sales.orders
 WHERE amount > 100
 GROUP BY region
+ORDER BY n DESC
 ```
 
-**Spec plan** (from [04](#doc-04-sql-parser-and-analyzer)):
-Aggregate(group=[region], proj=[region, count(*) AS n], input=Filter(amount > 100, Read("sales.orders"))).
+By the time it reaches the resolver, the SQL text has already been parsed and
+turned into Sail's neutral *spec plan* (see [04](#doc-04-sql-parser-and-analyzer)
+and [05](#doc-05-spec-plan-and-config)). The resolver receives that spec plan,
+plus a handful of session settings such as the time zone and whether ANSI mode
+is on.
 
-**Resolution:**
+---
 
-| Step | Action | State after |
-|------|--------|-------------|
-| Read | The catalog says `sales.orders` is a Parquet table at `s3://lake/orders` with columns `order_id` (bigint), `region` (string), and `amount` (double). The Parquet format returns a table source. Columns are registered. | `#0→order_id`, `#1→region`, `#2→amount` |
-| Filter | `amount` resolves to `#2`. `>` with the integer literal `100` becomes `#2 > 100.0` after type coercion. | unchanged |
-| Aggregate | `region` resolves to `#1`. `count(*)` becomes `count(1)`. The alias `n` registers a new field. | `#3→region` (group output), `#4→n` |
-| Named plan | Logical plan plus user names `["region", "n"]` | |
+## Why a separate resolver exists at all
 
-**DataFusion logical plan** (simplified):
+DataFusion, the engine Sail is built on, already knows how to plan and run SQL.
+So why not hand it the query directly?
+
+Because Spark and DataFusion disagree in many small but visible ways. Spark
+matches column names without caring about upper or lower case. It lets you
+select the same column twice. It lets you join a table to itself, and both sides
+keep their column names. It lets GROUP BY refer to an alias defined in the
+SELECT list, and lets ORDER BY use a column you never selected. It has
+hundreds of functions whose behavior differs slightly from DataFusion's
+versions: how they treat NULLs, which date format letters they use, what happens
+on overflow.
+
+If Sail left these differences to DataFusion, every one of them would show up as
+a wrong result or a confusing error. Instead, the resolver handles all of
+Spark's rules first, and gives DataFusion a plan that is already unambiguous and
+already uses Spark-compatible functions. DataFusion then does what it's best at:
+optimizing and executing.
+
+The resolver also owns the rest of the planning pipeline, so that one function
+call takes a spec plan all the way to something runnable:
 
 ```text
-Projection: #3, #4
-  Aggregate: groupBy=[[#1 AS #3]], aggr=[[count(Int64(1)) AS #4]]
-    Filter: #2 > Float64(100)
-      TableScan: sales.orders projection=[#1, #2]
+spec plan  (names unresolved)
+  │ 1. Resolve        → DataFusion logical plan, columns renamed to private IDs
+  │ 2. Analyze        → DataFusion's analyzer rules (for example, type coercion)
+  │ 3. Optimize       → Sail and DataFusion logical optimizer rules
+  │ 4. Stream rewrite → only if the query reads from a streaming source
+  │ 5. Physical plan  → Sail's extension planners, then physical optimizer rules
+  │ 6. Rename         → private column IDs swapped back to the user's names
+  ▼
+physical plan, ready for a job runner
 ```
 
-**After optimization and physical planning:** the filter is pushed into the
-Parquet scan (row-group pruning and page-index filtering), the aggregate is
-split into partial and final stages around a hash repartition on `region`, and
-the output columns are renamed to `region` and `n`.
-
-### 4.1 Hidden columns, step by step
-
-```sql
-SELECT name FROM people ORDER BY age
-```
-
-`age` isn't in the `SELECT` list, but Spark allows sorting by it.
-
-| Step | Plan | Columns (internal → user) |
-|------|------|---------------------------|
-| Read `people` | Scan | `#0→name`, `#1→age` |
-| Project `name` | Projection keeps `#0` **and** `#1`, with `#1` marked **hidden** | `#0→name`, `#1→age (hidden)` |
-| Sort by `age` | `age` matches hidden `#1` | |
-| Remove hidden columns | Final projection keeps only `#0` | `#0→name` |
-| Rename | Output column named `name` | |
-
-Without hidden columns, the projection would drop `age` before the sort could
-use it.
-
-### 4.2 Why internal IDs: duplicate names
-
-```sql
-SELECT a, a FROM t
-```
-
-DataFusion doesn't allow two output columns with the same name. Sail produces
-`#5→a` and `#6→a`. They're distinct internally and renamed to `a`, `a` only at
-the very end, which matches Spark's output.
-
-### 4.3 Function lookup, three cases
-
-| Call | Found in | Result |
-|------|----------|--------|
-| `my_udf(x)` after `spark.udf.register("my_udf", ...)` | Session functions (checked first) | Python UDF expression |
-| `upper(x)` | Built-in scalar table | DataFusion `upper` with Spark handling |
-| `percentile_cont(0.5) WITHIN GROUP (ORDER BY x)` | Built-in aggregate table | Ordered-set aggregate |
-| `uppr(x)` (typo) | Nowhere | `AnalysisException: unknown function: uppr` |
-
-A session UDF with the same name as a built-in (for example, `upper`)
-**overrides** the built-in, because session functions are checked first.
+Steps 2, 3, and 5 mostly reuse DataFusion's machinery with Sail's own rules
+added (see [08](#doc-08-logical-physical-plans-and-optimizers)). The interesting,
+Spark-specific work happens in step 1, which is what the rest of this doc is
+about.
 
 ---
 
-## 5. End-to-End: Where the Resolver Sits
+## Why every column gets a private name
 
-| # | Caller | Resolver's role |
-|---|--------|-----------------|
-| 1 | Spark Connect or Flight SQL hands over a spec plan and plan config | |
-| 2 | | Builds a resolver bound to the session |
-| 3 | | Resolves the named plan (table lookups through the catalog manager and table formats, functions through the builder tables) |
-| 4 | | Runs DataFusion's analyzer and optimizer through the session state (Sail rules included) |
-| 5 | | Applies the streaming rewrite if the plan reads from a streaming source |
-| 6 | | Asks the session's query planner for a physical plan (Sail extension planners, then physical optimizer rules) |
-| 7 | | Renames output columns to user-facing names |
-| 8 | Job runner receives the physical plan (see [09](#doc-09-local-and-cluster-execution)) | |
+Spark lets you do things that would confuse a simpler engine. You can select the
+same column twice, join a table to itself, and sort by a column you didn't
+select. DataFusion, on the other hand, insists that the columns at each step of a
+plan have distinct names.
+
+The resolver bridges this gap by giving every column it produces a private name,
+like #7, and keeping a notebook that says "#7 is what the user calls amount".
+Two columns both called id become #3 and #9, so they never collide. Only when
+the plan is finished are the private names swapped back for the names the user
+expects to see.
+
+The notebook records a little more than the user-facing name. For each private
+name it also remembers:
+
+- **Which DataFrames it came from.** PySpark tags every DataFrame with an ID,
+  and a column reference like `orders["amount"]` carries that tag. In a
+  self-join, both sides have an *amount*, but only one of them belongs to the
+  `orders` DataFrame. The tag tells the resolver which one you meant.
+- **Whether it's hidden.** Sometimes the resolver needs a column that the user
+  shouldn't see in the result. More on this below.
+
+When the resolver has finished, it hands over the plan together with the list of
+names the user should see, in order. Sail calls this pair a *named plan*. Step 6
+of the pipeline uses that list to rename the output columns.
+
+As a safety net, after resolving each step of the query, the resolver checks that
+every column in the output is in its notebook. If someone adds a feature and
+forgets to register a column, the query fails right away with a clear error
+instead of producing a plan with mysterious names.
 
 ---
 
-## 6. Extending and Debugging
+## Following the query: reading the table
 
-**Adding a Spark function:**
+The resolver works from the bottom of the query upward, so the first thing it
+meets is *FROM sales.orders*.
 
-1. Implement it in `sail-function` if DataFusion has no equivalent (see
-   [15](#doc-15-functions-and-python-udfs)).
-2. Add `("name", builder)` to the matching list in `sail-plan/src/function/`
-   (scalar by category, aggregate, window, generator, table).
-3. Pick the builder style: `unary` or `binary` for direct mappings, `udf` for a
-   scalar UDF, or `custom` when you need the function context or argument
-   rewriting.
-4. Add a test and update the compatibility data (see
-   [17](#doc-17-testing-and-development)).
+A table name could refer to several different things, and the resolver checks
+them in a fixed order. First, it checks whether the name is really a file path in
+disguise. Spark lets you write `` parquet.`s3://bucket/path` `` to query files
+directly, so if the first part of a two-part name is a known file format, the
+resolver treats the rest as a path. Next, it checks whether a WITH clause in
+the same query defined that name. Only if neither applies does it ask the
+catalog manager (see [11](#doc-11-catalogs)).
 
-**Adding a new query node:** add a resolver function in `resolver/query/`, make
-sure every new output column is registered, and if no DataFusion node fits,
-create a Sail logical extension node (see
+The catalog manager works out which catalog and database *sales.orders* belongs
+to, then looks it up. It checks temporary views first, then real tables, then
+saved views. The answer comes back in one of three shapes:
+
+- **A table.** The catalog reports its columns, file format, location,
+  partitioning, and properties. The resolver passes these to the matching table
+  format, Parquet in our case (see [12](#doc-12-data-sources-and-formats)). The
+  format lists the files and returns a table source that can be scanned.
+- **A saved view.** Views are stored as SQL text. The resolver parses that text
+  again and resolves it like any other query. Doing this every time means the
+  view always sees the current definitions of the tables it uses.
+- **A temporary view.** These are stored as already-resolved plans, so the
+  resolver reuses the plan and just hands out fresh private names for its
+  columns.
+
+In our example, *sales.orders* is a Parquet table with columns order_id,
+region, and amount. The resolver registers them in its notebook:
+
+```text
+#0 → order_id      #1 → region      #2 → amount
+```
+
+Time travel (VERSION AS OF, TIMESTAMP AS OF) and table sampling
+(TABLESAMPLE) are applied at this point too, for the formats that support
+them. Time travel isn't allowed on CTEs or views, because they have no version
+history.
+
+---
+
+## Following the query: resolving columns in the filter
+
+Next comes *WHERE amount > 100*. The resolver has to decide which column
+*amount* means.
+
+It begins by listing the possible readings of the name. A single word like
+*amount* can only be a column, but a dotted name like *t.amount* might mean
+"column amount of table t" or "field amount inside a struct column called t".
+For each reading, the resolver searches the columns that are visible at this
+point in the plan, comparing names without regard to case and checking the
+DataFrame tag if there is one.
+
+If nothing matches, it keeps looking in a few more places. Inside a GROUP BY
+query, it also looks at the outputs of the aggregation. It looks at hidden
+columns. And inside a subquery, it looks outward at the enclosing query's
+columns, which is how correlated subqueries like `WHERE x > (SELECT avg(x) FROM
+t2 WHERE t2.k = t1.k)` find *t1.k*.
+
+If the search finds exactly one match, that's the answer. If it finds none, the
+user gets *cannot resolve attribute*. If it finds more than one, for example
+because two joined tables both have an *amount*, the user gets *ambiguous
+attribute* and needs to qualify the name.
+
+Here, *amount* matches #2. The comparison *> 100* compares a double column with
+an integer, so DataFusion's type coercion later turns the literal into 100.0.
+
+---
+
+## Following the query: finding functions
+
+The query uses one function, *count(\*)*. Function names are resolved by looking
+in three places, in this order:
+
+1. **Functions registered in the session.** These are mostly Python UDFs that the
+   user registered with `spark.udf.register`. Because they're checked first, a
+   user function named *upper* would replace the built-in *upper*, just as in
+   Spark.
+2. **Built-in scalar and generator functions**, such as *upper*, *date_format*,
+   or *explode*.
+3. **Built-in aggregate functions**, such as *count*, *sum*, or *percentile_cont*.
+
+If a name isn't found anywhere, the user sees *unknown function*.
+
+The built-ins aren't registered in DataFusion's own function registry. Sail keeps
+its own table that maps each Spark function name to a small piece of code called
+a *builder*. A builder receives the already-resolved arguments plus the session
+settings, and returns a DataFusion expression. Many builders are trivial: *sqrt*
+maps straight to DataFusion's square root, with a cast to double. Others do real
+work. *concat* uses Sail's own implementation, because Spark returns NULL when
+any argument is NULL. Date functions translate Spark's Java-style format letters.
+Arithmetic functions check whether ANSI mode is on, which decides whether an
+overflow becomes NULL or an error. This design is why Sail can match Spark
+function by function without changing DataFusion itself.
+
+*count(\*)* gets one small special case: the star is rewritten to count a
+constant, because there's no column to count. The resolver also handles the
+other aggregate extras here: DISTINCT, FILTER (WHERE …), IGNORE NULLS, and
+ordered-set syntax like `percentile_cont(0.5) WITHIN GROUP (ORDER BY x)`.
+Functions that take lambdas, such as `transform(arr, x -> x + 1)`, are resolved
+here too.
+
+---
+
+## Following the query: grouping and sorting
+
+*GROUP BY region* and *ORDER BY n DESC* look simple, but they show off two Spark
+rules that need care.
+
+For the aggregation, the resolver works in three passes. First it resolves the
+grouping expressions and the SELECT list, pulling out the aggregate calls
+(*count(\*)*) so they're computed once. Second, if there were a HAVING clause,
+it would resolve it with access to both, so *HAVING count(\*) > 10* reuses the
+same count instead of computing a new one. Third, it builds DataFusion's form of
+the query: an aggregate step, an optional filter for HAVING, and a projection
+on top. ROLLUP, CUBE, and GROUPING SETS are handled in the same place.
+
+The new outputs get new private names:
+
+```text
+#3 → region   (the grouping key, as output by the aggregate)
+#4 → n        (the count)
+```
+
+*ORDER BY n DESC* refers to an alias, which the resolver finds among the
+aggregate's outputs.
+
+Now suppose the query had been `SELECT region FROM … ORDER BY amount` instead.
+*amount* isn't in the SELECT list, yet Spark allows sorting by it. The resolver
+handles this with a **hidden column**. It keeps *amount* flowing through the
+projection, marks it hidden in its notebook, lets the sort use it, and then adds
+a final step that drops every hidden column. The same trick carries join keys
+through outer joins and tracks positions for exploded arrays. The user never sees
+these columns. They exist only so the plan can do what Spark promises.
+
+After resolution, the logical plan for our example looks roughly like this:
+
+```text
+Sort: #4 DESC
+  Projection: #3, #4
+    Aggregate: groupBy=[#1 AS #3], aggr=[count(1) AS #4]
+      Filter: #2 > 100.0
+        TableScan: sales.orders  projection=[#1, #2]
+```
+
+along with the user-facing names *region* and *n*.
+
+---
+
+## Commands go through the same pipeline
+
+Not every request is a query. CREATE TABLE, INSERT, SHOW TABLES,
+`df.write`, DELETE, and `df.show()` all reach the resolver too. Sail's choice is
+to turn each of them into a logical plan as well, so they flow through the same
+pipeline and the same job runner as queries. One path to maintain is simpler than
+two.
+
+The trick is a small set of special plan nodes. Catalog operations (create,
+drop, alter, list, describe, USE) become a *catalog command* node, which at run
+time asks the catalog manager to do the work and returns a small result table.
+Writes become a *file write* node that hands the data to the table format's
+writer, wrapped in a *barrier* so that any preparation, such as creating the
+target table, finishes before the write starts. DELETE, UPDATE, and MERGE
+become nodes that the lakehouse formats know how to plan (see
+[13](#doc-13-lakehouse-delta-and-iceberg)). `df.show()` becomes a node that formats
+rows as Spark's familiar text table. EXPLAIN runs the pipeline in explain mode
+and returns the plans as text.
+
+One rule matters a lot here: **resolving a command never changes anything**.
+The resolver only describes the work, and the work happens when the plan runs.
+That's why `EXPLAIN CREATE TABLE … AS SELECT …` is safe: it shows the plan
+without creating a table (see [08](#doc-08-logical-physical-plans-and-optimizers)
+for how barriers enforce this).
+
+---
+
+## Putting it together
+
+Back to our query. The resolver found *sales.orders* through the catalog and got
+a Parquet source back. It gave the columns private names, matched *amount* in
+the filter, found *count* in the aggregate table, built the aggregation, and
+resolved the sort against the alias *n*. It then handed the plan to DataFusion's
+analyzer and optimizer. They pushed the filter into the Parquet scan, so row
+groups whose statistics rule out *amount > 100* are skipped, and split the
+aggregation into a partial step and a final step around a repartition by region.
+The extension planners produced the physical plan. Finally, the output columns
+were renamed from #3 and #4 back to *region* and *n*. The finished physical plan
+goes to the job runner (see [09](#doc-09-local-and-cluster-execution)), and
+`EXPLAIN EXTENDED` would show you the initial logical plan, the optimized logical
+plan, and the physical plan that the pipeline recorded along the way.
+
+When something goes wrong, the error message usually tells you which part of
+this story failed. *Cannot resolve attribute* means the column search came up
+empty: check the spelling, the qualifier, and whether the column was projected
+away earlier. *Ambiguous attribute* means two inputs share a name: qualify it,
+or use the DataFrame form `df["col"]`. *Unknown function* means the name isn't a
+built-in or a registered UDF in this session. And if a function returns a
+different answer than Spark, the place to look is that function's builder, which
+is where NULL handling, casts, and ANSI behavior are decided.
+
+---
+
+## Adding to the resolver
+
+To support a new Spark function, first check whether DataFusion already has one
+that behaves the same way. If so, adding a line to Sail's function table is
+enough. If not, write the implementation in the functions crate (see
+[15](#doc-15-functions-and-python-udfs)), then add a builder that calls it. Either
+way, add a test that compares the result with Spark's.
+
+To support a new kind of query step, add a resolver function for the new spec
+node. Make sure every column it produces is registered in the notebook (the
+safety net will remind you if you forget). If DataFusion has no plan node that
+fits, create a Sail extension node (see
 [08](#doc-08-logical-physical-plans-and-optimizers)).
 
-| Symptom | Where to look |
-|---------|---------------|
-| `cannot resolve attribute` | Column resolution. Check case, qualifiers, plan IDs, and whether the column was projected away before it's used. |
-| `ambiguous attribute` | A join of two inputs that share a name. Qualify it, or use `df1["col"]`. |
-| `unknown function: x` | Missing from the built-in tables, or the UDF isn't registered in this session |
-| Wrong column names in results | The named plan's user-facing names, or the final rename |
-| Different result from Spark for a function | That function's builder. Check casts, NULL handling, and ANSI behavior. |
-| "attribute … is missing from the schema" from a new feature | A new column wasn't registered in the resolver state |
-
-`EXPLAIN EXTENDED` shows the initial logical, final logical, and physical plans
-that this pipeline records.
-
 ---
 
-## 7. Where to Look
+## Where to look in the code
 
-| Topic | Location |
-|-------|----------|
-| Pipeline entry point (`resolve_and_execute_plan`) | `crates/sail-plan/src/lib.rs` |
-| Resolver and named plan | `crates/sail-plan/src/resolver/mod.rs`, `plan.rs` |
-| Resolver state (column IDs, hidden columns, CTEs) | `crates/sail-plan/src/resolver/state.rs` |
-| Query nodes | `crates/sail-plan/src/resolver/query/` (`read.rs`, `aggregate.rs`, `join.rs`, `project.rs`, …) |
-| Expressions | `crates/sail-plan/src/resolver/expression/` (`attribute.rs`, `function.rs`, `window.rs`, `subquery.rs`, `wildcard.rs`, `udf.rs`, …) |
-| Commands | `crates/sail-plan/src/resolver/command/` (`write.rs`, `merge.rs`, `catalog/`, …) |
-| Function builder tables | `crates/sail-plan/src/function/` (`scalar/`, `aggregate.rs`, `window.rs`, `generator.rs`, `table/`, `common.rs`) |
-| Catalog command node | `crates/sail-plan/src/catalog.rs` |
-| `EXPLAIN` | `crates/sail-plan/src/explain.rs` |
-| `show()` formatting | `crates/sail-plan/src/formatter.rs` |
-| Settings that affect resolution | `crates/sail-plan/src/config.rs` |
-| Streaming rewrite | `crates/sail-plan/src/streaming/` |
+Everything described here lives in the `sail-plan` crate. The pipeline itself
+is the function `resolve_and_execute_plan` in `src/lib.rs`. The resolver is
+under `src/resolver/`: `state.rs` holds the notebook of private names and hidden
+columns, `query/` has one file per kind of query step (`read.rs` for table
+lookup, `aggregate.rs`, `join.rs`, and so on), `expression/` handles columns and
+functions (`attribute.rs` for the column search, `function.rs` for the
+function lookup order), and `command/` handles writes, merges, and catalog
+commands. The function tables and their builders are in `src/function/`.
+EXPLAIN is in `src/explain.rs`, the `show()` formatting in `src/formatter.rs`,
+and the session settings that affect resolution in `src/config.rs`.
 
 
 ---
